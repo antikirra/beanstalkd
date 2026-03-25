@@ -204,6 +204,7 @@ job_copy(Job *j)
     }
 
     memcpy(n, j, sizeof(Job) + j->r.body_size);
+    n->body = (char *)n + sizeof(Job);
     job_list_reset(n);
 
     n->file = NULL; /* copies do not have refcnt on the wal */

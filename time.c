@@ -1,16 +1,15 @@
 #include "dat.h"
 #include <stdint.h>
 #include <stdlib.h>
-#include <sys/time.h>
+#include <time.h>
 
 int64
 nanoseconds(void)
 {
-    int r;
-    struct timeval tv;
+    struct timespec ts;
 
-    r = gettimeofday(&tv, 0);
-    if (r != 0) return warnx("gettimeofday"), -1; // can't happen
+    int r = clock_gettime(CLOCK_MONOTONIC, &ts);
+    if (r != 0) return warnx("clock_gettime"), -1; // can't happen
 
-    return ((int64)tv.tv_sec)*1000000000 + ((int64)tv.tv_usec)*1000;
+    return ((int64)ts.tv_sec)*1000000000 + (int64)ts.tv_nsec;
 }

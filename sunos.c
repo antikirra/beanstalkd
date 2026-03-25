@@ -46,6 +46,7 @@ sockwant(Socket *s, int rw)
         s->added = 1;
         return port_associate(portfd, PORT_SOURCE_FD, s->fd, events, (void *)s);
     } else if (!rw) {
+        s->added = 0;
         return port_dissociate(portfd, PORT_SOURCE_FD, s->fd);
     } else {
         port_dissociate(portfd, PORT_SOURCE_FD, s->fd);

@@ -413,17 +413,26 @@ remove_waiting_conn(Conn *c)
 
 // enqueue_waiting_conn sets CONN_TYPE_WAITING for the connection,
 // adds it to the waiting_conns set of every tube it's watching.
-static void
+static int
 enqueue_waiting_conn(Conn *c)
 {
-    c->type |= CONN_TYPE_WAITING;
-    global_stat.waiting_ct++;
     size_t i;
     for (i = 0; i < c->watch.len; i++) {
         Tube *t = c->watch.items[i];
+        if (!ms_append(&t->waiting_conns, c)) {
+            size_t j;
+            for (j = 0; j < i; j++) {
+                Tube *u = c->watch.items[j];
+                ms_remove(&u->waiting_conns, c);
+                u->stat.waiting_ct--;
+            }
+            return 0;
+        }
         t->stat.waiting_ct++;
-        ms_append(&t->waiting_conns, c);
     }
+    c->type |= CONN_TYPE_WAITING;
+    global_stat.waiting_ct++;
+    return 1;
 }
 
 // next_awaited_job iterates through all the tubes with awaiting connections,
@@ -502,7 +511,6 @@ soonest_delayed_job()
 // enqueue_job inserts job j in the tube, returns 1 on success, otherwise 0.
 // If update_store then it writes an entry to WAL.
 // On success it processes the queue.
-// BUG: If maintenance of WAL has failed, it is not reported as error.
 static int
 enqueue_job(Server *s, Job *j, int64 delay, char update_store)
 {
@@ -531,12 +539,11 @@ enqueue_job(Server *s, Job *j, int64 delay, char update_store)
         if (!walwrite(&s->wal, j)) {
             return 0;
         }
-        walmaint(&s->wal);
+        if (!walmaint(&s->wal)) {
+            twarnx("walmaint failed after walwrite");
+        }
     }
 
-    // The call below makes this function do too much.
-    // TODO: refactor this call outside so the call is explicit (not hidden)?
-    process_queue();
     return 1;
 }
 
@@ -561,7 +568,9 @@ bury_job(Server *s, Job *j, char update_store)
         if (!walwrite(&s->wal, j)) {
             return 0;
         }
-        walmaint(&s->wal);
+        if (!walmaint(&s->wal)) {
+            twarnx("walmaint failed after bury walwrite");
+        }
     }
 
     return 1;
@@ -579,6 +588,7 @@ enqueue_reserved_jobs(Conn *c)
         j->tube->stat.reserved_ct--;
         c->soonest_job = NULL;
     }
+    process_queue();
 }
 
 static int
@@ -889,11 +899,13 @@ enqueue_incoming_job(Conn *c)
     }
 
     if (j->walresv) {
+        job_free(j);
         reply_serr(c, MSG_INTERNAL_ERROR);
         return;
     }
     j->walresv = walresvput(&c->srv->wal, j);
     if (!j->walresv) {
+        job_free(j);
         reply_serr(c, MSG_OUT_OF_MEMORY);
         return;
     }
@@ -901,16 +913,11 @@ enqueue_incoming_job(Conn *c)
     /* we have a complete job, so let's stick it in the pqueue */
     r = enqueue_job(c->srv, j, j->r.delay, 1);
 
-    // Dead code: condition cannot happen, r can take 1 or 0 values only.
-    if (r < 0) {
-        reply_serr(c, MSG_INTERNAL_ERROR);
-        return;
-    }
-
     global_stat.total_jobs_ct++;
     j->tube->stat.total_jobs_ct++;
 
     if (r == 1) {
+        process_queue();
         reply_line(c, STATE_SEND_WORD, MSG_INSERTED_FMT, j->r.id);
         return;
     }
@@ -1098,8 +1105,14 @@ read_tube_name(char **tubename, char *buf, char **end)
 static void
 wait_for_job(Conn *c, int timeout)
 {
+    if (!enqueue_waiting_conn(c)) {
+        /* OOM: cannot register for waiting. Reply TIMED_OUT because
+         * the protocol only allows RESERVED, DEADLINE_SOON, or
+         * TIMED_OUT as responses to reserve commands. */
+        reply_msg(c, MSG_TIMED_OUT);
+        return;
+    }
     c->state = STATE_WAIT;
-    enqueue_waiting_conn(c);
 
     /* Set the pending timeout to the requested timeout amount */
     c->pending_timeout = timeout;
@@ -1437,7 +1450,7 @@ dispatch_cmd(Conn *c)
     case OP_RESERVE_TIMEOUT:
         errno = 0;
         uint32 utimeout = 0;
-        if (read_u32(&utimeout, c->cmd + CMD_RESERVE_TIMEOUT_LEN, &end_buf) != 0 || utimeout > INT_MAX) {
+        if (read_u32(&utimeout, c->cmd + CMD_RESERVE_TIMEOUT_LEN, NULL) != 0 || utimeout > INT_MAX) {
             reply_msg(c, MSG_BAD_FORMAT);
             return;
         }
@@ -1532,7 +1545,9 @@ dispatch_cmd(Conn *c)
 
         j->r.state = Invalid;
         r = walwrite(&c->srv->wal, j);
-        walmaint(&c->srv->wal);
+        if (r && !walmaint(&c->srv->wal)) {
+            twarnx("walmaint failed after delete walwrite");
+        }
         job_free(j);
 
         if (!r) {
@@ -1574,11 +1589,8 @@ dispatch_cmd(Conn *c)
         j->r.release_ct++;
 
         r = enqueue_job(c->srv, j, delay, !!delay);
-        if (r < 0) {
-            reply_serr(c, MSG_INTERNAL_ERROR);
-            return;
-        }
         if (r == 1) {
+            process_queue();
             reply_msg(c, MSG_RELEASED);
             return;
         }
@@ -1614,16 +1626,19 @@ dispatch_cmd(Conn *c)
         return;
 
     case OP_KICK:
-        errno = 0;
-        count = strtoul(c->cmd + CMD_KICK_LEN, &end_buf, 10);
-        if (end_buf == c->cmd + CMD_KICK_LEN || errno) {
-            reply_msg(c, MSG_BAD_FORMAT);
-            return;
+        {
+            uint32 kick_count;
+            if (read_u32(&kick_count, c->cmd + CMD_KICK_LEN, NULL)) {
+                reply_msg(c, MSG_BAD_FORMAT);
+                return;
+            }
+            count = kick_count;
         }
 
         op_ct[type]++;
 
         i = kick_jobs(c->srv, c->use, count);
+        process_queue();
         reply_line(c, STATE_SEND_WORD, "KICKED %u\r\n", i);
         return;
 
@@ -1643,6 +1658,7 @@ dispatch_cmd(Conn *c)
 
         if ((j->r.state == Buried && kick_buried_job(c->srv, j)) ||
             (j->r.state == Delayed && kick_delayed_job(c->srv, j))) {
+            process_queue();
             reply_msg(c, MSG_KICKED);
         } else {
             reply_msg(c, MSG_NOTFOUND);
@@ -1702,7 +1718,7 @@ dispatch_cmd(Conn *c)
         }
         op_ct[type]++;
 
-        t = tube_find(&tubes, name);
+        t = tube_find_name(name);
         if (!t) {
             reply_msg(c, MSG_NOTFOUND);
             return;
@@ -1825,7 +1841,7 @@ dispatch_cmd(Conn *c)
             reply_msg(c, MSG_BAD_FORMAT);
             return;
         }
-        t = tube_find(&tubes, name);
+        t = tube_find_name(name);
         if (!t) {
             reply_msg(c, MSG_NOTFOUND);
             return;
@@ -1879,6 +1895,10 @@ conn_timeout(Conn *c)
          * done sending. */
         if (j == c->out_job) {
             c->out_job = job_copy(c->out_job);
+            if (!c->out_job) {
+                c->state = STATE_CLOSE;
+                return;
+            }
         }
 
         timeout_ct++; /* stats */
@@ -1888,6 +1908,8 @@ conn_timeout(Conn *c)
             bury_job(c->srv, j, 0); /* out of memory, so bury it */
         connsched(c);
     }
+
+    process_queue();
 
     if (should_timeout) {
         remove_waiting_conn(c);
@@ -2162,6 +2184,7 @@ prottick(Server *s)
         if (r < 1)
             bury_job(s, j, 0);  /* out of memory */
     }
+    process_queue();
 
     // Unpause every possible tube and process the queue.
     // Capture the smallest period from the soonest pause deadline.
@@ -2206,7 +2229,11 @@ h_accept(const int fd, const short which, Server *s)
     socklen_t addrlen = sizeof addr;
     int cfd = accept(fd, (struct sockaddr *)&addr, &addrlen);
     if (cfd == -1) {
-        if (errno != EAGAIN && errno != EWOULDBLOCK) twarn("accept()");
+        if (errno == EMFILE || errno == ENFILE) {
+            twarnx("accept: too many open files");
+        } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            twarn("accept()");
+        }
         epollq_apply();
         return;
     }
@@ -2254,10 +2281,9 @@ h_accept(const int fd, const short which, Server *s)
     r = sockwant(&c->sock, 'r');
     if (r == -1) {
         twarn("sockwant");
-        close(cfd);
-        if (verbose) {
-            printf("close %d\n", cfd);
-        }
+        connclose(c);
+        epollq_apply();
+        return;
     }
     epollq_apply();
 }
@@ -2317,6 +2343,7 @@ prot_replay(Server *s, Job *list)
             twarnx("failed to reserve space");
             return 0;
         }
+        j->walresv += z;
         int64 delay = 0;
         switch (j->r.state) {
         case Buried: {
@@ -2331,9 +2358,12 @@ prot_replay(Server *s, Job *list)
             /* Falls through */
         default:
             r = enqueue_job(s, j, delay, 0);
-            if (r < 1)
-                twarnx("error recovering job %"PRIu64, j->r.id);
+            if (r < 1) {
+                twarnx("error recovering job %"PRIu64", burying", j->r.id);
+                bury_job(s, j, 0);
+            }
         }
     }
+    process_queue();
     return 1;
 }

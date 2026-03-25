@@ -36,16 +36,24 @@ OFILES=\
 
 TOFILES=\
 	testheap.o\
+	testheap2.o\
 	testjobs.o\
+	testjob2.o\
 	testms.o\
+	testms2.o\
 	testserv.o\
+	testserv2.o\
+	testtube.o\
 	testutil.o\
+	testutil2.o\
+	teststress.o\
+	testcore.o\
 
 HFILES=\
 	dat.h\
 
 ifeq ($(OS),linux)
-   LDLIBS+=-lrt
+   LDLIBS+=-lrt -lpthread
 endif
 
 # systemd support can be configured via USE_SYSTEMD:
@@ -99,6 +107,8 @@ bench: ct/_ctcheck
 	ct/_ctcheck -b
 
 ct/_ctcheck: ct/_ctcheck.o ct/ct.o $(OFILES) $(TOFILES)
+
+ct/_ctcheck.o: ct/_ctcheck.c
 
 ct/_ctcheck.c: $(TOFILES) ct/gen
 	ct/gen $(TOFILES) >$@.part

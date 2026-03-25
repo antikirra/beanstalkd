@@ -109,6 +109,13 @@ main(int argc, char **argv)
     set_sig_handlers();
 
     srv_acquire_wal(&srv);
+
+    if (srv.wal.use && srv.wal.wantsync) {
+        walsyncstart();
+    }
+
     srvserve(&srv);
+
+    walsyncstop();
     exit(0);
 }

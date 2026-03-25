@@ -1,0 +1,32 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    gcc libc6-dev make git python3 valgrind \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+
+# Build TWO binaries:
+# 1) ASan build for memory safety
+# 2) Debug build for Valgrind (ASan and Valgrind are incompatible)
+
+RUN make clean && make \
+    CC=gcc \
+    CFLAGS="-O1 -g -fsanitize=address -fno-omit-frame-pointer -Wall -Wformat=2" \
+    LDFLAGS="-fsanitize=address" \
+    LDLIBS="-lrt -lpthread" \
+    && cp beanstalkd /usr/local/bin/beanstalkd-asan
+
+RUN make clean && make \
+    CC=gcc \
+    CFLAGS="-O0 -g3 -Wall -Wformat=2" \
+    LDLIBS="-lrt -lpthread" \
+    && cp beanstalkd /usr/local/bin/beanstalkd-debug
+
+COPY test/loadtest.sh /loadtest.sh
+RUN chmod +x /loadtest.sh
+
+ENTRYPOINT ["/loadtest.sh"]

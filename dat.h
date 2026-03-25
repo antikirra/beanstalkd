@@ -244,6 +244,7 @@ struct Job {
 struct Tube {
     uint refs;
     char name[MAX_TUBE_NAME_LEN];
+    Tube *ht_next; // hash table chain for global tube lookup
     Heap ready;
     Heap delay;
     Ms waiting_conns;           // conns waiting for the job at this moment
@@ -327,6 +328,7 @@ Tube *make_tube(const char *name);
 void  tube_dref(Tube *t);
 void  tube_iref(Tube *t);
 Tube *tube_find(Ms *tubeset, const char *name);
+Tube *tube_find_name(const char *name);
 Tube *tube_find_or_make(const char *name);
 #define TUBE_ASSIGN(a,b) (tube_dref(a), (a) = (b), tube_iref(a))
 
@@ -447,10 +449,12 @@ struct Wal {
 int  waldirlock(Wal*);
 void walinit(Wal*, Job *list);
 int  walwrite(Wal*, Job*);
-void walmaint(Wal*);
+int  walmaint(Wal*);
 int  walresvput(Wal*, Job*);
 int  walresvupdate(Wal*);
 void walgc(Wal*);
+void walsyncstart(void);
+void walsyncstop(void);
 
 
 struct File {

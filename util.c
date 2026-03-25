@@ -172,6 +172,10 @@ optparse(Server *s, char **argv)
                     break;
                 case 'z':
                     job_data_size_limit = parse_size_t(EARGF(flagusage("-z")));
+                    if (job_data_size_limit < 1) {
+                        warnx("invalid job size limit, using default");
+                        job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
+                    }
                     if (job_data_size_limit > JOB_DATA_SIZE_LIMIT_MAX) {
                         warnx("maximum job size was set to %d", JOB_DATA_SIZE_LIMIT_MAX);
                         job_data_size_limit = JOB_DATA_SIZE_LIMIT_MAX;
@@ -179,6 +183,10 @@ optparse(Server *s, char **argv)
                     break;
                 case 's':
                     s->wal.filesize = parse_size_t(EARGF(flagusage("-s")));
+                    if (s->wal.filesize < 1) {
+                        warnx("invalid wal file size, using default");
+                        s->wal.filesize = Filesizedef;
+                    }
                     break;
                 case 'c':
                     warnx("-c flag was removed. binlog is always compacted.");
@@ -188,6 +196,10 @@ optparse(Server *s, char **argv)
                     break;
                 case 'f':
                     ms = (int64)parse_size_t(EARGF(flagusage("-f")));
+                    if (ms > 1000000000) {
+                        warnx("-f value too large, capping at 1000000000ms");
+                        ms = 1000000000;
+                    }
                     s->wal.syncrate = ms * 1000000;
                     s->wal.wantsync = 1;
                     break;

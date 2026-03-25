@@ -64,8 +64,10 @@ rawfalloc(int fd, int len)
 
     for (i = 0; i < len; i += w) {
         w = write(fd, buf, sizeof buf);
-        if (w == -1)
-            return errno;
+        if (w == -1 && errno == EINTR)
+            continue;
+        if (w <= 0)
+            return w == -1 ? errno : EIO;
     }
     lseek(fd, 0, 0);            // do not care if this fails
     return 0;
@@ -269,6 +271,9 @@ readrec(File *f, Job *l, int *err)
             job_free(j);
         }
         return 1;
+    default:
+        warnpos(f, -r, "unknown job state: %d", jr.state);
+        goto Error;
     }
 
 Error:
@@ -405,6 +410,9 @@ readrec5(File *f, Job *l, int *err)
             job_free(j);
         }
         return 1;
+    default:
+        warnpos(f, -r, "unknown v5 job state: %d", jr.state);
+        goto Error;
     }
 
 Error:
@@ -501,19 +509,24 @@ filewopen(File *f)
 static int
 filewrite(File *f, Job *j, void *buf, int len)
 {
-    int r;
+    int written = 0;
 
-    r = write(f->fd, buf, len);
-    if (r != len) {
-        twarn("write");
-        return 0;
+    while (written < len) {
+        int r = write(f->fd, (char *)buf + written, len - written);
+        if (r == -1 && errno == EINTR)
+            continue;
+        if (r <= 0) {
+            twarn("write");
+            return 0;
+        }
+        written += r;
     }
 
-    f->w->resv -= r;
-    f->resv -= r;
-    j->walresv -= r;
-    j->walused += r;
-    f->w->alive += r;
+    f->w->resv -= written;
+    f->resv -= written;
+    j->walresv -= written;
+    j->walused += written;
+    f->w->alive += written;
     return 1;
 }
 

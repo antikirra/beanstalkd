@@ -10,8 +10,82 @@
 #include <sys/uio.h>
 #include <sys/stat.h>
 #include <limits.h>
+#include <pthread.h>
 
 static int reserve(Wal *w, int n);
+
+// --- Async fsync thread ---
+//
+// Moves the blocking fsync() call off the main event loop thread.
+// The main thread passes a dup()'d fd to the fsync thread; the thread
+// owns that fd and closes it after fsync. This avoids fd lifetime races:
+// the main thread can close/rotate the original fd freely.
+//
+// Thread safety contract:
+//   sync_fd, sync_stop, sync_err — shared, protected by sync_mu
+//   sync_on — main-thread-only flag (set before thread start, cleared after join)
+//   w->use, w->cur, w->* — main-thread-only (fsync thread never reads Wal struct)
+//   The ONLY data crossing the thread boundary is the dup'd fd integer.
+
+static pthread_t       sync_thread;
+static pthread_mutex_t sync_mu   = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  sync_cond = PTHREAD_COND_INITIALIZER;
+static int             sync_fd   = -1;
+static int             sync_stop = 0;
+static int             sync_err  = 0;
+static int             sync_on   = 0;
+
+static void *
+sync_thread_fn(void *arg)
+{
+    UNUSED_PARAMETER(arg);
+
+    pthread_mutex_lock(&sync_mu);
+    for (;;) {
+        while (sync_fd < 0 && !sync_stop)
+            pthread_cond_wait(&sync_cond, &sync_mu);
+
+        if (sync_stop) break;
+
+        int fd = sync_fd;
+        sync_fd = -1;
+        pthread_mutex_unlock(&sync_mu);
+
+        // Blocking fsync on our private dup'd fd.
+        // Main thread is free to continue processing events.
+        int r = fsync(fd);
+        close(fd); // we own this fd (dup'd by main thread)
+
+        pthread_mutex_lock(&sync_mu);
+        if (r == -1)
+            sync_err = 1;
+    }
+    pthread_mutex_unlock(&sync_mu);
+    return NULL;
+}
+
+void
+walsyncstart(void)
+{
+    if (sync_on) return;
+    if (pthread_create(&sync_thread, NULL, sync_thread_fn, NULL) != 0) {
+        twarnx("failed to start fsync thread, using synchronous fsync");
+        return;
+    }
+    sync_on = 1;
+}
+
+void
+walsyncstop(void)
+{
+    if (!sync_on) return;
+    pthread_mutex_lock(&sync_mu);
+    sync_stop = 1;
+    pthread_cond_signal(&sync_cond);
+    pthread_mutex_unlock(&sync_mu);
+    pthread_join(sync_thread, NULL);
+    sync_on = 0;
+}
 
 
 // Reads w->dir for files matching binlog.NNN,
@@ -50,10 +124,22 @@ walscandir(Wal *w)
 }
 
 
+static void
+dirsync(Wal *w)
+{
+    int fd = open(w->dir, O_RDONLY);
+    if (fd >= 0) {
+        fsync(fd);
+        close(fd);
+    }
+}
+
+
 void
 walgc(Wal *w)
 {
     File *f;
+    int did_unlink = 0;
 
     while (w->head && !w->head->refs) {
         f = w->head;
@@ -66,6 +152,11 @@ walgc(Wal *w)
         unlink(f->path);
         free(f->path);
         free(f);
+        did_unlink = 1;
+    }
+
+    if (did_unlink) {
+        dirsync(w);
     }
 }
 
@@ -117,57 +208,94 @@ walresvmigrate(Wal *w, Job *j)
 }
 
 
-static void
+// moveone migrates one job from the oldest wal file to the current.
+// Returns 1 on success, 0 on failure or nothing to do.
+static int
 moveone(Wal *w)
 {
     Job *j;
 
     if (w->head == w->cur || w->head->next == w->cur) {
-        // no point in moving a job
-        return;
+        return 1; // no point in moving a job
     }
 
     j = w->head->jlist.fnext;
     if (!j || j == &w->head->jlist) {
-        // head holds no jlist; can't happen
         twarnx("head holds no jlist");
-        return;
+        return 1; // nothing to move
     }
 
     if (!walresvmigrate(w, j)) {
-        // it will not fit, so we'll try again later
-        return;
+        return 1; // it will not fit, try again later
     }
 
     filermjob(w->head, j);
     w->nmig++;
-    walwrite(w, j);
+    return walwrite(w, j);
 }
 
 
-static void
+// walcompact migrates jobs from old wal files. Returns 0 if WAL was disabled.
+static int
 walcompact(Wal *w)
 {
     int r;
 
     for (r=ratio(w); r>=2; r--) {
-        moveone(w);
+        if (!moveone(w))
+            return 0;
     }
+    return 1;
 }
 
 
-static void
+static int
 walsync(Wal *w)
 {
     int64 now;
 
+    // Check if async thread reported an error from previous fsync
+    if (sync_on) {
+        pthread_mutex_lock(&sync_mu);
+        int err = sync_err;
+        sync_err = 0;
+        pthread_mutex_unlock(&sync_mu);
+        if (err) {
+            twarnx("async fsync failed");
+            return 0;
+        }
+    }
+
     now = nanoseconds();
     if (w->wantsync && now >= w->lastsync+w->syncrate) {
         w->lastsync = now;
-        if (fsync(w->cur->fd) == -1) {
-            twarn("fsync");
+        if (sync_on) {
+            // dup() gives the thread its own fd — safe even if
+            // main thread rotates/closes the original later.
+            int fd = dup(w->cur->fd);
+            if (fd == -1) {
+                twarn("dup for async fsync");
+                return 0;
+            }
+            pthread_mutex_lock(&sync_mu);
+            if (sync_fd >= 0) {
+                // Previous fsync still in progress — skip this one.
+                // Data will be synced on next cycle.
+                close(fd);
+            } else {
+                sync_fd = fd;
+                pthread_cond_signal(&sync_cond);
+            }
+            pthread_mutex_unlock(&sync_mu);
+        } else {
+            // Synchronous fallback
+            if (fsync(w->cur->fd) == -1) {
+                twarn("fsync");
+                return 0;
+            }
         }
     }
+    return 1;
 }
 
 
@@ -191,19 +319,22 @@ walwrite(Wal *w, Job *j)
     if (!r) {
         filewclose(w->cur);
         w->use = 0;
+        return 0;
     }
     w->nrec++;
     return r;
 }
 
 
-void
+// walmaint performs wal compaction and sync.
+// Returns 1 on success, 0 if WAL was disabled due to error.
+int
 walmaint(Wal *w)
 {
-    if (w->use) {
-        walcompact(w);
-        walsync(w);
-    }
+    if (!w->use) return 1;
+    if (!walcompact(w)) return 0;
+    if (!walsync(w)) return 0;
+    return 1;
 }
 
 
@@ -233,6 +364,7 @@ makenextfile(Wal *w)
 
     w->next++;
     fileadd(f, w);
+    dirsync(w);
     return 1;
 }
 

@@ -5,6 +5,54 @@
 
 struct Ms tubes;
 
+// Hash table for O(1) global tube lookup by name.
+#define TUBE_HASH_SIZE 256
+static Tube *tube_ht[TUBE_HASH_SIZE];
+
+static uint
+tube_hash(const char *name)
+{
+    uint h = 5381;
+    while (*name)
+        h = h * 33 + (unsigned char)*name++;
+    return h % TUBE_HASH_SIZE;
+}
+
+static void
+tube_ht_add(Tube *t)
+{
+    uint i = tube_hash(t->name);
+    t->ht_next = tube_ht[i];
+    tube_ht[i] = t;
+}
+
+static void
+tube_ht_remove(Tube *t)
+{
+    uint i = tube_hash(t->name);
+    Tube **slot = &tube_ht[i];
+    while (*slot && *slot != t)
+        slot = &(*slot)->ht_next;
+    if (*slot)
+        *slot = (*slot)->ht_next;
+    t->ht_next = NULL;
+}
+
+// tube_find_name finds a tube by name in the global hash table. O(1).
+Tube *
+tube_find_name(const char *name)
+{
+    uint i = tube_hash(name);
+    Tube *t = tube_ht[i];
+    while (t) {
+        if (strncmp(t->name, name, MAX_TUBE_NAME_LEN) == 0)
+            return t;
+        t = t->ht_next;
+    }
+    return NULL;
+}
+
+
 Tube *
 make_tube(const char *name)
 {
@@ -34,6 +82,7 @@ make_tube(const char *name)
 static void
 tube_free(Tube *t)
 {
+    tube_ht_remove(t);
     ms_remove(&tubes, t);
     free(t->ready.data);
     free(t->delay.data);
@@ -78,6 +127,7 @@ make_and_insert_tube(const char *name)
     if (!r)
         return tube_dref(t), (Tube *) 0;
 
+    tube_ht_add(t);
     return t;
 }
 
@@ -97,9 +147,8 @@ tube_find(Ms *tubeset, const char *name)
 Tube *
 tube_find_or_make(const char *name)
 {
-    Tube *t = tube_find(&tubes, name);
+    Tube *t = tube_find_name(name);
     if (t)
         return t;
     return make_and_insert_tube(name);
 }
-

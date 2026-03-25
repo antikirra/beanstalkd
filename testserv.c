@@ -719,7 +719,7 @@ cttest_job_size_max_plus_1()
     int fd = mustdiallocal(port);
     mustsend(fd, "put 0 0 0 1073741825\r\n");
 
-    const int len = 1024*1024;
+    enum { len = 1024*1024 };
     char body[len+1];
     memset(body, 'a', len);
     body[len] = 0;

@@ -61,12 +61,15 @@ sockwant(Socket *s, int rw)
         }
         ev->flags = EV_ADD;
         ev->udata = s;
-        s->added = ev->filter;
         ev++;
         n++;
     }
 
-    return kevent(kq, evs, n, NULL, 0, &ts);
+    int r = kevent(kq, evs, n, NULL, 0, &ts);
+    if (r == 0 && rw) {
+        s->added = evs[n-1].filter;
+    }
+    return r;
 }
 
 
