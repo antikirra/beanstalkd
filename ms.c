@@ -15,17 +15,14 @@ ms_init(Ms *a, ms_event_fn oninsert, ms_event_fn onremove)
 static int
 grow(Ms *a)
 {
-    void **nitems;
     size_t ncap = a->cap << 1;
     if (!ncap)
         ncap = 1;
 
-    nitems = malloc(ncap * sizeof(void *));
+    void **nitems = realloc(a->items, ncap * sizeof(void *));
     if (!nitems)
         return 0;
 
-    memcpy(nitems, a->items, a->len * sizeof(void *));
-    free(a->items);
     a->items = nitems;
     a->cap = ncap;
     return 1;
@@ -77,6 +74,16 @@ ms_remove(Ms *a, void *item)
             return ms_delete(a, i);
     }
     return 0;
+}
+
+// ms_remove_at removes item from position i in O(1) if the hint is correct.
+// Falls back to O(n) linear scan if the hint is stale.
+int
+ms_remove_at(Ms *a, size_t i, void *item)
+{
+    if (i < a->len && a->items[i] == item)
+        return ms_delete(a, i);
+    return ms_remove(a, item);
 }
 
 int

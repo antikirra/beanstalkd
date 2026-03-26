@@ -160,6 +160,7 @@ void ms_init(Ms *a, ms_event_fn oninsert, ms_event_fn onremove);
 void ms_clear(Ms *a);
 int ms_append(Ms *a, void *item);
 int ms_remove(Ms *a, void *item);
+int ms_remove_at(Ms *a, size_t i, void *item);
 int ms_contains(Ms *a, void *item);
 void *ms_take(Ms *a);
 
@@ -222,31 +223,36 @@ struct Jobrec {
 };
 
 struct Job {
-     // persistent fields; these get written to the wal
+    // persistent fields; these get written to the wal
     Jobrec r;
 
-    // bookeeping fields; these are in-memory only
-    char pad[6];
+    // hot bookkeeping fields — accessed on every reserve/delete/timeout
+    size_t heap_index;          // where is this job in its current heap
     Tube *tube;
+    void *reserver;
+    char *body;                 // written separately to the wal
+
+    // cold bookkeeping fields — accessed less frequently
     Job *prev, *next;           // linked list of jobs
     Job *ht_next;               // Next job in a hash table list
-    size_t heap_index;          // where is this job in its current heap
     File *file;
     Job  *fnext;
     Job  *fprev;
-    void *reserver;
     int walresv;
     int walused;
-
-    char *body;                 // written separately to the wal
 };
 
 struct Tube {
     uint refs;
     char name[MAX_TUBE_NAME_LEN];
+    size_t name_len;                    // cached strlen(name)
     Tube *ht_next; // hash table chain for global tube lookup
     Heap ready;
     Heap delay;
+    size_t delay_heap_index;    // position in global delay tube heap
+    int in_delay_heap;          // 1 if tube is in global delay heap
+    size_t matchable_index;     // position in matchable tube heap
+    int in_matchable;           // 1 if tube is in matchable heap
     Ms waiting_conns;           // conns waiting for the job at this moment
     struct stats stat;
     uint using_ct;
@@ -290,6 +296,13 @@ void optparse(Server*, char**);
 extern const char *progname;
 
 int64 nanoseconds(void);
+
+// Cached value of nanoseconds() for the current event loop tick.
+// MAIN THREAD ONLY — never read or write from the async fsync thread.
+// Updated at: prottick() entry, srvserve() before each handler,
+// prot_init(), prot_replay(). Use instead of nanoseconds() in hot paths.
+extern int64 now;
+
 int   rawfalloc(int fd, int len);
 
 // Take ID for a jobs from next_id and allocate and store the job.
@@ -348,6 +361,7 @@ extern size_t job_data_size_limit;
 
 void prot_init(void);
 int64 prottick(Server *s);
+void prot_remove_tube(Tube *t);
 
 void remove_waiting_conn(Conn *c);
 
@@ -359,6 +373,7 @@ int  prot_replay(Server *s, Job *list);
 
 
 int make_server_socket(char *host, char *port);
+int make_nonblocking(int fd);
 
 
 // CONN_TYPE_* are bit masks used to track the type of connection.
@@ -407,6 +422,8 @@ struct Conn {
     int out_job_sent;           // how many bytes of *out_job were sent already
 
     Ms  watch;                  // the set of watched tubes by the connection
+    size_t *watch_idx;          // parallel to watch.items: position in each tube's waiting_conns
+    size_t  watch_idx_cap;      // allocated capacity of watch_idx
     Job reserved_jobs;          // linked list header
 };
 int  conn_less(void *ca, void *cb);

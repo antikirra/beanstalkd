@@ -8,6 +8,7 @@
 #include <stdarg.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <string.h>
@@ -506,20 +507,36 @@ filewopen(File *f)
 }
 
 
+// filewritev writes multiple buffers to f in a single writev syscall.
+// Updates WAL accounting on success. Returns 1 on success, 0 on failure.
 static int
-filewrite(File *f, Job *j, void *buf, int len)
+filewritev(File *f, Job *j, struct iovec *iov, int iovcnt)
 {
-    int written = 0;
+    int total = 0;
+    int i;
+    for (i = 0; i < iovcnt; i++)
+        total += iov[i].iov_len;
 
-    while (written < len) {
-        int r = write(f->fd, (char *)buf + written, len - written);
+    int written = 0;
+    while (written < total) {
+        ssize_t r = writev(f->fd, iov, iovcnt);
         if (r == -1 && errno == EINTR)
             continue;
         if (r <= 0) {
-            twarn("write");
+            twarn("writev");
             return 0;
         }
         written += r;
+        // Advance iov past fully written segments.
+        while (iovcnt > 0 && (size_t)r >= iov[0].iov_len) {
+            r -= iov[0].iov_len;
+            iov++;
+            iovcnt--;
+        }
+        if (iovcnt > 0 && r > 0) {
+            iov[0].iov_base = (char *)iov[0].iov_base + r;
+            iov[0].iov_len -= r;
+        }
     }
 
     f->w->resv -= written;
@@ -534,11 +551,13 @@ filewrite(File *f, Job *j, void *buf, int len)
 int
 filewrjobshort(File *f, Job *j)
 {
-    int r, nl;
+    int nl = 0; // name len 0 indicates short record
+    struct iovec iov[2] = {
+        { .iov_base = &nl,   .iov_len = sizeof nl },
+        { .iov_base = &j->r, .iov_len = sizeof j->r },
+    };
 
-    nl = 0; // name len 0 indicates short record
-    r = filewrite(f, j, &nl, sizeof nl) &&
-        filewrite(f, j, &j->r, sizeof j->r);
+    int r = filewritev(f, j, iov, 2);
     if (!r) return 0;
 
     if (j->r.state == Invalid) {
@@ -552,15 +571,16 @@ filewrjobshort(File *f, Job *j)
 int
 filewrjobfull(File *f, Job *j)
 {
-    int nl;
+    int nl = j->tube->name_len;
+    struct iovec iov[4] = {
+        { .iov_base = &nl,           .iov_len = sizeof nl },
+        { .iov_base = j->tube->name, .iov_len = nl },
+        { .iov_base = &j->r,         .iov_len = sizeof j->r },
+        { .iov_base = j->body,       .iov_len = j->r.body_size },
+    };
 
     fileaddjob(f, j);
-    nl = strlen(j->tube->name);
-    return
-        filewrite(f, j, &nl, sizeof nl) &&
-        filewrite(f, j, j->tube->name, nl) &&
-        filewrite(f, j, &j->r, sizeof j->r) &&
-        filewrite(f, j, j->body, j->r.body_size);
+    return filewritev(f, j, iov, 4);
 }
 
 

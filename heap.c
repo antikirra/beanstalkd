@@ -74,16 +74,11 @@ int
 heapinsert(Heap *h, void *x)
 {
     if (h->len == h->cap) {
-        void **ndata;
         size_t ncap = (h->len+1) * 2; /* allocate twice what we need */
-
-        ndata = malloc(sizeof(void*) * ncap);
+        void **ndata = realloc(h->data, sizeof(void*) * ncap);
         if (!ndata) {
             return 0;
         }
-
-        memcpy(ndata, h->data, sizeof(void*) * h->len);
-        free(h->data);
         h->data = ndata;
         h->cap = ncap;
     }

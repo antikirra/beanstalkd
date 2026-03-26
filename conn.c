@@ -124,7 +124,7 @@ conntickat(Conn *c)
     }
 
     if (has_reserved_job(c)) {
-        t = connsoonestjob(c)->r.deadline_at - nanoseconds() - margin;
+        t = connsoonestjob(c)->r.deadline_at - now - margin;
         should_timeout = 1;
     }
     if (c->pending_timeout >= 0) {
@@ -133,7 +133,7 @@ conntickat(Conn *c)
     }
 
     if (should_timeout) {
-        return nanoseconds() + t;
+        return now + t;
     }
     return 0;
 }
@@ -185,7 +185,7 @@ conn_reserve_job(Conn *c, Job *j) {
     j->tube->stat.reserved_ct++;
     j->r.reserve_ct++;
 
-    j->r.deadline_at = nanoseconds() + j->r.ttr;
+    j->r.deadline_at = now + j->r.ttr;
     j->r.state = Reserved;
     job_list_insert(&c->reserved_jobs, j);
     j->reserver = c;
@@ -198,7 +198,7 @@ conn_reserve_job(Conn *c, Job *j) {
 int
 conndeadlinesoon(Conn *c)
 {
-    int64 t = nanoseconds();
+    int64 t = now;
     Job *j = connsoonestjob(c);
 
     return j && t >= j->r.deadline_at - SAFETY_MARGIN;
@@ -210,7 +210,8 @@ conn_ready(Conn *c)
     size_t i;
 
     for (i = 0; i < c->watch.len; i++) {
-        if (((Tube *) c->watch.items[i])->ready.len)
+        Tube *t = c->watch.items[i];
+        if (t->ready.len && !t->pause)
             return 1;
     }
     return 0;
@@ -261,6 +262,7 @@ connclose(Conn *c)
         enqueue_reserved_jobs(c);
 
     ms_clear(&c->watch);
+    free(c->watch_idx);
     c->use->using_ct--;
     TUBE_ASSIGN(c->use, NULL);
 

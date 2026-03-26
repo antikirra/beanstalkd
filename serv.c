@@ -67,6 +67,7 @@ srvserve(Server *s)
         }
 
         if (rw) {
+            now = nanoseconds();
             sock->f(sock->x, rw);
         }
     }

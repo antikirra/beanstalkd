@@ -15,8 +15,8 @@
 #include <systemd/sd-daemon.h>
 #endif
 
-static int
-set_nonblocking(int fd)
+int
+make_nonblocking(int fd)
 {
     int flags, r;
 
@@ -57,7 +57,7 @@ make_inet_socket(char *host, char *port)
             continue;
         }
 
-        r = set_nonblocking(fd);
+        r = make_nonblocking(fd);
         if (r == -1) {
             close(fd);
             continue;
@@ -185,7 +185,7 @@ make_unix_socket(char *path)
         return -1;
     }
 
-    r = set_nonblocking(fd);
+    r = make_nonblocking(fd);
     if (r == -1) {
         close(fd);
         return -1;

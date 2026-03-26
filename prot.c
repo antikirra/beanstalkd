@@ -12,6 +12,8 @@
 #include <sys/types.h>
 #include <sys/utsname.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <inttypes.h>
 #include <stdarg.h>
 #include <signal.h>
@@ -229,9 +231,119 @@ size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
 #define BUCKET_BUF_SIZE 1024
 
 static uint64 ready_ct = 0;
+static uint64 delayed_ct = 0;
+static uint64 paused_ct = 0;
 static uint64 timeout_ct = 0;
+
+int64 now = 0;
 static uint64 op_ct[TOTAL_OPS] = {0};
 static struct stats global_stat = {0};
+
+// Global delay tube heap: tubes ordered by their soonest delayed job's deadline.
+// Provides O(1) lookup of the soonest delayed job across all tubes,
+// replacing the O(tubes.len) scan in soonest_delayed_job().
+static Heap delay_tube_heap;
+
+static int
+tube_delay_less(void *ta, void *tb)
+{
+    Tube *a = ta;
+    Tube *b = tb;
+    if (a->delay.len == 0) return 0;
+    if (b->delay.len == 0) return 1;
+    Job *ja = a->delay.data[0];
+    Job *jb = b->delay.data[0];
+    return ja->r.deadline_at < jb->r.deadline_at;
+}
+
+static void
+tube_delay_setpos(void *t, size_t pos)
+{
+    ((Tube *)t)->delay_heap_index = pos;
+}
+
+// Update the global delay tube heap after a tube's delay heap changes.
+// Call after inserting/removing a delayed job in a tube.
+// On removal (delay.len == 0): always succeeds.
+// On insert/re-sort: may fail under OOM. Returns 0 on failure, 1 on success.
+// OOM failure is non-fatal: tube is temporarily invisible to
+// soonest_delayed_job(). Next insert into this tube retries.
+static int
+delay_tube_update(Tube *t)
+{
+    if (t->delay.len == 0) {
+        if (t->in_delay_heap) {
+            heapremove(&delay_tube_heap, t->delay_heap_index);
+            t->in_delay_heap = 0;
+        }
+        return 1;
+    }
+    if (t->in_delay_heap) {
+        heapremove(&delay_tube_heap, t->delay_heap_index);
+    }
+    t->in_delay_heap = heapinsert(&delay_tube_heap, t);
+    return t->in_delay_heap;
+}
+
+// Matchable tube heap: tubes with ready jobs AND waiting connections.
+// Provides O(1) lookup of the highest-priority matchable job,
+// replacing the O(tubes.len) scan in next_awaited_job().
+static Heap matchable_heap;
+
+static int
+tube_match_less(void *ta, void *tb)
+{
+    Tube *a = ta;
+    Tube *b = tb;
+    if (a->ready.len == 0) return 0;
+    if (b->ready.len == 0) return 1;
+    return job_pri_less(a->ready.data[0], b->ready.data[0]);
+}
+
+static void
+tube_match_setpos(void *t, size_t pos)
+{
+    ((Tube *)t)->matchable_index = pos;
+}
+
+// Update tube's membership in the matchable heap.
+// A tube is matchable when it has ready jobs, waiting connections,
+// and is not paused. Call after any change to these conditions.
+static void
+matchable_update(Tube *t)
+{
+    int dominated = t->ready.len > 0
+                 && t->waiting_conns.len > 0
+                 && !t->pause;
+    if (dominated) {
+        if (t->in_matchable) {
+            heapremove(&matchable_heap, t->matchable_index);
+        }
+        t->in_matchable = heapinsert(&matchable_heap, t);
+    } else if (t->in_matchable) {
+        heapremove(&matchable_heap, t->matchable_index);
+        t->in_matchable = 0;
+    }
+}
+
+// Clean up prot.c internal state when a tube is about to be freed.
+// Called from tube_free() in tube.c.
+void
+prot_remove_tube(Tube *t)
+{
+    if (t->pause)
+        paused_ct--;
+    if (t->delay.len > 0)
+        delayed_ct -= t->delay.len;
+    if (t->in_delay_heap) {
+        heapremove(&delay_tube_heap, t->delay_heap_index);
+        t->in_delay_heap = 0;
+    }
+    if (t->in_matchable) {
+        heapremove(&matchable_heap, t->matchable_index);
+        t->in_matchable = 0;
+    }
+}
 
 static Tube *default_tube;
 
@@ -281,6 +393,7 @@ static const char * op_names[] = {
 
 static Job *remove_ready_job(Job *j);
 static Job *remove_buried_job(Job *j);
+static Job *remove_delayed_job(Job *j);
 
 // epollq_add schedules connection c in the s->conns heap, adds c
 // to the epollq list to change expected operation in event notifications.
@@ -407,59 +520,62 @@ remove_waiting_conn(Conn *c)
     for (i = 0; i < c->watch.len; i++) {
         Tube *t = c->watch.items[i];
         t->stat.waiting_ct--;
-        ms_remove(&t->waiting_conns, c);
+        ms_remove_at(&t->waiting_conns, c->watch_idx[i], c);
+        matchable_update(t);
     }
 }
 
 // enqueue_waiting_conn sets CONN_TYPE_WAITING for the connection,
 // adds it to the waiting_conns set of every tube it's watching.
+// Records each position in c->watch_idx for O(1) removal later.
 static int
 enqueue_waiting_conn(Conn *c)
 {
     size_t i;
+
+    // Ensure watch_idx has capacity for all watched tubes.
+    if (c->watch.len > c->watch_idx_cap) {
+        size_t ncap = c->watch_idx_cap ? c->watch_idx_cap * 2 : 4;
+        if (ncap < c->watch.len) ncap = c->watch.len;
+        size_t *p = realloc(c->watch_idx, ncap * sizeof(size_t));
+        if (!p)
+            return 0;
+        c->watch_idx = p;
+        c->watch_idx_cap = ncap;
+    }
+
     for (i = 0; i < c->watch.len; i++) {
         Tube *t = c->watch.items[i];
         if (!ms_append(&t->waiting_conns, c)) {
             size_t j;
             for (j = 0; j < i; j++) {
                 Tube *u = c->watch.items[j];
-                ms_remove(&u->waiting_conns, c);
+                ms_remove_at(&u->waiting_conns, c->watch_idx[j], c);
                 u->stat.waiting_ct--;
+                matchable_update(u);
             }
             return 0;
         }
+        c->watch_idx[i] = t->waiting_conns.len - 1;
         t->stat.waiting_ct++;
+        matchable_update(t);
     }
     c->type |= CONN_TYPE_WAITING;
     global_stat.waiting_ct++;
     return 1;
 }
 
-// next_awaited_job iterates through all the tubes with awaiting connections,
-// returns the next ready job with the smallest priority.
-// If jobs has the same priority it picks the job with smaller id.
-// All tubes with expired pause are unpaused.
+// next_awaited_job returns the highest-priority ready job among all tubes
+// that have both ready jobs and waiting connections. O(1) via matchable heap.
 static Job *
-next_awaited_job(int64 now)
+next_awaited_job()
 {
-    size_t i;
-    Job *j = NULL;
-
-    for (i = 0; i < tubes.len; i++) {
-        Tube *t = tubes.items[i];
-        if (t->pause) {
-            if (t->unpause_at > now)
-                continue;
-            t->pause = 0;
-        }
-        if (t->waiting_conns.len && t->ready.len) {
-            Job *candidate = t->ready.data[0];
-            if (!j || job_pri_less(candidate, j)) {
-                j = candidate;
-            }
-        }
-    }
-    return j;
+    if (matchable_heap.len == 0)
+        return NULL;
+    Tube *t = matchable_heap.data[0];
+    if (t->ready.len == 0 || t->waiting_conns.len == 0)
+        return NULL;
+    return t->ready.data[0];
 }
 
 // process_queue performs reservation for every jobs that is awaited for.
@@ -467,18 +583,30 @@ static void
 process_queue()
 {
     Job *j = NULL;
-    int64 now = nanoseconds();
 
-    while ((j = next_awaited_job(now))) {
+    while ((j = next_awaited_job())) {
         j = remove_ready_job(j);
         if (j == NULL) {
+            // Impossible: next_awaited_job found a ready job but remove
+            // failed. Break to avoid infinite loop (NASA rule 2).
             twarnx("job not ready");
-            continue;
+            break;
         }
         Conn *c = ms_take(&j->tube->waiting_conns);
         if (c == NULL) {
+            // Impossible: next_awaited_job checked waiting_conns.len > 0
+            // but ms_take returned NULL. Re-enqueue the job we just removed
+            // from the ready heap to avoid orphaning it, then break.
             twarnx("waiting_conns is empty");
-            continue;
+            heapinsert(&j->tube->ready, j);
+            j->r.state = Ready;
+            ready_ct++;
+            if (j->r.pri < URGENT_THRESHOLD) {
+                global_stat.urgent_ct++;
+                j->tube->stat.urgent_ct++;
+            }
+            matchable_update(j->tube);
+            break;
         }
         global_stat.reserved_ct++;
 
@@ -489,23 +617,16 @@ process_queue()
 }
 
 // soonest_delayed_job returns the delayed job
-// with the smallest deadline_at among all tubes.
+// with the smallest deadline_at among all tubes. O(1) via global heap.
 static Job *
 soonest_delayed_job()
 {
-    Job *j = NULL;
-    size_t i;
-
-    for (i = 0; i < tubes.len; i++) {
-        Tube *t = tubes.items[i];
-        if (t->delay.len == 0) {
-            continue;
-        }
-        Job *nj = t->delay.data[0];
-        if (!j || nj->r.deadline_at < j->r.deadline_at)
-            j = nj;
-    }
-    return j;
+    if (delay_tube_heap.len == 0)
+        return NULL;
+    Tube *t = delay_tube_heap.data[0];
+    if (t->delay.len == 0)
+        return NULL;
+    return t->delay.data[0];
 }
 
 // enqueue_job inserts job j in the tube, returns 1 on success, otherwise 0.
@@ -518,11 +639,13 @@ enqueue_job(Server *s, Job *j, int64 delay, char update_store)
 
     j->reserver = NULL;
     if (delay) {
-        j->r.deadline_at = nanoseconds() + delay;
+        j->r.deadline_at = now + delay;
         r = heapinsert(&j->tube->delay, j);
         if (!r)
             return 0;
         j->r.state = Delayed;
+        delayed_ct++;
+        delay_tube_update(j->tube);
     } else {
         r = heapinsert(&j->tube->ready, j);
         if (!r)
@@ -533,6 +656,7 @@ enqueue_job(Server *s, Job *j, int64 delay, char update_store)
             global_stat.urgent_ct++;
             j->tube->stat.urgent_ct++;
         }
+        matchable_update(j->tube);
     }
 
     if (update_store) {
@@ -588,7 +712,6 @@ enqueue_reserved_jobs(Conn *c)
         j->tube->stat.reserved_ct--;
         c->soonest_job = NULL;
     }
-    process_queue();
 }
 
 static int
@@ -614,18 +737,7 @@ kick_buried_job(Server *s, Job *j)
     return 0;
 }
 
-static uint
-get_delayed_job_ct()
-{
-    size_t i;
-    uint count = 0;
 
-    for (i = 0; i < tubes.len; i++) {
-        Tube *t = tubes.items[i];
-        count += t->delay.len;
-    }
-    return count;
-}
 
 static int
 kick_delayed_job(Server *s, Job *j)
@@ -638,7 +750,7 @@ kick_delayed_job(Server *s, Job *j)
         return 0;
     j->walresv += z;
 
-    heapremove(&j->tube->delay, j->heap_index);
+    remove_delayed_job(j);
 
     j->r.kick_ct++;
     r = enqueue_job(s, j, 0, 1);
@@ -655,19 +767,12 @@ kick_delayed_job(Server *s, Job *j)
     return 0;
 }
 
-static int
-buried_job_p(Tube *t)
-{
-    // this function does not do much. inline?
-    return !job_list_is_empty(&t->buried);
-}
-
 /* return the number of jobs successfully kicked */
 static uint
 kick_buried_jobs(Server *s, Tube *t, uint n)
 {
     uint i;
-    for (i = 0; (i < n) && buried_job_p(t); ++i) {
+    for (i = 0; (i < n) && !job_list_is_empty(&t->buried); ++i) {
         kick_buried_job(s, t->buried.next);
     }
     return i;
@@ -687,7 +792,7 @@ kick_delayed_jobs(Server *s, Tube *t, uint n)
 static uint
 kick_jobs(Server *s, Tube *t, uint n)
 {
-    if (buried_job_p(t))
+    if (!job_list_is_empty(&t->buried))
         return kick_buried_jobs(s, t, n);
     return kick_delayed_jobs(s, t, n);
 }
@@ -715,6 +820,8 @@ remove_delayed_job(Job *j)
     if (!j || j->r.state != Delayed)
         return NULL;
     heapremove(&j->tube->delay, j->heap_index);
+    delayed_ct--;
+    delay_tube_update(j->tube);
 
     return j;
 }
@@ -732,6 +839,7 @@ remove_ready_job(Job *j)
         global_stat.urgent_ct--;
         j->tube->stat.urgent_ct--;
     }
+    matchable_update(j->tube);
     return j;
 }
 
@@ -745,7 +853,7 @@ static bool
 touch_job(Conn *c, Job *j)
 {
     if (is_job_reserved_by_conn(c, j)) {
-        j->r.deadline_at = nanoseconds() + j->r.ttr;
+        j->r.deadline_at = now + j->r.ttr;
         c->soonest_job = NULL;
         return true;
     }
@@ -789,31 +897,58 @@ static int
 which_cmd(Conn *c)
 {
 #define TEST_CMD(s,c,o) if (strncmp((s), (c), CONSTSTRLEN(c)) == 0) return (o);
-    TEST_CMD(c->cmd, CMD_PUT, OP_PUT);
-    TEST_CMD(c->cmd, CMD_PEEKJOB, OP_PEEKJOB);
-    TEST_CMD(c->cmd, CMD_PEEK_READY, OP_PEEK_READY);
-    TEST_CMD(c->cmd, CMD_PEEK_DELAYED, OP_PEEK_DELAYED);
-    TEST_CMD(c->cmd, CMD_PEEK_BURIED, OP_PEEK_BURIED);
-    TEST_CMD(c->cmd, CMD_RESERVE_TIMEOUT, OP_RESERVE_TIMEOUT);
-    TEST_CMD(c->cmd, CMD_RESERVE_JOB, OP_RESERVE_JOB);
-    TEST_CMD(c->cmd, CMD_RESERVE, OP_RESERVE);
-    TEST_CMD(c->cmd, CMD_DELETE, OP_DELETE);
-    TEST_CMD(c->cmd, CMD_RELEASE, OP_RELEASE);
-    TEST_CMD(c->cmd, CMD_BURY, OP_BURY);
-    TEST_CMD(c->cmd, CMD_KICK, OP_KICK);
-    TEST_CMD(c->cmd, CMD_KICKJOB, OP_KICKJOB);
-    TEST_CMD(c->cmd, CMD_TOUCH, OP_TOUCH);
-    TEST_CMD(c->cmd, CMD_STATSJOB, OP_STATSJOB);
-    TEST_CMD(c->cmd, CMD_STATS_TUBE, OP_STATS_TUBE);
-    TEST_CMD(c->cmd, CMD_STATS, OP_STATS);
-    TEST_CMD(c->cmd, CMD_USE, OP_USE);
-    TEST_CMD(c->cmd, CMD_WATCH, OP_WATCH);
-    TEST_CMD(c->cmd, CMD_IGNORE, OP_IGNORE);
-    TEST_CMD(c->cmd, CMD_LIST_TUBES_WATCHED, OP_LIST_TUBES_WATCHED);
-    TEST_CMD(c->cmd, CMD_LIST_TUBE_USED, OP_LIST_TUBE_USED);
-    TEST_CMD(c->cmd, CMD_LIST_TUBES, OP_LIST_TUBES);
-    TEST_CMD(c->cmd, CMD_QUIT, OP_QUIT);
-    TEST_CMD(c->cmd, CMD_PAUSE_TUBE, OP_PAUSE_TUBE);
+    /* Dispatch by first byte reduces average strncmp calls from 25 to 1-6. */
+    switch (c->cmd[0]) {
+    case 'p':
+        TEST_CMD(c->cmd, CMD_PUT, OP_PUT);
+        TEST_CMD(c->cmd, CMD_PEEKJOB, OP_PEEKJOB);
+        TEST_CMD(c->cmd, CMD_PEEK_READY, OP_PEEK_READY);
+        TEST_CMD(c->cmd, CMD_PEEK_DELAYED, OP_PEEK_DELAYED);
+        TEST_CMD(c->cmd, CMD_PEEK_BURIED, OP_PEEK_BURIED);
+        TEST_CMD(c->cmd, CMD_PAUSE_TUBE, OP_PAUSE_TUBE);
+        break;
+    case 'r':
+        TEST_CMD(c->cmd, CMD_RESERVE_TIMEOUT, OP_RESERVE_TIMEOUT);
+        TEST_CMD(c->cmd, CMD_RESERVE_JOB, OP_RESERVE_JOB);
+        TEST_CMD(c->cmd, CMD_RESERVE, OP_RESERVE);
+        TEST_CMD(c->cmd, CMD_RELEASE, OP_RELEASE);
+        break;
+    case 'd':
+        TEST_CMD(c->cmd, CMD_DELETE, OP_DELETE);
+        break;
+    case 'b':
+        TEST_CMD(c->cmd, CMD_BURY, OP_BURY);
+        break;
+    case 'k':
+        TEST_CMD(c->cmd, CMD_KICK, OP_KICK);
+        TEST_CMD(c->cmd, CMD_KICKJOB, OP_KICKJOB);
+        break;
+    case 't':
+        TEST_CMD(c->cmd, CMD_TOUCH, OP_TOUCH);
+        break;
+    case 's':
+        TEST_CMD(c->cmd, CMD_STATSJOB, OP_STATSJOB);
+        TEST_CMD(c->cmd, CMD_STATS_TUBE, OP_STATS_TUBE);
+        TEST_CMD(c->cmd, CMD_STATS, OP_STATS);
+        break;
+    case 'u':
+        TEST_CMD(c->cmd, CMD_USE, OP_USE);
+        break;
+    case 'w':
+        TEST_CMD(c->cmd, CMD_WATCH, OP_WATCH);
+        break;
+    case 'i':
+        TEST_CMD(c->cmd, CMD_IGNORE, OP_IGNORE);
+        break;
+    case 'l':
+        TEST_CMD(c->cmd, CMD_LIST_TUBES_WATCHED, OP_LIST_TUBES_WATCHED);
+        TEST_CMD(c->cmd, CMD_LIST_TUBE_USED, OP_LIST_TUBE_USED);
+        TEST_CMD(c->cmd, CMD_LIST_TUBES, OP_LIST_TUBES);
+        break;
+    case 'q':
+        TEST_CMD(c->cmd, CMD_QUIT, OP_QUIT);
+        break;
+    }
     return OP_UNKNOWN;
 }
 
@@ -930,7 +1065,7 @@ enqueue_incoming_job(Conn *c)
 static uint
 uptime()
 {
-    return (nanoseconds() - started_at) / 1000000000;
+    return (now - started_at) / 1000000000;
 }
 
 static int
@@ -939,8 +1074,6 @@ fmt_stats(char *buf, size_t size, void *x)
     int whead = 0, wcur = 0;
     Server *s = x;
     struct rusage ru;
-
-    s = x;
 
     if (s->wal.head) {
         whead = s->wal.head->seq;
@@ -955,7 +1088,7 @@ fmt_stats(char *buf, size_t size, void *x)
                     global_stat.urgent_ct,
                     ready_ct,
                     global_stat.reserved_ct,
-                    get_delayed_job_ct(),
+                    (uint)delayed_ct,
                     global_stat.buried_ct,
                     op_ct[OP_PUT],
                     op_ct[OP_PEEKJOB],
@@ -1005,18 +1138,11 @@ fmt_stats(char *buf, size_t size, void *x)
                     node_info.machine);
 }
 
-/* Read an integer from the given buffer and place it in num.
- * Parsed integer should fit into uint64.
- * Update end to point to the address after the last character consumed.
- * num and end can be NULL. If they are both NULL, read_u64() will do the
- * conversion and return the status code but not update any values.
- * This is an easy way to check for errors.
- * If end is NULL, read_u64() will also check that the entire input string
- * was consumed and return an error code otherwise.
- * Return 0 on success, or nonzero on failure.
- * If a failure occurs, num and end are not modified. */
+/* Read an unsigned integer from buf, validate it fits within max_val.
+ * Skip leading spaces. If end is NULL, require the entire string to be consumed.
+ * Return 0 on success, -1 on failure. On failure, out and end are unmodified. */
 static int
-read_u64(uint64 *num, const char *buf, char **end)
+read_uint(uintmax_t *out, uintmax_t max_val, const char *buf, char **end)
 {
     uintmax_t tnum;
     char *tend;
@@ -1033,39 +1159,30 @@ read_u64(uint64 *num, const char *buf, char **end)
         return -1;
     if (!end && tend[0] != '\0')
         return -1;
-    if (tnum > UINT64_MAX)
+    if (tnum > max_val)
         return -1;
 
-    if (num) *num = (uint64)tnum;
+    if (out) *out = tnum;
     if (end) *end = tend;
     return 0;
 }
 
-// Indentical to read_u64() but instead reads into uint32.
+static int
+read_u64(uint64 *num, const char *buf, char **end)
+{
+    uintmax_t v;
+    int r = read_uint(&v, UINT64_MAX, buf, end);
+    if (r == 0 && num) *num = (uint64)v;
+    return r;
+}
+
 static int
 read_u32(uint32 *num, const char *buf, char **end)
 {
-    uintmax_t tnum;
-    char *tend;
-
-    errno = 0;
-    while (buf[0] == ' ')
-        buf++;
-    if (buf[0] < '0' || '9' < buf[0])
-        return -1;
-    tnum = strtoumax(buf, &tend, 10);
-    if (tend == buf)
-        return -1;
-    if (errno)
-        return -1;
-    if (!end && tend[0] != '\0')
-        return -1;
-    if (tnum > UINT32_MAX)
-        return -1;
-
-    if (num) *num = (uint32)tnum;
-    if (end) *end = tend;
-    return 0;
+    uintmax_t v;
+    int r = read_uint(&v, UINT32_MAX, buf, end);
+    if (r == 0 && num) *num = (uint32)v;
+    return r;
 }
 
 /* Read a delay value in seconds from the given buffer and
@@ -1123,31 +1240,30 @@ wait_for_job(Conn *c, int timeout)
 
 typedef int(*fmt_fn)(char *, size_t, void *);
 
+// Stats buffer size. Enough for any stats response (typical ~1.5KB).
+#define STATS_BUF_SIZE 4096
+
 static void
 do_stats(Conn *c, fmt_fn fmt, void *data)
 {
-    int r, stats_len;
-
-    /* first, measure how big a buffer we will need */
-    stats_len = fmt(NULL, 0, data) + 16;
-
-    c->out_job = allocate_job(stats_len); /* fake job to hold stats data */
+    /* Allocate once, format directly into the job body.
+     * Avoids the old two-pass approach (measure + format)
+     * and also avoids stack buffer + memcpy. */
+    c->out_job = allocate_job(STATS_BUF_SIZE);
     if (!c->out_job) {
         reply_serr(c, MSG_OUT_OF_MEMORY);
         return;
     }
 
-    /* Mark this job as a copy so it can be appropriately freed later on */
     c->out_job->r.state = Copy;
-
-    /* now actually format the stats data */
-    r = fmt(c->out_job->body, stats_len, data);
-    /* and set the actual body size */
-    c->out_job->r.body_size = r;
-    if (r > stats_len) {
+    int r = fmt(c->out_job->body, STATS_BUF_SIZE, data);
+    if (r >= STATS_BUF_SIZE) {
+        job_free(c->out_job);
+        c->out_job = NULL;
         reply_serr(c, MSG_INTERNAL_ERROR);
         return;
     }
+    c->out_job->r.body_size = r;
 
     c->out_job_sent = 0;
     reply_line(c, STATE_SEND_JOB, "OK %d\r\n", r - 2);
@@ -1156,36 +1272,37 @@ do_stats(Conn *c, fmt_fn fmt, void *data)
 static void
 do_list_tubes(Conn *c, Ms *l)
 {
-    char *buf;
     Tube *t;
-    size_t i, resp_z;
+    size_t i;
 
-    /* first, measure how big a buffer we will need */
-    resp_z = 6; /* initial "---\n" and final "\r\n" */
-    for (i = 0; i < l->len; i++) {
-        t = l->items[i];
-        resp_z += 3 + strlen(t->name); /* including "- " and "\n" */
-    }
-
-    c->out_job = allocate_job(resp_z); /* fake job to hold response data */
+    /* Upper bound: "---\n" (4) + N × ("- " + name + "\n") + "\r\n" (2).
+     * Over-allocates by (MAX_TUBE_NAME_LEN - actual_len) per tube,
+     * but avoids a measurement pass over the tube list. */
+    size_t maxsz = 6 + l->len * (3 + MAX_TUBE_NAME_LEN);
+    c->out_job = allocate_job(maxsz);
     if (!c->out_job) {
         reply_serr(c, MSG_OUT_OF_MEMORY);
         return;
     }
-
-    /* Mark this job as a copy so it can be appropriately freed later on */
     c->out_job->r.state = Copy;
 
-    /* now actually format the response */
-    buf = c->out_job->body;
-    buf += snprintf(buf, 5, "---\n");
+    char *buf = c->out_job->body;
+    memcpy(buf, "---\n", 4);
+    buf += 4;
     for (i = 0; i < l->len; i++) {
         t = l->items[i];
-        buf += snprintf(buf, 4 + strlen(t->name), "- %s\n", t->name);
+        *buf++ = '-';
+        *buf++ = ' ';
+        size_t nl = t->name_len;
+        memcpy(buf, t->name, nl);
+        buf += nl;
+        *buf++ = '\n';
     }
-    buf[0] = '\r';
-    buf[1] = '\n';
+    *buf++ = '\r';
+    *buf++ = '\n';
 
+    size_t resp_z = buf - c->out_job->body;
+    c->out_job->r.body_size = resp_z;
     c->out_job_sent = 0;
     reply_line(c, STATE_SEND_JOB, "OK %zu\r\n", resp_z - 2);
 }
@@ -1197,7 +1314,7 @@ fmt_job_stats(char *buf, size_t size, Job *j)
     int64 time_left;
     int file = 0;
 
-    t = nanoseconds();
+    t = now;
     if (j->r.state == Reserved || j->r.state == Delayed) {
         time_left = (j->r.deadline_at - t) / 1000000000;
     } else {
@@ -1229,7 +1346,7 @@ fmt_stats_tube(char *buf, size_t size, Tube *t)
     uint64 time_left;
 
     if (t->pause > 0) {
-        time_left = (t->unpause_at - nanoseconds()) / 1000000000;
+        time_left = (t->unpause_at - now) / 1000000000;
     } else {
         time_left = 0;
     }
@@ -1416,7 +1533,7 @@ dispatch_cmd(Conn *c)
         }
         op_ct[type]++;
 
-        if (buried_job_p(c->use))
+        if (!job_list_is_empty(&c->use->buried))
             j = job_copy(c->use->buried.next);
         else
             j = NULL;
@@ -1853,9 +1970,12 @@ dispatch_cmd(Conn *c)
             delay = 1;
         }
 
-        t->unpause_at = nanoseconds() + delay;
+        t->unpause_at = now + delay;
+        if (!t->pause)
+            paused_ct++;
         t->pause = delay;
         t->stat.pause_ct++;
+        matchable_update(t);
 
         reply_line(c, STATE_SEND_WORD, "PAUSED\r\n");
         return;
@@ -1886,7 +2006,7 @@ conn_timeout(Conn *c)
     /* Check if any reserved jobs have run out of time. We should do this
      * whether or not the client is waiting for a new reservation. */
     while ((j = connsoonestjob(c))) {
-        if (j->r.deadline_at >= nanoseconds())
+        if (j->r.deadline_at >= now)
             break;
 
         /* This job is in the middle of being written out. If we return it to
@@ -1908,8 +2028,6 @@ conn_timeout(Conn *c)
             bury_job(c->srv, j, 0); /* out of memory, so bury it */
         connsched(c);
     }
-
-    process_queue();
 
     if (should_timeout) {
         remove_waiting_conn(c);
@@ -2164,7 +2282,6 @@ int64
 prottick(Server *s)
 {
     Job *j;
-    int64 now;
     Tube *t;
     int64 period = 0x34630B8A000LL; /* 1 hour in nanoseconds */
     int64 d;
@@ -2173,31 +2290,36 @@ prottick(Server *s)
 
     // Enqueue all jobs that are no longer delayed.
     // Capture the smallest period from the soonest delayed job.
-    while ((j = soonest_delayed_job())) {
+    // Loop bound: each iteration removes one job via remove_delayed_job.
+    while (delayed_ct > 0 && (j = soonest_delayed_job())) {
         d = j->r.deadline_at - now;
         if (d > 0) {
             period = min(period, d);
             break;
         }
-        heapremove(&j->tube->delay, j->heap_index);
+        remove_delayed_job(j);
         int r = enqueue_job(s, j, 0, 0);
         if (r < 1)
             bury_job(s, j, 0);  /* out of memory */
     }
-    process_queue();
 
-    // Unpause every possible tube and process the queue.
+    // Unpause every possible tube.
     // Capture the smallest period from the soonest pause deadline.
+    // Skip entirely when no tubes are paused (common case).
     size_t i;
-    for (i = 0; i < tubes.len; i++) {
-        t = tubes.items[i];
-        d = t->unpause_at - now;
-        if (t->pause && d <= 0) {
-            t->pause = 0;
-            process_queue();
-        }
-        else if (d > 0) {
-            period = min(period, d);
+    if (paused_ct) {
+        for (i = 0; i < tubes.len; i++) {
+            t = tubes.items[i];
+            if (!t->pause)
+                continue;
+            d = t->unpause_at - now;
+            if (d <= 0) {
+                t->pause = 0;
+                paused_ct--;
+                matchable_update(t);
+            } else {
+                period = min(period, d);
+            }
         }
     }
 
@@ -2214,6 +2336,11 @@ prottick(Server *s)
         c->in_conns = 0;
         conn_timeout(c);
     }
+
+    // Match ready jobs with waiting connections. Single call covers all
+    // state changes above: delayed→ready transitions, tube unpauses,
+    // and expired reservation re-enqueues.
+    process_queue();
 
     epollq_apply();
 
@@ -2241,9 +2368,8 @@ h_accept(const int fd, const short which, Server *s)
         printf("accept %d\n", cfd);
     }
 
-    int flags = fcntl(cfd, F_GETFL, 0);
-    if (flags < 0) {
-        twarn("getting flags");
+    int r = make_nonblocking(cfd);
+    if (r == -1) {
         close(cfd);
         if (verbose) {
             printf("close %d\n", cfd);
@@ -2252,16 +2378,8 @@ h_accept(const int fd, const short which, Server *s)
         return;
     }
 
-    int r = fcntl(cfd, F_SETFL, flags | O_NONBLOCK);
-    if (r < 0) {
-        twarn("setting O_NONBLOCK");
-        close(cfd);
-        if (verbose) {
-            printf("close %d\n", cfd);
-        }
-        epollq_apply();
-        return;
-    }
+    int flags = 1;
+    setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &flags, sizeof flags);
 
     Conn *c = make_conn(cfd, STATE_WANT_COMMAND, default_tube, default_tube);
     if (!c) {
@@ -2291,7 +2409,8 @@ h_accept(const int fd, const short which, Server *s)
 void
 prot_init()
 {
-    started_at = nanoseconds();
+    now = nanoseconds();
+    started_at = now;
     memset(op_ct, 0, sizeof(op_ct));
 
     int dev_random = open("/dev/urandom", O_RDONLY);
@@ -2319,6 +2438,11 @@ prot_init()
 
     ms_init(&tubes, NULL, NULL);
 
+    delay_tube_heap.less = tube_delay_less;
+    delay_tube_heap.setpos = tube_delay_setpos;
+    matchable_heap.less = tube_match_less;
+    matchable_heap.setpos = tube_match_setpos;
+
     TUBE_ASSIGN(default_tube, tube_find_or_make("default"));
     if (!default_tube)
         twarnx("Out of memory during startup!");
@@ -2332,8 +2456,9 @@ int
 prot_replay(Server *s, Job *list)
 {
     Job *j, *nj;
-    int64 t;
     int r;
+
+    now = nanoseconds();
 
     for (j = list->next ; j != list ; j = nj) {
         nj = j->next;
@@ -2351,9 +2476,8 @@ prot_replay(Server *s, Job *list)
             break;
         }
         case Delayed:
-            t = nanoseconds();
-            if (t < j->r.deadline_at) {
-                delay = j->r.deadline_at - t;
+            if (now < j->r.deadline_at) {
+                delay = j->r.deadline_at - now;
             }
             /* Falls through */
         default:

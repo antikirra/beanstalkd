@@ -48,6 +48,7 @@ TOFILES=\
 	testutil2.o\
 	teststress.o\
 	testcore.o\
+	testprot2.o\
 
 HFILES=\
 	dat.h\

@@ -1,5 +1,6 @@
 #include "dat.h"
 #include <stdint.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -53,6 +54,29 @@ tube_find_name(const char *name)
 }
 
 
+// on_waiting_swap is called by ms_delete after swapping the last element
+// into position i. It updates the swapped-in conn's watch_idx to reflect
+// its new position in this tube's waiting_conns. This enables O(1) removal
+// via ms_remove_at.
+static void
+on_waiting_swap(Ms *a, void *removed_item, size_t i)
+{
+    UNUSED_PARAMETER(removed_item);
+    if (i >= a->len)
+        return; // removed the last element, no swap occurred
+    Conn *moved = a->items[i];
+    if (!conn_waiting(moved))
+        return;
+    // Find which entry in moved->watch corresponds to this tube.
+    Tube *t = (Tube *)((char *)a - offsetof(Tube, waiting_conns));
+    for (size_t k = 0; k < moved->watch.len; k++) {
+        if (moved->watch.items[k] == t) {
+            moved->watch_idx[k] = i;
+            return;
+        }
+    }
+}
+
 Tube *
 make_tube(const char *name)
 {
@@ -65,6 +89,7 @@ make_tube(const char *name)
         t->name[MAX_TUBE_NAME_LEN - 1] = '\0';
         twarnx("truncating tube name");
     }
+    t->name_len = strlen(t->name);
 
     t->ready.less = job_pri_less;
     t->delay.less = job_delay_less;
@@ -74,7 +99,7 @@ make_tube(const char *name)
     Job j = {.tube = NULL};
     t->buried = j;
     t->buried.prev = t->buried.next = &t->buried;
-    ms_init(&t->waiting_conns, NULL, NULL);
+    ms_init(&t->waiting_conns, NULL, (ms_event_fn)on_waiting_swap);
 
     return t;
 }
@@ -82,6 +107,7 @@ make_tube(const char *name)
 static void
 tube_free(Tube *t)
 {
+    prot_remove_tube(t);
     tube_ht_remove(t);
     ms_remove(&tubes, t);
     free(t->ready.data);

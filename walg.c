@@ -200,7 +200,7 @@ walresvmigrate(Wal *w, Job *j)
     // reserve only space for the migrated full job record
     // space for the delete is already reserved
     z += sizeof(int);
-    z += strlen(j->tube->name);
+    z += j->tube->name_len;
     z += sizeof(Jobrec);
     z += j->r.body_size;
 
@@ -252,8 +252,6 @@ walcompact(Wal *w)
 static int
 walsync(Wal *w)
 {
-    int64 now;
-
     // Check if async thread reported an error from previous fsync
     if (sync_on) {
         pthread_mutex_lock(&sync_mu);
@@ -266,7 +264,11 @@ walsync(Wal *w)
         }
     }
 
-    now = nanoseconds();
+    // Use the per-tick cached now (global, main-thread-only).
+    // walsync is called exclusively from the main thread via
+    // walmaint → walwrite → enqueue_job. The async fsync thread
+    // never calls this function and never reads 'now'.
+    // Syncrate is typically 50ms; sub-tick staleness is negligible.
     if (w->wantsync && now >= w->lastsync+w->syncrate) {
         w->lastsync = now;
         if (sync_on) {
@@ -502,7 +504,7 @@ walresvput(Wal *w, Job *j)
 
     // reserve space for the initial job record
     z += sizeof(int);
-    z += strlen(j->tube->name);
+    z += j->tube->name_len;
     z += sizeof(Jobrec);
     z += j->r.body_size;
 
