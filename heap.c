@@ -100,8 +100,10 @@ heapremove(Heap *h, size_t k)
 
     void *x = h->data[k];
     h->len--;
-    set(h, k, h->data[h->len]);
-    siftdown(h, k);
-    siftup(h, k);
+    if (k < h->len) {
+        set(h, k, h->data[h->len]);
+        siftdown(h, k);
+        siftup(h, k);
+    }
     return x;
 }

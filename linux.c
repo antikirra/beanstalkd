@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <sys/epoll.h>
+#include <limits.h>
 
 #ifndef EPOLLRDHUP
 #define EPOLLRDHUP 0x2000
@@ -76,7 +77,8 @@ int
 socknext(Socket **s, int64 timeout)
 {
     if (ep_pos >= ep_nready) {
-        int ms = (int)(timeout / 1000000);
+        int64 ms64 = timeout / 1000000;
+        int ms = ms64 > INT_MAX ? INT_MAX : (int)ms64;
         ep_nready = epoll_wait(epfd, ep_buf, EPOLL_BATCH, ms);
         ep_pos = 0;
         if (ep_nready == -1) {

@@ -390,6 +390,8 @@ prot_remove_tube(Tube *t)
 {
     if (t->pause)
         paused_ct--;
+    if (t->ready.len > 0)
+        ready_ct -= t->ready.len;
     if (t->delay.len > 0)
         delayed_ct -= t->delay.len;
     if (t->in_delay_heap) {
@@ -543,7 +545,11 @@ reply(Conn *c, char *line, int len, int state)
             epollq_add(c, 'w');
             return;
         }
-        // r <= 0: EAGAIN or error, fall through.
+        // r == -1: fatal errors close immediately, EAGAIN falls through.
+        if (r == -1 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            c->state = STATE_CLOSE;
+            return;
+        }
     }
 
     epollq_add(c, 'w');
@@ -1067,8 +1073,6 @@ which_cmd(Conn *c)
 static void
 fill_extra_data(Conn *c)
 {
-    if (!c->sock.fd)
-        return; /* the connection was closed */
     if (!c->cmd_len)
         return; /* we don't have a complete command */
 
@@ -1395,6 +1399,10 @@ do_list_tubes(Conn *c, Ms *l)
      * Over-allocates by (MAX_TUBE_NAME_LEN - actual_len) per tube,
      * but avoids a measurement pass over the tube list. */
     size_t maxsz = 6 + l->len * (3 + MAX_TUBE_NAME_LEN);
+    if (maxsz > INT_MAX) {
+        reply_serr(c, MSG_OUT_OF_MEMORY);
+        return;
+    }
     c->out_job = allocate_job(maxsz);
     if (!c->out_job) {
         reply_serr(c, MSG_OUT_OF_MEMORY);

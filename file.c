@@ -64,7 +64,8 @@ rawfalloc(int fd, int len)
     int i, w;
 
     for (i = 0; i < len; ) {
-        w = write(fd, buf, sizeof buf);
+        int chunk = len - i < (int)sizeof(buf) ? len - i : (int)sizeof(buf);
+        w = write(fd, buf, chunk);
         if (w == -1) {
             if (errno == EINTR)
                 continue;
@@ -178,6 +179,7 @@ readrec(File *f, Job *l, int *err)
         return 0;
     }
     if (r != sizeof(int)) {
+        if (r > 0) *err = 1;
         return 0;
     }
     sz += r;
@@ -238,8 +240,16 @@ readrec(File *f, Job *l, int *err)
                 goto Error;
             }
             t = tube_find_or_make(tubename);
+            if (!t) {
+                warnpos(f, -r, "OOM tube_find_or_make");
+                goto Error;
+            }
             j = make_job_with_id(jr.pri, jr.delay, jr.ttr, jr.body_size,
                                  t, jr.id);
+            if (!j) {
+                warnpos(f, -r, "OOM make_job_with_id");
+                goto Error;
+            }
             job_list_reset(j);
             j->r.created_at = jr.created_at;
         }
@@ -315,6 +325,7 @@ readrec5(File *f, Job *l, int *err)
         return 0;
     }
     if (r != sizeof(namelen)) {
+        if (r > 0) *err = 1;
         return 0;
     }
     sz += r;
@@ -369,8 +380,16 @@ readrec5(File *f, Job *l, int *err)
                 goto Error;
             }
             t = tube_find_or_make(tubename);
+            if (!t) {
+                warnpos(f, -r, "OOM tube_find_or_make");
+                goto Error;
+            }
             j = make_job_with_id(jr.pri, jr.delay, jr.ttr, jr.body_size,
                                  t, jr.id);
+            if (!j) {
+                warnpos(f, -r, "OOM make_job_with_id");
+                goto Error;
+            }
             job_list_reset(j);
         }
         {

@@ -124,8 +124,9 @@ walscandir(Wal *w)
 
     while ((e = readdir(d))) {
         if (strncmp(e->d_name, base, len) == 0) {
+            errno = 0;
             n = strtol(e->d_name+len, &p, 10);
-            if (p && *p == '\0') {
+            if (p && *p == '\0' && !errno) {
                 if (n > max) max = n;
                 if (n < min) min = n;
             }
@@ -209,7 +210,7 @@ ratio(Wal *w)
 static int
 walresvmigrate(Wal *w, Job *j)
 {
-    int z = 0;
+    int64 z = 0;
 
     // reserve only space for the migrated full job record
     // space for the delete is already reserved
@@ -218,7 +219,8 @@ walresvmigrate(Wal *w, Job *j)
     z += sizeof(Jobrec);
     z += j->r.body_size;
 
-    return reserve(w, z);
+    if (z > INT_MAX) return 0;
+    return reserve(w, (int)z);
 }
 
 
@@ -503,7 +505,7 @@ reserve(Wal *w, int n)
 int
 walresvput(Wal *w, Job *j)
 {
-    int z = 0;
+    int64 z = 0;
 
     // reserve space for the initial job record
     z += sizeof(int);
@@ -515,7 +517,8 @@ walresvput(Wal *w, Job *j)
     z += sizeof(int);
     z += sizeof(Jobrec);
 
-    return reserve(w, z);
+    if (z > INT_MAX) return 0;
+    return reserve(w, (int)z);
 }
 
 

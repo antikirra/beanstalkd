@@ -22,6 +22,7 @@ static size_t  pool_mem;
 static int
 pool_class(int body_size)
 {
+    if (body_size < 0)      return -1;
     if (body_size <= 64)    return 0;
     if (body_size <= 128)   return 1;
     if (body_size <= 256)   return 2;
@@ -205,8 +206,10 @@ make_job_with_id(uint32 pri, int64 delay, int64 ttr,
     if (id) {
         j->r.id = id;
         if (id >= next_id) next_id = id + 1;
+        if (!next_id) next_id = 1;
     } else {
         j->r.id = next_id++;
+        if (!next_id) next_id = 1;
     }
     j->r.pri = pri;
     j->r.delay = delay;
@@ -322,6 +325,9 @@ job_copy(Job *j)
     job_list_reset(n);
 
     n->file = NULL; /* copies do not have refcnt on the wal */
+    n->ht_next = NULL;
+    n->fnext = NULL;
+    n->fprev = NULL;
 
     n->tube = 0; /* Don't use memcpy for the tube, which we must refcount. */
     TUBE_ASSIGN(n->tube, j->tube);

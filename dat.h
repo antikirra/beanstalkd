@@ -352,7 +352,10 @@ Tube *tube_find(Ms *tubeset, const char *name);
 Tube *tube_find_name(const char *name);
 uint  tube_name_hash(const char *name);
 Tube *tube_find_or_make(const char *name);
-#define TUBE_ASSIGN(a,b) (tube_dref(a), (a) = (b), tube_iref(a))
+#define TUBE_ASSIGN(a,b) do { \
+    Tube *_tb = (b); \
+    if ((a) != _tb) { tube_dref(a); (a) = _tb; tube_iref(a); } \
+} while(0)
 
 
 Conn *make_conn(int fd, char start_state, Tube *use, Tube *watch);
