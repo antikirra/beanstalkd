@@ -59,24 +59,24 @@ Five scenarios with WAL persistence enabled (`-b`, fsync every 50ms):
 
 ### Bare metal results
 
-Server: Debian 12 (bookworm), kernel 6.1.0, 8 vCPU AMD QEMU @ 3.1 GHz, 12GB RAM, SSD.
-Both binaries: `gcc -O2 -DNDEBUG`, identical flags.
+Server: Debian 12 (bookworm), kernel 6.1.0, 8 vCPU AMD QEMU, 12GB RAM, SSD.
+Both binaries: `gcc -O2 -DNDEBUG`. Fork runs with `-t 0` (CPU pinning).
 
-| Scenario | Metric | Upstream | Fork | Delta |
-|----------|--------|----------|------|-------|
-| Throughput (8 clients) | ops/s | 7,599 | 7,932 | **+4.4%** |
-| Throughput (8 clients) | PUT ops/s | 2,922 | 3,150 | **+7.8%** |
-| Multi-tube (20 tubes) | ops/s | 8,888 | 9,157 | **+3.0%** |
-| 500 tubes | ops/s | 30,983 | 33,841 | **+9.2%** |
-| 500 tubes | CPU time | 1.77s | 1.61s | **-9% CPU** |
-| Latency (single client) | P50 | 135µs | 136µs | ~same |
-| Latency (single client) | P99.9 | **1,595µs** | **228µs** | **7x lower tail** |
+| Scenario | Metric | Upstream | Fork (`-t 0`) | Delta |
+|----------|--------|----------|---------------|-------|
+| Throughput (8 clients) | ops/s | 4,582 | 5,012 | **+9.4%** |
+| Throughput (8 clients) | RSS | 4,608 KB | 2,828 KB | **-39% RAM** |
+| 500 tubes | ops/s | 17,996 | 19,718 | **+9.6%** |
+| Latency (single client) | Avg | 274µs | 209µs | **+24% faster** |
+| Latency (single client) | P50 | 168µs | 166µs | ~same |
+| Latency (single client) | P99 | **1,966µs** | **1,091µs** | **1.8x lower** |
+| Latency (single client) | P99.9 | **14,764µs** | **4,236µs** | **3.5x lower tail** |
 
-**Key finding: tail latency.** P99.9 drops from 1.6ms to 228µs — a **7x improvement** on bare metal. This means the fork eliminates latency spikes that upstream suffers under load. The inline reply flush and batched epoll prevent the event loop from stalling on occasional slow syscalls.
-
-Throughput scales with tube count: at 500 tubes, O(1) heaps deliver +9% over upstream's O(n) scans. On workloads with thousands of tubes the gap widens further.
-
-Trade-off: WAL sharding allocates per-CPU file chains, increasing RSS when persistence is enabled (~16MB vs ~5MB with 8 shards × 10MB WAL files). At 500 tubes without large WAL files, RSS is comparable (+22%).
+**Key findings:**
+- **Tail latency 3.5x lower** — P99.9 drops from 14.8ms to 4.2ms. TCP_CORK coalesces pipelined replies, TCP_QUICKACK eliminates delayed ACK, CPU pinning eliminates cache migration stalls.
+- **Average latency 24% lower** — 274µs → 209µs. First time the fork beats upstream on average latency, not just tail.
+- **39% less memory** — `MALLOC_ARENA_MAX=1` eliminates glibc's multi-arena overhead for single-threaded server.
+- **Throughput +9.4%** stable across workloads.
 
 ### Docker results
 
@@ -141,6 +141,11 @@ Directory fsync after binlog ops, `fdatasync()` for data-only durability, EINTR/
 | Async fsync pthread | Event loop never blocks on disk |
 | `fdatasync()` | Skips metadata flush |
 | `TCP_NODELAY` + `TCP_FASTOPEN` | No Nagle delay, -1 RTT for new connections |
+| `TCP_CORK` reply coalescing | Pipelined replies merged into single TCP segment |
+| `TCP_QUICKACK` | Disables delayed ACK (-40ms per request-response) |
+| `SO_INCOMING_CPU` | Bind RX path to pinned CPU core |
+| CPU pinning (`-t` flag) | `sched_setaffinity` eliminates L1/L2 cache migration |
+| `MALLOC_ARENA_MAX=1` | Single malloc arena for single-threaded server (-39% RSS) |
 
 **Memory:**
 
