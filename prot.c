@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "dat.h"
 #include <stdbool.h>
 #include <stdint.h>
@@ -504,15 +505,45 @@ reply(Conn *c, char *line, int len, int state)
     if (!c)
         return;
 
+    if (verbose >= 2) {
+        printf(">%d reply %.*s\n", c->sock.fd, len-2, line);
+    }
+
+    // Fast path: try immediate write for short text replies.
+    // Saves 2 syscalls per command (epoll_ctl MOD + epoll_wait)
+    // by skipping the read→epoll→write→epoll round-trip.
+    // Falls through to normal epoll-based send on EAGAIN or partial write.
+    if (state == STATE_SEND_WORD) {
+        int r = write(c->sock.fd, line, len);
+        if (r == len) {
+            c->reply = line;
+            c->reply_len = len;
+            c->reply_sent = 0;
+            c->state = STATE_WANT_COMMAND;
+            if (c->out_job && c->out_job->r.state == Copy)
+                job_free(c->out_job);
+            c->out_job = NULL;
+            connsched(c);
+            return;
+        }
+        // Partial write: record progress, fall through to epoll.
+        if (r > 0) {
+            c->reply = line;
+            c->reply_len = len;
+            c->reply_sent = r;
+            c->state = state;
+            epollq_add(c, 'w');
+            return;
+        }
+        // r <= 0: EAGAIN or error, fall through.
+    }
+
     epollq_add(c, 'w');
 
     c->reply = line;
     c->reply_len = len;
     c->reply_sent = 0;
     c->state = state;
-    if (verbose >= 2) {
-        printf(">%d reply %.*s\n", c->sock.fd, len-2, line);
-    }
 }
 
 static void
@@ -2445,7 +2476,11 @@ h_accept(const int fd, const short which, Server *s)
     // cost a full epoll_wait + prottick round-trip.
     for (;;) {
         socklen_t addrlen = sizeof addr;
+#ifdef SOCK_NONBLOCK
+        int cfd = accept4(fd, (struct sockaddr *)&addr, &addrlen, SOCK_NONBLOCK);
+#else
         int cfd = accept(fd, (struct sockaddr *)&addr, &addrlen);
+#endif
         if (cfd == -1) {
             if (errno == EMFILE || errno == ENFILE) {
                 twarnx("accept: too many open files");
@@ -2458,14 +2493,18 @@ h_accept(const int fd, const short which, Server *s)
             printf("accept %d\n", cfd);
         }
 
-        int r = make_nonblocking(cfd);
-        if (r == -1) {
-            close(cfd);
-            if (verbose) {
-                printf("close %d\n", cfd);
+#ifndef SOCK_NONBLOCK
+        {
+            int r = make_nonblocking(cfd);
+            if (r == -1) {
+                close(cfd);
+                if (verbose) {
+                    printf("close %d\n", cfd);
+                }
+                continue;
             }
-            continue;
         }
+#endif
 
         int flags = 1;
         setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &flags, sizeof flags);
@@ -2484,8 +2523,7 @@ h_accept(const int fd, const short which, Server *s)
         c->sock.f = (Handle)prothandle;
         c->sock.fd = cfd;
 
-        r = sockwant(&c->sock, 'r');
-        if (r == -1) {
+        if (sockwant(&c->sock, 'r') == -1) {
             twarn("sockwant");
             connclose(c);
             continue;
