@@ -51,10 +51,11 @@ tube_ht_remove(Tube *t)
 Tube *
 tube_find_name(const char *name)
 {
+    size_t len = strlen(name);
     uint i = tube_hash(name);
     Tube *t = tube_ht[i];
     while (t) {
-        if (strncmp(t->name, name, MAX_TUBE_NAME_LEN) == 0)
+        if (t->name_len == len && memcmp(t->name, name, len) == 0)
             return t;
         t = t->ht_next;
     }

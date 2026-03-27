@@ -2507,10 +2507,10 @@ prottick(Server *s)
         conn_timeout(c);
     }
 
-    // Match ready jobs with waiting connections. Single call covers all
-    // state changes above: delayed→ready transitions, tube unpauses,
-    // and expired reservation re-enqueues.
-    process_queue();
+    // Match ready jobs with waiting connections only if something
+    // changed above (delayed→ready, unpause, timeout). Skip when idle.
+    if (matchable_heap.len > 0)
+        process_queue();
 
     // Periodically return unused heap pages to the OS.
     // Addresses glibc not releasing memory after mass job deletion.
