@@ -13,7 +13,16 @@
 #define EPOLLRDHUP 0x2000
 #endif
 
+// Batch size for epoll_wait. Amortizes syscall overhead: with 64 events
+// per call, a server handling 100K events/sec makes ~1562 syscalls instead
+// of 100K. Timer processing (prottick) still runs between each event,
+// so deadline accuracy is unaffected.
+#define EPOLL_BATCH 64
+
 static int epfd;
+static struct epoll_event ep_buf[EPOLL_BATCH];
+static int ep_nready;
+static int ep_pos;
 
 
 int
@@ -24,6 +33,8 @@ sockinit(void)
         twarn("epoll_create");
         return -1;
     }
+    ep_nready = 0;
+    ep_pos = 0;
     return 0;
 }
 
@@ -63,22 +74,28 @@ sockwant(Socket *s, int rw)
 int
 socknext(Socket **s, int64 timeout)
 {
-    int r;
-    struct epoll_event ev = {.events=0};
-
-    r = epoll_wait(epfd, &ev, 1, (int)(timeout/1000000));
-    if (r == -1 && errno != EINTR) {
-        twarn("epoll_wait");
-        exit(1);
+    if (ep_pos >= ep_nready) {
+        int ms = (int)(timeout / 1000000);
+        ep_nready = epoll_wait(epfd, ep_buf, EPOLL_BATCH, ms);
+        ep_pos = 0;
+        if (ep_nready == -1) {
+            ep_nready = 0;
+            if (errno != EINTR) {
+                twarn("epoll_wait");
+                exit(1);
+            }
+            return 0;
+        }
     }
 
-    if (r > 0) {
-        *s = ev.data.ptr;
-        if (ev.events & (EPOLLERR|EPOLLHUP|EPOLLRDHUP)) {
+    if (ep_pos < ep_nready) {
+        struct epoll_event *ev = &ep_buf[ep_pos++];
+        *s = ev->data.ptr;
+        if (ev->events & (EPOLLERR|EPOLLHUP|EPOLLRDHUP)) {
             return 'h';
-        } else if (ev.events & EPOLLIN) {
+        } else if (ev->events & EPOLLIN) {
             return 'r';
-        } else if (ev.events & EPOLLOUT) {
+        } else if (ev->events & EPOLLOUT) {
             return 'w';
         }
     }

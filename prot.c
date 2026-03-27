@@ -331,6 +331,43 @@ matchable_update(Tube *t)
     }
 }
 
+// Pause tube heap: paused tubes ordered by unpause_at (soonest first).
+// Provides O(1) lookup of the soonest tube to unpause,
+// replacing the O(tubes.len) scan in prottick().
+static Heap pause_tube_heap;
+
+static int
+tube_pause_less(void *ta, void *tb)
+{
+    Tube *a = ta;
+    Tube *b = tb;
+    return a->unpause_at < b->unpause_at;
+}
+
+static void
+tube_pause_setpos(void *t, size_t pos)
+{
+    ((Tube *)t)->pause_heap_index = pos;
+}
+
+// Update tube's membership in the pause heap.
+// Call after any change to tube->pause.
+static void
+pause_tube_update(Tube *t)
+{
+    if (!t->pause) {
+        if (t->in_pause_heap) {
+            heapremove(&pause_tube_heap, t->pause_heap_index);
+            t->in_pause_heap = 0;
+        }
+        return;
+    }
+    if (t->in_pause_heap) {
+        heapremove(&pause_tube_heap, t->pause_heap_index);
+    }
+    t->in_pause_heap = heapinsert(&pause_tube_heap, t);
+}
+
 // Clean up prot.c internal state when a tube is about to be freed.
 // Called from tube_free() in tube.c.
 void
@@ -347,6 +384,10 @@ prot_remove_tube(Tube *t)
     if (t->in_matchable) {
         heapremove(&matchable_heap, t->matchable_index);
         t->in_matchable = 0;
+    }
+    if (t->in_pause_heap) {
+        heapremove(&pause_tube_heap, t->pause_heap_index);
+        t->in_pause_heap = 0;
     }
 }
 
@@ -2012,6 +2053,7 @@ dispatch_cmd(Conn *c)
         t->pause = delay;
         t->stat.pause_ct++;
         matchable_update(t);
+        pause_tube_update(t);
 
         reply_line(c, STATE_SEND_WORD, "PAUSED\r\n");
         return;
@@ -2339,24 +2381,20 @@ prottick(Server *s)
             bury_job(s, j, 0);  /* out of memory */
     }
 
-    // Unpause every possible tube.
-    // Capture the smallest period from the soonest pause deadline.
-    // Skip entirely when no tubes are paused (common case).
-    size_t i;
-    if (paused_ct) {
-        for (i = 0; i < tubes.len; i++) {
-            t = tubes.items[i];
-            if (!t->pause)
-                continue;
-            d = t->unpause_at - now;
-            if (d <= 0) {
-                t->pause = 0;
-                paused_ct--;
-                matchable_update(t);
-            } else {
-                period = min(period, d);
-            }
+    // Unpause tubes whose deadline has arrived. O(k log n) for k expired tubes.
+    // Uses pause_tube_heap for O(1) lookup of soonest unpause deadline.
+    while (pause_tube_heap.len) {
+        t = pause_tube_heap.data[0];
+        d = t->unpause_at - now;
+        if (d > 0) {
+            period = min(period, d);
+            break;
         }
+        heapremove(&pause_tube_heap, 0);
+        t->in_pause_heap = 0;
+        t->pause = 0;
+        paused_ct--;
+        matchable_update(t);
     }
 
     // Process connections with pending timeouts. Release jobs with expired ttr.
@@ -2477,7 +2515,7 @@ prot_init()
         exit(50);
     }
     for (i = 0; i < instance_id_bytes; i++) {
-        sprintf(instance_hex + (i * 2), "%02x", rand_data[i]);
+        snprintf(instance_hex + (i * 2), 3, "%02x", rand_data[i]);
     }
     close(dev_random);
 
@@ -2492,6 +2530,8 @@ prot_init()
     delay_tube_heap.setpos = tube_delay_setpos;
     matchable_heap.less = tube_match_less;
     matchable_heap.setpos = tube_match_setpos;
+    pause_tube_heap.less = tube_pause_less;
+    pause_tube_heap.setpos = tube_pause_setpos;
 
     TUBE_ASSIGN(default_tube, tube_find_or_make("default"));
     if (!default_tube) {

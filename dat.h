@@ -253,6 +253,8 @@ struct Tube {
     int in_delay_heap;          // 1 if tube is in global delay heap
     size_t matchable_index;     // position in matchable tube heap
     int in_matchable;           // 1 if tube is in matchable heap
+    size_t pause_heap_index;    // position in global pause tube heap
+    int in_pause_heap;          // 1 if tube is in pause heap
     Ms waiting_conns;           // conns waiting for the job at this moment
     struct stats stat;
     uint using_ct;

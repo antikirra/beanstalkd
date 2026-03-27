@@ -5,15 +5,37 @@
 
 static uint64 next_id = 1;
 
-// Free list for Job reuse. Reduces malloc/free overhead and heap
-// fragmentation for high-throughput workloads with uniform job sizes.
-// Entries are linked via ht_next (safe: job is removed from hash before pooling).
-// Only exact body_size matches are reused to avoid memory waste.
-#define JOB_POOL_CAP     4096
-#define JOB_POOL_MEM_MAX (8 << 20) // 8MB
-static Job    *job_pool;
-static int     job_pool_len;
-static size_t  job_pool_mem;
+// Size-classed free list for O(1) job reuse across varied body sizes.
+// Jobs are allocated at power-of-2 boundaries (64, 128, ..., 65536).
+// Any body_size within a class reuses entries from that class.
+// Entries linked via ht_next (safe: job is removed from hash before pooling).
+#define POOL_NCLASS     11          // classes: 64, 128, 256, ..., 65536
+#define POOL_PER_CLASS  512         // max entries per class
+#define POOL_MEM_MAX    (8 << 20)   // 8MB total across all classes
+
+static Job    *pool_head[POOL_NCLASS];
+static int     pool_len[POOL_NCLASS];
+static size_t  pool_mem;
+
+// pool_class returns the class index (0..POOL_NCLASS-1) for body_size,
+// or -1 if too large to pool.
+static int
+pool_class(int body_size)
+{
+    if (body_size <= 64)    return 0;
+    if (body_size <= 128)   return 1;
+    if (body_size <= 256)   return 2;
+    if (body_size <= 512)   return 3;
+    if (body_size <= 1024)  return 4;
+    if (body_size <= 2048)  return 5;
+    if (body_size <= 4096)  return 6;
+    if (body_size <= 8192)  return 7;
+    if (body_size <= 16384) return 8;
+    if (body_size <= 32768) return 9;
+    if (body_size <= 65536) return 10;
+    return -1;
+}
+
 
 static int cur_prime = 0;
 
@@ -22,76 +44,99 @@ static Job **all_jobs = all_jobs_init;
 static size_t all_jobs_cap = 12289; /* == primes[0] */
 static size_t all_jobs_used = 0;
 
-static void rehash(int);
+// Incremental rehash state. During migration, entries live in both tables.
+// Each find/insert/delete migrates a few buckets from old to new,
+// spreading the O(n) cost across many operations instead of one pause.
+static Job **rehash_old;
+static size_t rehash_old_cap;
+static size_t rehash_pos;
 
-static int
-_get_job_hash_index(uint64 job_id)
+// Migrate up to 16 buckets from the old table to the new table.
+// Bounded work per call: O(16 + entries_in_16_buckets).
+static void
+rehash_step(void)
 {
-    return job_id % all_jobs_cap;
+    if (!rehash_old) return;
+
+    int steps = 16;
+    while (steps-- > 0 && rehash_pos < rehash_old_cap) {
+        while (rehash_old[rehash_pos]) {
+            Job *j = rehash_old[rehash_pos];
+            rehash_old[rehash_pos] = j->ht_next;
+            size_t index = j->r.id % all_jobs_cap;
+            j->ht_next = all_jobs[index];
+            all_jobs[index] = j;
+        }
+        rehash_pos++;
+    }
+
+    if (rehash_pos >= rehash_old_cap) {
+        if (rehash_old != all_jobs_init) {
+            free(rehash_old);
+        }
+        rehash_old = NULL;
+        rehash_old_cap = 0;
+    }
+}
+
+static void
+rehash_start(int is_upscaling)
+{
+    if (rehash_old) return; /* already in progress */
+
+    int d = is_upscaling ? 1 : -1;
+    if (cur_prime + d >= NUM_PRIMES) return;
+    if (cur_prime + d < 0) return;
+
+    size_t new_cap = primes[cur_prime + d];
+    Job **new_table = calloc(new_cap, sizeof(Job *));
+    if (!new_table) {
+        twarnx("Failed to allocate %zu new hash buckets", new_cap);
+        return;
+    }
+
+    rehash_old = all_jobs;
+    rehash_old_cap = all_jobs_cap;
+    rehash_pos = 0;
+
+    all_jobs = new_table;
+    all_jobs_cap = new_cap;
+    cur_prime += d;
 }
 
 static void
 store_job(Job *j)
 {
-    int index = 0;
-
-    index = _get_job_hash_index(j->r.id);
-
+    size_t index = j->r.id % all_jobs_cap;
     j->ht_next = all_jobs[index];
     all_jobs[index] = j;
     all_jobs_used++;
 
+    rehash_step();
+
     /* accept a load factor of 4 */
-    if (all_jobs_used > (all_jobs_cap << 2)) rehash(1);
-}
-
-static void
-rehash(int is_upscaling)
-{
-    Job **old = all_jobs;
-    size_t old_cap = all_jobs_cap, old_used = all_jobs_used, i;
-    int old_prime = cur_prime;
-    int d = is_upscaling ? 1 : -1;
-
-    if (cur_prime + d >= NUM_PRIMES) return;
-    if (cur_prime + d < 0) return;
-
-    cur_prime += d;
-
-    all_jobs_cap = primes[cur_prime];
-    all_jobs = calloc(all_jobs_cap, sizeof(Job *));
-    if (!all_jobs) {
-        twarnx("Failed to allocate %zu new hash buckets", all_jobs_cap);
-        cur_prime = old_prime;
-        all_jobs = old;
-        all_jobs_cap = old_cap;
-        all_jobs_used = old_used;
-        return;
-    }
-    all_jobs_used = 0;
-
-    for (i = 0; i < old_cap; i++) {
-        while (old[i]) {
-            Job *j = old[i];
-            old[i] = j->ht_next;
-            j->ht_next = NULL;
-            store_job(j);
-        }
-    }
-    if (old != all_jobs_init) {
-        free(old);
-    }
+    if (!rehash_old && all_jobs_used > (all_jobs_cap << 2))
+        rehash_start(1);
 }
 
 Job *
 job_find(uint64 job_id)
 {
-    int index = _get_job_hash_index(job_id);
+    size_t index = job_id % all_jobs_cap;
     Job *jh = all_jobs[index];
 
     while (jh && jh->r.id != job_id)
         jh = jh->ht_next;
 
+    // Check old table if rehash in progress and not found in new.
+    if (!jh && rehash_old) {
+        index = job_id % rehash_old_cap;
+        jh = rehash_old[index];
+        while (jh && jh->r.id != job_id)
+            jh = jh->ht_next;
+    }
+
+    rehash_step();
     return jh;
 }
 
@@ -99,17 +144,19 @@ Job *
 allocate_job(int body_size)
 {
     Job *j = NULL;
+    int cls = pool_class(body_size);
+    int asize = cls >= 0 ? (64 << cls) : body_size;
 
-    // Reuse from pool if head matches the requested body size exactly.
-    if (job_pool && job_pool->r.body_size == body_size) {
-        j = job_pool;
-        job_pool = j->ht_next;
-        job_pool_len--;
-        job_pool_mem -= sizeof(Job) + body_size;
+    // Reuse from size-class pool. O(1) lookup, guaranteed fit.
+    if (cls >= 0 && pool_head[cls]) {
+        j = pool_head[cls];
+        pool_head[cls] = j->ht_next;
+        pool_len[cls]--;
+        pool_mem -= sizeof(Job) + asize;
     }
 
     if (!j) {
-        j = malloc(sizeof(Job) + body_size);
+        j = malloc(sizeof(Job) + asize);
         if (!j) {
             twarnx("OOM");
             return (Job *) 0;
@@ -177,15 +224,32 @@ job_hash_free(Job *j)
 {
     Job **slot;
 
-    slot = &all_jobs[_get_job_hash_index(j->r.id)];
+    // Search new table first.
+    slot = &all_jobs[j->r.id % all_jobs_cap];
     while (*slot && *slot != j) slot = &(*slot)->ht_next;
     if (*slot) {
         *slot = (*slot)->ht_next;
         --all_jobs_used;
+        goto done;
     }
 
+    // Search old table if rehash in progress.
+    if (rehash_old) {
+        slot = &rehash_old[j->r.id % rehash_old_cap];
+        while (*slot && *slot != j) slot = &(*slot)->ht_next;
+        if (*slot) {
+            *slot = (*slot)->ht_next;
+            --all_jobs_used;
+        }
+    }
+
+done:
+    rehash_step();
+
     // Downscale when the hashmap is too sparse, but never below initial size.
-    if (cur_prime > 0 && all_jobs_used < (all_jobs_cap >> 4)) rehash(0);
+    // Only when no rehash in progress.
+    if (!rehash_old && cur_prime > 0 && all_jobs_used < (all_jobs_cap >> 4))
+        rehash_start(0);
 }
 
 void
@@ -198,16 +262,18 @@ job_free(Job *j)
     TUBE_ASSIGN(j->tube, NULL);
     if (!is_copy) job_hash_free(j);
 
-    // Pool regular jobs for reuse; copies and excess go to free().
-    size_t entry_bytes = sizeof(Job) + j->r.body_size;
-    if (!is_copy
-        && job_pool_len < JOB_POOL_CAP
-        && job_pool_mem + entry_bytes <= JOB_POOL_MEM_MAX) {
-        j->ht_next = job_pool;
-        job_pool = j;
-        job_pool_len++;
-        job_pool_mem += entry_bytes;
-        return;
+    // Pool regular jobs for reuse; copies, oversized, and excess go to free().
+    int cls = pool_class(j->r.body_size);
+    if (!is_copy && cls >= 0) {
+        size_t entry_bytes = sizeof(Job) + (size_t)(64 << cls);
+        if (pool_len[cls] < POOL_PER_CLASS
+            && pool_mem + entry_bytes <= POOL_MEM_MAX) {
+            j->ht_next = pool_head[cls];
+            pool_head[cls] = j;
+            pool_len[cls]++;
+            pool_mem += entry_bytes;
+            return;
+        }
     }
 
     free(j);
