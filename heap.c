@@ -73,7 +73,7 @@ siftup(Heap *h, size_t k)
 int
 heapinsert(Heap *h, void *x)
 {
-    if (h->len == h->cap) {
+    if (unlikely(h->len == h->cap)) {
         size_t ncap = (h->len+1) * 2; /* allocate twice what we need */
         void **ndata = realloc(h->data, sizeof(void*) * ncap);
         if (!ndata) {

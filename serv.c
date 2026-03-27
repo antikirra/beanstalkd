@@ -148,7 +148,6 @@ srvserve(Server *s)
         exit(2);
     }
 
-
     for (;;) {
         int64 period = prottick(s);
 

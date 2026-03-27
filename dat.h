@@ -22,7 +22,7 @@ typedef struct Server Server;
 typedef struct Wal    Wal;
 
 typedef void(*Handle)(void*, int rw);
-typedef int(FAlloc)(int, int);
+typedef int(*FAlloc)(int, int);
 
 
 // NUM_PRIMES is used in the jobs hashing.
@@ -30,16 +30,6 @@ typedef int(FAlloc)(int, int);
 #define NUM_PRIMES 48
 #else
 #define NUM_PRIMES 19
-#endif
-
-/* Some compilers (e.g. gcc on SmartOS) define NULL as 0.
- * This is allowed by the C standard, but is unhelpful when
- * using NULL in most pointer contexts with errors turned on. */
-#if (defined(sun) || defined(__sun)) && (defined(__SVR4) || defined(__svr4__))
-#ifdef NULL
-#undef NULL
-#endif
-#define NULL ((void*)0)
 #endif
 
 // The name of a tube cannot be longer than MAX_TUBE_NAME_LEN-1
@@ -69,6 +59,10 @@ typedef int(FAlloc)(int, int);
 // Use this macro to designate unused parameters in functions.
 #define UNUSED_PARAMETER(x) (void)(x)
 
+// Branch prediction hints for hot paths.
+#define likely(x)   __builtin_expect(!!(x), 1)
+#define unlikely(x) __builtin_expect(!!(x), 0)
+
 // version is defined in vers.c, see vers.sh for details.
 extern const char version[];
 
@@ -78,7 +72,7 @@ extern int verbose;
 extern struct Server srv;
 
 // Replaced by tests to simulate failures.
-extern FAlloc *falloc;
+extern FAlloc falloc;
 
 // stats structure holds counters for operations, both globally and per tube.
 struct stats {

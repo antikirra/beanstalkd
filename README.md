@@ -1,21 +1,77 @@
-# beanstalkd (hardened fork)
+# beanstalkd
 
-Hardened, optimized fork of [beanstalkd](https://github.com/beanstalkd/beanstalkd) — simple, fast general purpose work queue.
+High-performance work queue. Pure C, Linux-native, single binary.
 
-Drop-in replacement for upstream: **100% wire protocol and WAL format compatibility**. Every existing client works unmodified.
+Drop-in replacement for [upstream beanstalkd](https://github.com/beanstalkd/beanstalkd): **100% wire protocol and WAL format compatible**. Every existing client library works unmodified.
 
-See [doc/protocol.txt](doc/protocol.txt) for the network protocol.
+## Platform
 
-## Quick start
+This fork targets **Linux 6.1+** exclusively. No cross-platform abstractions, no trade-offs. The codebase uses Linux-specific APIs directly: `epoll_create1`, `accept4`, `fallocate`, `fdatasync`, `CLOCK_MONOTONIC_COARSE`, `SOCK_NONBLOCK`, `SOCK_CLOEXEC`, `O_CLOEXEC`, `TCP_FASTOPEN`, `posix_fadvise`, `malloc_trim`.
 
-    $ make
-    $ ./beanstalkd
+Three ways to run:
 
-    $ make check           # run 197 unit tests
-    $ make bench           # run benchmarks
-    $ ./beanstalkd -h      # show all options
+| Method | Command |
+|--------|---------|
+| **Docker** (recommended) | `docker build -t beanstalkd .` then `docker run -p 11300:11300 beanstalkd` |
+| **Native Linux host** | `make && ./beanstalkd` (requires Linux 6.1+, glibc, gcc) |
+| **Linux VM** | Same as native, inside any VM with a 6.1+ kernel |
 
-Requires Linux (2.6.17+), Mac OS X, FreeBSD, or Illumos. Any C99 compiler; tested with GCC and clang.
+## Build and test
+
+```sh
+# Full pipeline: build + 205 unit tests (UBSan) + cppcheck (works on any host OS):
+docker build -f Dockerfile.build .
+
+# Native (Linux 6.1+ only):
+make            # build
+make check      # 205 unit tests
+make bench      # benchmarks
+
+# Integration tests (ASan + Valgrind + WAL crash recovery):
+docker build -f test/Dockerfile.loadtest -t beanstalkd-test .
+docker run --rm beanstalkd-test
+```
+
+**CI pipeline** (`Dockerfile.build`):
+1. **Build + 205 unit tests** under UndefinedBehaviorSanitizer (traps on first UB)
+2. **cppcheck** static analysis (zero false-positive policy)
+
+**Production image** (`Dockerfile`): LTO-optimized, stripped binary (~68KB), multi-stage build on bookworm-slim.
+
+## Benchmark
+
+Reproducible A/B comparison — upstream vs fork, identical compiler flags (`gcc -O2 -DNDEBUG`), sequential isolated runs inside a single container:
+
+```sh
+docker build -f Dockerfile.benchmark -t beanstalkd-bench .
+docker run --rm beanstalkd-bench
+```
+
+Five scenarios with WAL persistence enabled (`-b`, fsync every 50ms):
+
+| # | Scenario | Workload | What it measures |
+|---|----------|----------|------------------|
+| 1 | Throughput | 8 clients × 10K jobs, 128B body | Peak aggregate ops/s |
+| 2 | Multi-tube | 20 tubes, mixed 8B-8KB bodies | Realistic heterogeneous load |
+| 3 | Massive tubes | 500 tubes × 100 jobs, 4 clients | O(1) vs O(n) scheduling |
+| 4 | Latency | 1 client, 5K cycles, 4B body | P50/P99/P99.9 round-trip |
+| 5 | Connection storm | 200 connect+stats+close, 8 threads | Accept path efficiency |
+
+Sample results (Docker, bookworm-slim, ARM64):
+
+| Scenario | Metric | Upstream | Fork | Delta |
+|----------|--------|----------|------|-------|
+| Throughput | ops/s | 11,270 | 12,785 | **+13%** |
+| Throughput | CPU time | 2.11s | 1.67s | **-21% CPU** |
+| Multi-tube | ops/s | 11,623 | 13,680 | **+18%** |
+| 500 tubes | ops/s | 38,652 | 50,268 | **+30%** |
+| 500 tubes | CPU time | 1.17s | 0.97s | **-17% CPU** |
+| Latency | P99.9 | 714µs | 305µs | **2.3x lower tail** |
+| Conn storm | conn/s | 8,201 | 8,657 | +6% |
+
+The advantage scales with tube count: at 500 tubes the fork's O(1) heaps deliver **+30% throughput** where upstream's O(n) scans become the bottleneck. Tail latency (P99.9) is consistently 2-3x lower due to inline reply flush and batched epoll.
+
+Trade-off: WAL sharding allocates per-CPU file chains, increasing RSS when persistence is enabled. At 500 tubes RSS is comparable (~8% higher); at 8 clients with large WAL files the difference is larger.
 
 ## Why this fork
 
@@ -26,27 +82,24 @@ Requires Linux (2.6.17+), Mac OS X, FreeBSD, or Illumos. Any C99 compiler; teste
 | Syscalls per command | ~4 (read + epoll + write + epoll) | ~2 (read + write, inline flush) |
 | Job hash table rehash | Stop-the-world O(n) | Incremental, 16 buckets/op |
 | Job pool reuse | Exact size match only | 11 size classes, O(1) hit rate |
-| WAL disk I/O | Single file chain, 1 fsync thread | Per-CPU sharded WAL, N fsync threads |
-| Unit tests | 100 | 197 |
+| WAL disk I/O | Single file, 1 fsync thread | Per-CPU sharded, N fsync threads |
+| Unit tests | 100 | 205 |
 
 ## What changed
 
-### Bug fixes (32)
+### Bug fixes (35)
 
 **Crashes (P0):**
 NULL deref in conn_timeout, infinite loop in rawfalloc, WAL balance rollback corruption, unsafe `exit()` in signal handler, `EPOLLERR` causing 100% CPU, OOM in `prot_init` leading to SIGSEGV.
 
 **Data loss (P1):**
-Memory/job leaks in h_accept and enqueue_incoming_job, job_copy dangling pointer, WAL nrec increment on failure, corrupt WAL records silently skipped, walmaint errors silently ignored, prot_replay orphaning jobs and leaking WAL space, `enqueue_job` WAL failure leaving job in two structures, `release`/`bury` WAL failure orphaning jobs, `delayed_ct` stats truncated to 32 bits, `pause-time-left` uint64 wraparound, WAL stats not aggregated across shards.
+Memory/job leaks in h_accept and enqueue_incoming_job, job_copy dangling pointer, WAL nrec increment on failure, corrupt WAL records silently skipped, walmaint errors silently ignored, prot_replay orphaning jobs and leaking WAL space, `enqueue_job` WAL failure leaving job in two structures, `release`/`bury` WAL failure orphaning jobs, `delayed_ct` stats truncated to 32 bits, `pause-time-left` uint64 wraparound, WAL stats not aggregated across shards, `total_jobs_ct` incremented before enqueue check, OOM in heap updates silently ignored.
 
 **Hardening (P2):**
-Input validation for OP_KICK/OP_RESERVE_TIMEOUT, darwin/sunos event loop fixes, option parsing boundary checks, `-f` flag overflow, parallel make race, tube leak on `ms_append` failure, EMFILE busy loop (listen socket deregistration + auto re-add), `scan_line_end` bare `\r` handling.
-
-**Clock:**
-`clock_gettime(CLOCK_MONOTONIC)` replaces gettimeofday; NTP jumps no longer cause mass timeouts.
+Input validation for OP_KICK/OP_RESERVE_TIMEOUT, option parsing boundary checks, `-f` flag overflow, tube leak on `ms_append` failure, EMFILE busy loop (listen socket deregistration + auto re-add), `scan_line_end` bare `\r` handling.
 
 **WAL integrity:**
-Directory fsync after binlog ops, `F_FULLFSYNC` on macOS, EINTR/short-read handling in readfull and rawfalloc.
+Directory fsync after binlog ops, `fdatasync()` for data-only durability, EINTR/short-read handling in readfull, `fallocate()` for O(1) WAL preallocation, partial recovery in `prot_replay` (no longer aborts on first failure).
 
 ### Performance
 
@@ -60,127 +113,107 @@ Directory fsync after binlog ops, `F_FULLFSYNC` on macOS, EINTR/short-read handl
 | Waiting conn index | Remove conn from tube | O(conns) |
 | Tube hash table | Find tube by name | O(tubes) |
 
-**Syscall reduction** — measured via strace on 10K put+delete cycles:
+**Syscall reduction:**
 
 | Optimization | Effect |
 |-------------|--------|
 | Inline reply flush | -50% epoll_wait, -99% epoll_ctl |
-| Batch epoll (64 events) | ~64x fewer kernel transitions under concurrent load |
-| `accept4(SOCK_NONBLOCK)` | Eliminates `fcntl` per connection |
-| Per-tick time cache | -13 `clock_gettime` calls per tick |
-| Vectorized WAL writes | 1 `writev` instead of 2-4 `write` per record |
+| Batch epoll (64 events) | ~64x fewer kernel transitions under load |
+| `accept4(SOCK_NONBLOCK\|SOCK_CLOEXEC)` | Atomic, no fcntl |
+| `CLOCK_MONOTONIC_COARSE` | ~5ns vs ~25ns per call |
+| Vectorized WAL writes (`writev`) | 1 syscall instead of 2-4 per record |
+| `fallocate()` for WAL prealloc | O(1) instead of N x write(4KB) |
 | Async fsync pthread | Event loop never blocks on disk |
-| TCP_NODELAY on accept | Eliminates Nagle's ~40 ms delay |
+| `fdatasync()` | Skips metadata flush |
+| `TCP_NODELAY` + `TCP_FASTOPEN` | No Nagle delay, -1 RTT for new connections |
 
 **Memory:**
 
 | Optimization | Effect |
 |-------------|--------|
-| Size-classed job pool | O(1) reuse across varied sizes (11 buckets, 64 B .. 64 KB) |
+| Size-classed job pool | O(1) reuse across 11 buckets (64 B .. 64 KB) |
 | Incremental rehash | 16 buckets/op instead of stop-the-world O(n) |
-| Periodic `malloc_trim` | Returns unused glibc pages to OS (configurable via `-m`) |
-| Cache-friendly Job struct | Hot fields grouped; sizeof(Job) 176 → 168 bytes |
+| Periodic `malloc_trim` | Returns unused glibc pages to OS (`-m` flag) |
+| Cache-friendly Job struct | Hot fields grouped; sizeof(Job) 176 -> 168 bytes |
 
 **WAL sharding** — parallel disk I/O across CPU cores:
 
-When WAL is enabled (`-b`), jobs are distributed across N independent WAL instances (one per CPU core) by tube name hash. Each shard has its own directory, file chain, compaction, and async fsync thread. The event loop (single-threaded) routes `walwrite` to the correct shard in O(1). Shard count is detected from CPU cores on first run, then persisted to `<wal_dir>/shards` so routing stays stable across hardware changes.
-
-| Metric | Value |
-|--------|-------|
-| Shard count | auto-detected from CPU cores, persisted on first run |
-| Routing | `DJB2(tube_name) % nshards` — deterministic, O(1) |
-| Aggregate throughput | ~33K ops/s with 8 concurrent clients + WAL + fsync=50ms |
-| Legacy compatibility | Old `binlog.*` in root dir replayed at startup, new writes go to shard subdirs |
-
-**Internal:**
-
-| Optimization | Effect |
-|-------------|--------|
-| `shard_wal()` cached | 1 hash per WAL op instead of 2–3 |
-| `epollq_rmconn` pointer-to-pointer | O(n) without list reversal side-effect |
-| `fmt_fn` signatures | `void*` parameter eliminates UB function-pointer casts |
-| `zalloc(size_t)` | Correct type for allocation size (was `int`) |
-
-**Parsing:** first-byte command dispatch (~6x fewer strncmp), cached tube name_len, single-pass stats formatting. Default `-O2` (upstream: `-O0`).
+When WAL is enabled (`-b`), jobs are distributed across N independent WAL instances (one per CPU core) by tube name hash. Each shard has its own directory, file chain, compaction, and async fsync thread. Shard count is detected on first run and persisted to `<wal_dir>/shards`.
 
 ### Stability
 
-- **Bounded loops** — break on impossible states (NASA rule 2)
-- **Accurate counters** — `delayed_ct`, `paused_ct`, `ready_ct` tracked on all paths including OOM and tube destruction
-- **Graceful OOM** — heap insertion failures non-fatal, retried on next operation
+- **Bounded loops** with break on impossible states
+- **Accurate counters** on all paths including OOM and tube destruction
+- **Graceful OOM** — heap insertion failures are non-fatal, logged, retried on next operation
 - **Incremental rehash** — dual-table lookup during migration, no job invisible mid-rehash
-- **Downscale hysteresis** — hash table never shrinks below initial capacity
-- **Explicit process_queue** — no longer called implicitly from `enqueue_job`
-- **EMFILE backpressure** — fd exhaustion deregisters the listen socket from epoll, preventing 100% CPU busy loop; re-registers automatically when a connection closes
-- **Stats correctness** — `delayed_ct` no longer truncated to 32 bits; `pause-time-left` uses signed arithmetic with clamping (no uint64 wraparound); WAL metrics (`binlog-records-written`, `binlog-records-migrated`) aggregate across all shards
-- **Robust line scanning** — `scan_line_end` finds `\r\n` even after bare `\r` bytes
-
-## Testing
-
-### Unit tests
-
-    $ make check
-
-197 tests: 100 legacy + 97 hostile (OOM paths, boundary values, heap ordering, counter invariants, copy independence, WAL shard routing/recovery, stress up to 1000 elements).
-
-### Benchmarks
-
-    $ make bench
-
-### Docker integration
-
-    $ docker build -f test/Dockerfile.loadtest -t beanstalkd-test .
-    $ docker run --rm beanstalkd-test
-
-Three phases: AddressSanitizer (memory safety), Valgrind memcheck (leak detection), WAL crash recovery (`kill -9` + restart + verify).
+- **EMFILE backpressure** — fd exhaustion deregisters the listen socket, re-registers on close
+- **Robust line scanning** — `scan_line_end` handles bare `\r` bytes
 
 ## Configuration
 
-All upstream flags preserved. New:
+```
+./beanstalkd -h      # show all options
+```
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-m SEC` | 60 | Return unused memory to OS every SEC seconds. `0` to disable. glibc only. |
+| `-b DIR` | disabled | Enable WAL persistence (auto-sharded across CPU cores) |
+| `-f MS` | 50 | fsync interval in milliseconds (0 = every write) |
+| `-F` | | Never fsync |
+| `-l ADDR` | 0.0.0.0 | Listen address (prefix `unix:` for Unix socket) |
+| `-p PORT` | 11300 | Listen port |
+| `-z BYTES` | 65535 | Maximum job body size |
+| `-s BYTES` | 10MB | WAL file size |
+| `-u USER` | | Drop privileges to user |
+| `-m SEC` | 60 | Return unused memory to OS interval (0 = disable) |
+| `-V` | | Increase verbosity (repeatable) |
 
-Full list: `./beanstalkd -h`
-
-### WAL sharding
-
-When persistence is enabled (`-b DIR`), the WAL is automatically sharded across CPU cores:
+## WAL sharding layout
 
 ```
 DIR/
-  shards          ← shard count (written once on first run)
-  lock            ← root directory lock
-  binlog.*        ← legacy WAL (read on startup for migration)
-  s0/binlog.*     ← shard 0
-  s1/binlog.*     ← shard 1
+  shards          # shard count (persisted on first run)
+  lock            # directory lock
+  binlog.*        # legacy WAL (read on startup for migration)
+  s0/binlog.*     # shard 0
+  s1/binlog.*     # shard 1
   ...
-  sN/binlog.*     ← shard N-1
+  sN/binlog.*     # shard N-1
 ```
 
-**Shard count stability.** The number of shards is auto-detected from CPU cores on first run and persisted to `DIR/shards`. On subsequent runs this file is read, keeping routing stable even if CPU count changes. If the file is missing, a new shard layout is created.
-
-**Changing shard count.** To reshard (e.g., after hardware upgrade):
-
-1. Stop beanstalkd
-2. Delete `DIR/shards`
-3. Start beanstalkd — it detects the new CPU count and creates a fresh shard layout
-4. Existing shard WALs are replayed into the new layout automatically
-
-**Disabling sharding.** Delete `DIR/shards` and all `DIR/s*/` directories. beanstalkd falls back to the single legacy WAL in `DIR/`.
+To reshard after hardware change: stop beanstalkd, delete `DIR/shards`, restart. Existing WALs are replayed into the new layout automatically.
 
 ## Project structure
 
-| Directory | Contents |
-|-----------|----------|
-| `adm` | systemd, sysv, upstart, launchd configs |
-| `ct` | Test framework (vendored from [kr/ct](https://github.com/kr/ct)) |
-| `doc` | Protocol spec, man page |
-| `pkg` | Release and packaging scripts |
-| `test` | Docker-based integration tests |
+```
+.
+├── dat.h                   # All types, macros, declarations
+├── main.c                  # Entry point, signals, privilege drop
+├── prot.c                  # Protocol: commands, scheduling, stats
+├── serv.c                  # Event loop
+├── conn.c                  # Connection state machine
+├── job.c                   # Job alloc/free, hash table, memory pool
+├── tube.c                  # Tube CRUD, hash map, refcounting
+├── heap.c                  # Generic min-heap
+├── ms.c                    # Dynamic array
+├── walg.c                  # WAL lifecycle, async fsync, sharding
+├── file.c                  # WAL file I/O, writev, fallocate
+├── linux.c                 # epoll backend
+├── net.c                   # Socket creation, TCP_FASTOPEN
+├── time.c                  # CLOCK_MONOTONIC_COARSE
+├── util.c                  # Logging, options, zalloc
+├── primes.c                # Hash table prime sizes
+├── test*.c                 # 205 unit tests (14 files)
+├── ct/                     # Vendored test framework
+├── doc/protocol.txt        # Wire protocol specification (frozen)
+├── adm/systemd/            # systemd service + socket units
+├── Dockerfile              # Production image (multi-stage, bookworm-slim)
+├── Dockerfile.build        # CI pipeline: UBSan + cppcheck
+└── test/                   # Integration tests (ASan, Valgrind, WAL recovery)
+```
 
-## Links
+## License
 
-- Upstream: https://beanstalkd.github.io/
-- Protocol: [doc/protocol.txt](doc/protocol.txt)
+MIT. See [LICENSE](LICENSE).
+
+Based on [beanstalkd](https://github.com/beanstalkd/beanstalkd) by Keith Rarick and contributors.

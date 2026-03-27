@@ -2,19 +2,12 @@
 
 set -e
 
-fixsyms() {
-    if test "`uname -s|tr A-Z a-z`" = darwin
-    then egrep -v [.] | egrep ^_ | sed s/^_//
-    else cat
-    fi
-}
-
 syms() {
     prefix=$1
     shift
     for f in "$@"
     do nm $f
-    done | cut -d ' ' -f 3 | fixsyms | egrep ^$prefix
+    done | cut -d ' ' -f 3 | egrep ^$prefix
 }
 
 ts=`syms cttest "$@" || true`

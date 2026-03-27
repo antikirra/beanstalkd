@@ -1,6 +1,7 @@
 #include "ct/ct.h"
 #include "dat.h"
 #include <stdint.h>
+#include <inttypes.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -813,4 +814,82 @@ cttest_shard_wal_init_creates_dirs()
     srv.nshards = 0;
     srv.shards = NULL;
     srv.wal.use = 0;
+}
+
+// ─── Shard distribution fairness ────────────────────────────
+// 1000 random tube names across 8 shards must not all land
+// in the same shard. This catches degenerate hash functions.
+
+void
+cttest_shard_distribution_fairness()
+{
+    int nshards = 8;
+    int counts[8] = {0};
+    int i;
+
+    for (i = 0; i < 1000; i++) {
+        char name[64];
+        snprintf(name, sizeof(name), "workload-%d-task-%d", i / 10, i % 10);
+        uint h = tube_name_hash(name) % nshards;
+        assertf(h < (uint)nshards, "shard out of bounds");
+        counts[h]++;
+    }
+
+    // Each shard should get at least 5% (50 of 1000). If any shard
+    // gets 0, the hash function is pathologically bad.
+    for (i = 0; i < nshards; i++) {
+        assertf(counts[i] > 20,
+                "shard %d got only %d of 1000 tubes — hash is degenerate",
+                i, counts[i]);
+    }
+
+    // No shard should get more than 30% (300 of 1000).
+    for (i = 0; i < nshards; i++) {
+        assertf(counts[i] < 300,
+                "shard %d got %d of 1000 tubes — hash is heavily skewed",
+                i, counts[i]);
+    }
+}
+
+// ─── Large-scale rehash correctness ─────────────────────────
+// Insert 60,000 jobs (enough to trigger rehash from primes[0]=12289
+// to primes[1]=24593 at 4x load factor ~49156), then verify every
+// single job is findable, then delete all and verify empty.
+
+void
+cttest_job_hash_large_scale_rehash()
+{
+    Tube *t = make_tube("rehash-tube");
+    TUBE_ASSIGN(t, t);
+
+    int N = 60000;
+    uint64 *ids = malloc(N * sizeof(uint64));
+    assertf(ids != NULL, "OOM allocating id array");
+
+    // Insert
+    for (int i = 0; i < N; i++) {
+        Job *j = make_job(1, 0, 1000000000, 4, t);
+        assertf(j != NULL, "job %d must allocate", i);
+        ids[i] = j->r.id;
+    }
+
+    // Every job must be findable
+    for (int i = 0; i < N; i++) {
+        Job *j = job_find(ids[i]);
+        assertf(j != NULL, "job %"PRIu64" not found after rehash", ids[i]);
+        assertf(j->r.id == ids[i], "wrong job returned for id %"PRIu64, ids[i]);
+    }
+
+    // Delete all
+    for (int i = 0; i < N; i++) {
+        Job *j = job_find(ids[i]);
+        assertf(j != NULL, "job %"PRIu64" vanished before delete", ids[i]);
+        job_free(j);
+    }
+
+    assertf(get_all_jobs_used() == 0,
+            "all 60K jobs must be freed, got %zu", get_all_jobs_used());
+
+    free(ids);
+    tube_dref(t);
 }

@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "dat.h"
 #include <stdint.h>
 #include <stdlib.h>
@@ -14,20 +15,12 @@
 
 static int reserve(Wal *w, int n);
 
-// Platform-aware fsync: uses F_FULLFSYNC on macOS for true durability
-// (standard fsync on macOS does not flush drive write caches),
-// plain fsync elsewhere.
+// fdatasync() skips metadata (atime/mtime) flush — faster than fsync()
+// for WAL writes where only data integrity matters.
 static int
 durable_fsync(int fd)
 {
-#ifdef F_FULLFSYNC
-    int r = fcntl(fd, F_FULLFSYNC, 0);
-    if (r == -1 && errno == ENOTSUP)
-        return fsync(fd);
-    return r;
-#else
-    return fsync(fd);
-#endif
+    return fdatasync(fd);
 }
 
 // --- Per-Wal async fsync thread ---
@@ -114,7 +107,7 @@ walscandir(Wal *w)
     static const int len = sizeof(base) - 1;
     DIR *d;
     struct dirent *e;
-    int min = 1<<30;
+    int min = INT_MAX;
     int max = 0;
     int n;
     char *p;
@@ -142,7 +135,7 @@ walscandir(Wal *w)
 static void
 dirsync(Wal *w)
 {
-    int fd = open(w->dir, O_RDONLY);
+    int fd = open(w->dir, O_RDONLY|O_CLOEXEC);
     if (fd >= 0) {
         durable_fsync(fd);
         close(fd);
@@ -550,7 +543,7 @@ waldirlock(Wal *w)
     }
     snprintf(path, path_length, "%s/lock", w->dir);
 
-    fd = open(path, O_WRONLY|O_CREAT, 0600);
+    fd = open(path, O_WRONLY|O_CREAT|O_CLOEXEC, 0600);
     free(path);
     if (fd == -1) {
         twarn("open");
@@ -593,7 +586,7 @@ walread(Wal *w, Job *list, int min)
             exit(1);
         }
 
-        int fd = open(f->path, O_RDONLY);
+        int fd = open(f->path, O_RDONLY|O_CLOEXEC);
         if (fd < 0) {
             twarn("open %s", f->path);
             free(f->path);
@@ -602,6 +595,7 @@ walread(Wal *w, Job *list, int min)
         }
 
         f->fd = fd;
+        posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
         fileadd(f, w);
         err |= fileread(f, list);
         if (close(fd) == -1)

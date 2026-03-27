@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "dat.h"
 #include <netdb.h>
 #include <stdio.h>
@@ -51,15 +52,10 @@ make_inet_socket(char *host, char *port)
     }
 
     for (ai = airoot; ai; ai = ai->ai_next) {
-        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        fd = socket(ai->ai_family, ai->ai_socktype | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                    ai->ai_protocol);
         if (fd == -1) {
             twarn("socket()");
-            continue;
-        }
-
-        r = make_nonblocking(fd);
-        if (r == -1) {
-            close(fd);
             continue;
         }
 
@@ -136,6 +132,11 @@ make_inet_socket(char *host, char *port)
             continue;
         }
 
+        {
+            int qlen = 256;
+            setsockopt(fd, IPPROTO_TCP, TCP_FASTOPEN, &qlen, sizeof qlen);
+        }
+
         break;
     }
 
@@ -179,15 +180,9 @@ make_unix_socket(char *path)
         }
     }
 
-    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd == -1) {
         twarn("socket()");
-        return -1;
-    }
-
-    r = make_nonblocking(fd);
-    if (r == -1) {
-        close(fd);
         return -1;
     }
 

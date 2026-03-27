@@ -31,7 +31,7 @@ grow(Ms *a)
 int
 ms_append(Ms *a, void *item)
 {
-    if (a->len >= a->cap && !grow(a))
+    if (unlikely(a->len >= a->cap) && !grow(a))
         return 0;
 
     a->items[a->len++] = item;

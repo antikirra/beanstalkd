@@ -1687,7 +1687,7 @@ void
 cttest_binlog_disk_full()
 {
     size = 1000;
-    falloc = &wrapfalloc;
+    falloc = wrapfalloc;
     fallocpat[0] = 1;
     fallocpat[2] = 1;
 
@@ -1751,7 +1751,7 @@ void
 cttest_binlog_disk_full_delete()
 {
     size = 1000;
-    falloc = &wrapfalloc;
+    falloc = wrapfalloc;
     fallocpat[0] = 1;
     fallocpat[1] = 1;
 

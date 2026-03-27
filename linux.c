@@ -1,4 +1,4 @@
-#define _XOPEN_SOURCE 600
+#define _GNU_SOURCE
 
 #include "dat.h"
 #include <unistd.h>
@@ -9,10 +9,6 @@
 #include <errno.h>
 #include <sys/epoll.h>
 #include <limits.h>
-
-#ifndef EPOLLRDHUP
-#define EPOLLRDHUP 0x2000
-#endif
 
 // Batch size for epoll_wait. Amortizes syscall overhead: with 64 events
 // per call, a server handling 100K events/sec makes ~1562 syscalls instead
@@ -29,9 +25,9 @@ static int ep_pos;
 int
 sockinit(void)
 {
-    epfd = epoll_create(1);
+    epfd = epoll_create1(EPOLL_CLOEXEC);
     if (epfd == -1) {
-        twarn("epoll_create");
+        twarn("epoll_create1");
         return -1;
     }
     ep_nready = 0;

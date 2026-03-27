@@ -31,17 +31,7 @@ enum { MaxN = 1000 * 1000 * 1000 };
 
 
 
-#ifdef __MACH__
-#	include <mach/mach_time.h>
-
-static int64
-nstime()
-{
-    return (int64)mach_absolute_time();
-}
-
-#else
-#	include <time.h>
+#include <time.h>
 
 static int64
 nstime()
@@ -50,8 +40,6 @@ nstime()
     clock_gettime(CLOCK_MONOTONIC, &t);
     return (int64)(t.tv_sec)*Second + t.tv_nsec;
 }
-
-#endif
 
 void
 ctlogpn(const char *p, int n, const char *fmt, ...)

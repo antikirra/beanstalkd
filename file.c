@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "dat.h"
 #include <stdint.h>
 #include <inttypes.h>
@@ -19,7 +20,7 @@ static int  readfull(File*, void*, int, int*, char*);
 static void warnpos(File*, int, char*, ...)
 __attribute__((format(printf, 3, 4)));
 
-FAlloc *falloc = &rawfalloc;
+FAlloc falloc = rawfalloc;
 
 enum
 {
@@ -57,9 +58,16 @@ enum
 int
 rawfalloc(int fd, int len)
 {
-    // We do not use ftruncate() because it might extend the file
-    // with a sequence of null bytes or a hole.
-    // posix_fallocate() is not portable enough, might fail for NFS.
+    // fallocate(): single syscall, O(1), allocates without writing.
+    // Falls through to write loop on EOPNOTSUPP (e.g. NFS, tmpfs).
+    int r = fallocate(fd, 0, 0, len);
+    if (r == 0)
+        return 0;
+    if (errno != EOPNOTSUPP && errno != ENOSYS)
+        return errno;
+
+    // Fallback: write zeroes in 4KB chunks for filesystems
+    // that don't support fallocate (NFS, tmpfs).
     static char buf[4096] = {0};
     int i, w;
 
@@ -357,7 +365,7 @@ readrec5(File *f, Job *l, int *err)
     if (!(j || namelen)) {
         // We read a short record without having seen a
         // full record for this job, so the full record
-        // was in an eariler file that has been deleted.
+        // was in an earlier file that has been deleted.
         // Therefore the job itself has either been
         // deleted or migrated; either way, this record
         // should be ignored.
@@ -506,7 +514,7 @@ filewopen(File *f)
     int n;
     int ver = Walver;
 
-    fd = open(f->path, O_WRONLY|O_CREAT, 0400);
+    fd = open(f->path, O_WRONLY|O_CREAT|O_CLOEXEC, 0400);
     if (fd < 0) {
         twarn("open %s", f->path);
         return;

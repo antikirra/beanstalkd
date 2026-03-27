@@ -88,12 +88,6 @@ and format of the `beanstalkd` protocol.
   This helps reduce resident memory after mass job deletion on glibc
   systems. A value of 0 disables this behavior. The default is 60.
 
-* `-c`:
-  This flag has no effect. It is kept for historical compatibility only.
-
-* `-n`:
-  This flag has no effect. It is kept for historical compatibility only.
-
 ## ENVIRONMENT
 
 * `LISTEN_PID`, `LISTEN_FDS`:
@@ -104,12 +98,9 @@ and format of the `beanstalkd` protocol.
 
 sd-daemon(3), sd_listen_fds(3)
 
-Files `README.md` and `doc/protocol.txt` in the `beanstalkd`
-distribution.
-
-<https://beanstalkd.github.io/>
+Files `README.md` and `doc/protocol.txt` in the beanstalkd distribution.
 
 ## AUTHOR
 
-`Beanstalkd` is written by Keith Rarick and maintained by the community at
-<https://github.com/beanstalkd/beanstalkd/issues>
+Originally written by Keith Rarick. This fork is maintained at
+<https://github.com/antikirra/beanstalkd>

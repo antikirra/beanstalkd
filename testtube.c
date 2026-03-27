@@ -177,3 +177,59 @@ cttest_tube_find_in_watch_set()
     tube_dref(a);
     tube_dref(b);
 }
+
+// ─── Tube hash collision chain stress ───────────────────────
+// Create 500 tubes, delete alternating ones, verify survivors.
+// With 256 hash buckets, 500 tubes guarantees chain length ~2.
+// This attacks collision resolution: if unlinking breaks a chain,
+// a later lookup silently returns NULL for a tube that exists.
+
+void
+cttest_tube_hash_collision_stress_500()
+{
+    char name[32];
+    Tube *tubes[500];
+
+    // Create 500 tubes
+    for (int i = 0; i < 500; i++) {
+        snprintf(name, sizeof(name), "collision-%d", i);
+        tubes[i] = tube_find_or_make(name);
+        assertf(tubes[i] != NULL, "tube %d must be created", i);
+        tube_iref(tubes[i]); // hold strong ref
+    }
+
+    // Verify all findable
+    for (int i = 0; i < 500; i++) {
+        snprintf(name, sizeof(name), "collision-%d", i);
+        Tube *found = tube_find_name(name);
+        assertf(found == tubes[i],
+                "tube %d must be findable after creation", i);
+    }
+
+    // Delete every other tube (odd indices)
+    for (int i = 1; i < 500; i += 2) {
+        tube_dref(tubes[i]); // release our ref
+        tubes[i] = NULL;
+    }
+
+    // Survivors (even indices) must still be findable
+    for (int i = 0; i < 500; i += 2) {
+        snprintf(name, sizeof(name), "collision-%d", i);
+        Tube *found = tube_find_name(name);
+        assertf(found == tubes[i],
+                "surviving tube %d must be findable after alternating deletes", i);
+    }
+
+    // Deleted tubes must NOT be findable
+    for (int i = 1; i < 500; i += 2) {
+        snprintf(name, sizeof(name), "collision-%d", i);
+        Tube *found = tube_find_name(name);
+        assertf(found == NULL,
+                "deleted tube %d must NOT be findable", i);
+    }
+
+    // Clean up survivors
+    for (int i = 0; i < 500; i += 2) {
+        tube_dref(tubes[i]);
+    }
+}

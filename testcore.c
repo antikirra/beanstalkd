@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 static Tube *dtube;
 
@@ -29,9 +30,9 @@ void
 cttest_nanoseconds_advances()
 {
     int64 t1 = nanoseconds();
-    /* burn some CPU */
-    volatile int x = 0;
-    for (int i = 0; i < 1000000; i++) x += i;
+    // CLOCK_MONOTONIC_COARSE has jiffy resolution (~1-4ms).
+    // Sleep 5ms to guarantee crossing a jiffy boundary.
+    usleep(5000);
     int64 t2 = nanoseconds();
     assertf(t2 > t1, "time must advance after work: %lld > %lld",
             (long long)t2, (long long)t1);

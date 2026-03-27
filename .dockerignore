@@ -1,6 +1,9 @@
+.git
+*.o
 *.gcda
 *.gcno
-*.o
-/vers.c
 /beanstalkd
-/News
+/vers.c
+ct/_ctcheck
+ct/_ctcheck.c
+ct/*.o

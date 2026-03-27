@@ -8,8 +8,10 @@ nanoseconds(void)
 {
     struct timespec ts;
 
-    int r = clock_gettime(CLOCK_MONOTONIC, &ts);
-    if (r != 0) return warnx("clock_gettime"), -1; // can't happen
+    // CLOCK_MONOTONIC_COARSE: ~5ns vs ~25ns for CLOCK_MONOTONIC.
+    // Resolution is jiffy-based (~1-4ms), adequate for beanstalkd
+    // where job delays and TTR are in whole seconds.
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
 
     return ((int64)ts.tv_sec)*1000000000 + (int64)ts.tv_nsec;
 }

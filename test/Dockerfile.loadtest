@@ -1,29 +1,23 @@
-FROM ubuntu:22.04
+FROM debian:bookworm-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && apt-get install -y \
-    gcc libc6-dev make git python3 valgrind \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc libc6-dev make valgrind python3 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
 COPY . .
 
-# Build TWO binaries:
-# 1) ASan build for memory safety
-# 2) Debug build for Valgrind (ASan and Valgrind are incompatible)
-
+# ASan build (memory safety)
 RUN make clean && make \
-    CC=gcc \
     CFLAGS="-O2 -g -fsanitize=address -fno-omit-frame-pointer" \
     LDFLAGS="-fsanitize=address" \
-    LDLIBS="-lrt -lpthread" \
     && cp beanstalkd /usr/local/bin/beanstalkd-asan
 
+# Debug build for Valgrind (ASan and Valgrind are incompatible)
 RUN make clean && make \
-    CC=gcc \
-    CFLAGS="-O0 -g3 -Wall -Wformat=2" \
-    LDLIBS="-lrt -lpthread" \
+    CFLAGS="-O0 -g3" \
     && cp beanstalkd /usr/local/bin/beanstalkd-debug
 
 COPY test/loadtest.sh /loadtest.sh

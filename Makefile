@@ -6,20 +6,16 @@ override CFLAGS+=-Wall -Werror -Wformat=2 -g
 override LDFLAGS?=
 
 LDLIBS?=
+LDLIBS+=-lrt -lpthread
 
-OS?=$(shell uname | tr 'A-Z' 'a-z')
 INSTALL?=install
 PKG_CONFIG?=pkg-config
-
-ifeq ($(OS),sunos)
-override LDFLAGS += -lxnet -lsocket -lnsl
-endif
 
 VERS=$(shell ./vers.sh)
 TARG=beanstalkd
 MOFILE=main.o
 OFILES=\
-	$(OS).o\
+	linux.o\
 	conn.o\
 	file.o\
 	heap.o\
@@ -53,10 +49,6 @@ TOFILES=\
 
 HFILES=\
 	dat.h\
-
-ifeq ($(OS),linux)
-   LDLIBS+=-lrt -lpthread
-endif
 
 # systemd support can be configured via USE_SYSTEMD:
 #        no: disabled
@@ -109,6 +101,7 @@ bench: ct/_ctcheck
 	ct/_ctcheck -b
 
 ct/_ctcheck: ct/_ctcheck.o ct/ct.o $(OFILES) $(TOFILES)
+	$(LINK.o) -o $@ $^ $(LDLIBS)
 
 ct/_ctcheck.o: ct/_ctcheck.c
 
@@ -130,5 +123,3 @@ vers.c:
 
 doc/beanstalkd.1 doc/beanstalkd.1.html: doc/beanstalkd.ronn
 	ronn $<
-
-freebsd.o: darwin.c

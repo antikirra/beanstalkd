@@ -1,6 +1,9 @@
+*.o
 *.gcda
 *.gcno
-*.o
-/vers.c
 /beanstalkd
-/News
+/vers.c
+ct/_ctcheck
+ct/_ctcheck.c
+ct/_ctcheck.o
+ct/*.o

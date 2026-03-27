@@ -1,0 +1,31 @@
+FROM debian:bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc libc6-dev make git ca-certificates python3 procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# ─── Build upstream (original beanstalkd from GitHub) ────────
+RUN git clone --depth 1 https://github.com/beanstalkd/beanstalkd.git /upstream
+# Both binaries compiled with identical optimization flags for fair comparison.
+# -Werror removed from upstream because it has unfixed warnings.
+RUN cd /upstream \
+    && sed -i 's/-Werror//' Makefile \
+    && make clean && make CFLAGS="-O2 -DNDEBUG" \
+    && cp beanstalkd /usr/local/bin/beanstalkd-upstream
+
+# ─── Build fork (this repository) ───────────────────────────
+WORKDIR /fork
+COPY . .
+RUN make clean && make \
+    CFLAGS="-O2 -DNDEBUG" \
+    && cp beanstalkd /usr/local/bin/beanstalkd-fork
+
+# Clean up build artifacts
+RUN rm -rf /upstream /fork
+
+COPY test/benchmark.sh /benchmark.sh
+RUN chmod +x /benchmark.sh
+
+ENTRYPOINT ["/benchmark.sh"]

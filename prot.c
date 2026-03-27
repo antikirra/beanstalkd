@@ -302,6 +302,9 @@ delay_tube_update(Tube *t)
         heapremove(&delay_tube_heap, t->delay_heap_index);
     }
     t->in_delay_heap = heapinsert(&delay_tube_heap, t);
+    if (!t->in_delay_heap) {
+        twarnx("delay_tube_update: OOM inserting tube %s into delay heap", t->name);
+    }
     return t->in_delay_heap;
 }
 
@@ -340,6 +343,9 @@ matchable_update(Tube *t)
             heapremove(&matchable_heap, t->matchable_index);
         }
         t->in_matchable = heapinsert(&matchable_heap, t);
+        if (!t->in_matchable) {
+            twarnx("matchable_update: OOM inserting tube %s into matchable heap", t->name);
+        }
     } else if (t->in_matchable) {
         heapremove(&matchable_heap, t->matchable_index);
         t->in_matchable = 0;
@@ -381,6 +387,9 @@ pause_tube_update(Tube *t)
         heapremove(&pause_tube_heap, t->pause_heap_index);
     }
     t->in_pause_heap = heapinsert(&pause_tube_heap, t);
+    if (!t->in_pause_heap) {
+        twarnx("pause_tube_update: OOM inserting tube %s into pause heap", t->name);
+    }
 }
 
 // Clean up prot.c internal state when a tube is about to be freed.
@@ -1161,16 +1170,17 @@ enqueue_incoming_job(Conn *c)
     /* we have a complete job, so let's stick it in the pqueue */
     r = enqueue_job(c->srv, j, j->r.delay, 1);
 
-    global_stat.total_jobs_ct++;
-    j->tube->stat.total_jobs_ct++;
-
     if (r == 1) {
+        global_stat.total_jobs_ct++;
+        j->tube->stat.total_jobs_ct++;
         process_queue();
         reply_line(c, STATE_SEND_WORD, MSG_INSERTED_FMT, j->r.id);
         return;
     }
 
     /* out of memory trying to grow the queue, so it gets buried */
+    global_stat.total_jobs_ct++;
+    j->tube->stat.total_jobs_ct++;
     bury_job(c->srv, j, 0);
     reply_line(c, STATE_SEND_WORD, MSG_BURIED_FMT, j->r.id);
 }
@@ -2514,11 +2524,7 @@ h_accept(const int fd, const short which, Server *s)
     // cost a full epoll_wait + prottick round-trip.
     for (;;) {
         socklen_t addrlen = sizeof addr;
-#ifdef SOCK_NONBLOCK
-        int cfd = accept4(fd, (struct sockaddr *)&addr, &addrlen, SOCK_NONBLOCK);
-#else
-        int cfd = accept(fd, (struct sockaddr *)&addr, &addrlen);
-#endif
+        int cfd = accept4(fd, (struct sockaddr *)&addr, &addrlen, SOCK_NONBLOCK|SOCK_CLOEXEC);
         if (cfd == -1) {
             if (errno == EMFILE || errno == ENFILE) {
                 twarnx("accept: too many open files");
@@ -2531,19 +2537,6 @@ h_accept(const int fd, const short which, Server *s)
         if (verbose) {
             printf("accept %d\n", cfd);
         }
-
-#ifndef SOCK_NONBLOCK
-        {
-            int r = make_nonblocking(cfd);
-            if (r == -1) {
-                close(cfd);
-                if (verbose) {
-                    printf("close %d\n", cfd);
-                }
-                continue;
-            }
-        }
-#endif
 
         int flags = 1;
         setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &flags, sizeof flags);
@@ -2629,13 +2622,16 @@ prot_replay(Server *s, Job *list)
 
     now = nanoseconds();
 
+    int ok = 1;
     for (j = list->next ; j != list ; j = nj) {
         nj = j->next;
         job_list_remove(j);
         int z = walresvupdate(shard_wal(s, j));
         if (!z) {
-            twarnx("failed to reserve space");
-            return 0;
+            twarnx("failed to reserve space for job %"PRIu64", burying", j->r.id);
+            bury_job(s, j, 0);
+            ok = 0;
+            continue;
         }
         j->walresv += z;
         int64 delay = 0;
@@ -2654,9 +2650,10 @@ prot_replay(Server *s, Job *list)
             if (r < 1) {
                 twarnx("error recovering job %"PRIu64", burying", j->r.id);
                 bury_job(s, j, 0);
+                ok = 0;
             }
         }
     }
     process_queue();
-    return 1;
+    return ok;
 }

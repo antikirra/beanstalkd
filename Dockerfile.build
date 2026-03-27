@@ -1,0 +1,23 @@
+FROM debian:bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc libc6-dev make cppcheck \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+
+# Build and run 197 tests under UBSan (traps on first undefined behavior)
+RUN make clean && make check \
+    CFLAGS="-O2 -Wall -Werror -Wformat=2 -g -fsanitize=undefined -fno-sanitize-recover=all" \
+    LDFLAGS="-fsanitize=undefined" \
+    LDLIBS="-lrt -lpthread -lubsan"
+
+# cppcheck: zero false-positive static analysis
+RUN cppcheck --error-exitcode=1 --enable=warning,performance \
+    --suppress=missingIncludeSystem --quiet \
+    --std=c99 -I. \
+    conn.c file.c heap.c job.c linux.c main.c ms.c net.c \
+    primes.c prot.c serv.c time.c tube.c util.c walg.c

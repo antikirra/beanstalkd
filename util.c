@@ -73,16 +73,11 @@ fmtalloc(char *fmt, ...)
 // Zalloc allocates n bytes of zeroed memory and
 // returns a pointer to it.
 // If insufficient memory is available, zalloc returns 0.
+// Uses calloc which avoids memset for mmap'd pages on glibc.
 void*
 zalloc(size_t n)
 {
-    void *p;
-
-    p = malloc(n);
-    if (p) {
-        memset(p, 0, n);
-    }
-    return p;
+    return calloc(1, n);
 }
 
 
@@ -189,12 +184,6 @@ optparse(Server *s, char **argv)
                         warnx("invalid wal file size, using default");
                         s->wal.filesize = Filesizedef;
                     }
-                    break;
-                case 'c':
-                    warnx("-c flag was removed. binlog is always compacted.");
-                    break;
-                case 'n':
-                    warnx("-n flag was removed. binlog is always compacted.");
                     break;
                 case 'f':
                     ms = (int64)parse_size_t(EARGF(flagusage("-f")));
