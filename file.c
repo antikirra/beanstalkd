@@ -63,12 +63,16 @@ rawfalloc(int fd, int len)
     static char buf[4096] = {0};
     int i, w;
 
-    for (i = 0; i < len; i += w) {
+    for (i = 0; i < len; ) {
         w = write(fd, buf, sizeof buf);
-        if (w == -1 && errno == EINTR)
-            continue;
-        if (w <= 0)
-            return w == -1 ? errno : EIO;
+        if (w == -1) {
+            if (errno == EINTR)
+                continue;
+            return errno;
+        }
+        if (w == 0)
+            return EIO;
+        i += w;
     }
     lseek(fd, 0, 0);            // do not care if this fails
     return 0;
@@ -239,12 +243,14 @@ readrec(File *f, Job *l, int *err)
             job_list_reset(j);
             j->r.created_at = jr.created_at;
         }
+        {
+        int32 old_body_size = j->r.body_size;
         j->r = jr;
         job_list_insert(l, j);
 
         // full record; read the job body
         if (namelen) {
-            if (jr.body_size != j->r.body_size) {
+            if (jr.body_size != old_body_size) {
                 warnpos(f, -r, "job %"PRIu64" size changed", j->r.id);
                 warnpos(f, -r, "was %d, now %d", j->r.body_size, jr.body_size);
                 goto Error;
@@ -265,6 +271,7 @@ readrec(File *f, Job *l, int *err)
         f->w->alive += sz;
 
         return 1;
+        } /* end old_body_size scope */
     case Invalid:
         if (j) {
             job_list_remove(j);
@@ -366,6 +373,8 @@ readrec5(File *f, Job *l, int *err)
                                  t, jr.id);
             job_list_reset(j);
         }
+        {
+        int32 old_body_size = j->r.body_size;
         j->r.id = jr.id;
         j->r.pri = jr.pri;
         j->r.delay = jr.delay * 1000; // us => ns
@@ -383,7 +392,7 @@ readrec5(File *f, Job *l, int *err)
 
         // full record; read the job body
         if (namelen) {
-            if (jr.body_size != j->r.body_size) {
+            if (jr.body_size != old_body_size) {
                 warnpos(f, -r, "job %"PRIu64" size changed", j->r.id);
                 warnpos(f, -r, "was %"PRId32", now %"PRId32, j->r.body_size, jr.body_size);
                 goto Error;
@@ -404,6 +413,7 @@ readrec5(File *f, Job *l, int *err)
         f->w->alive += sz;
 
         return 1;
+        } /* end old_body_size scope */
     case Invalid:
         if (j) {
             job_list_remove(j);
@@ -430,21 +440,26 @@ Error:
 static int
 readfull(File *f, void *c, int n, int *err, char *desc)
 {
-    int r;
+    int got = 0;
 
-    r = read(f->fd, c, n);
-    if (r == -1) {
-        twarn("read");
-        warnpos(f, 0, "error reading %s", desc);
-        *err = 1;
-        return 0;
+    while (got < n) {
+        int r = read(f->fd, (char *)c + got, n - got);
+        if (r == -1) {
+            if (errno == EINTR)
+                continue;
+            twarn("read");
+            warnpos(f, 0, "error reading %s", desc);
+            *err = 1;
+            return 0;
+        }
+        if (r == 0) {
+            warnpos(f, -got, "unexpected EOF reading %d bytes (got %d): %s", n, got, desc);
+            *err = 1;
+            return 0;
+        }
+        got += r;
     }
-    if (r != n) {
-        warnpos(f, -r, "unexpected EOF reading %d bytes (got %d): %s", n, r, desc);
-        *err = 1;
-        return 0;
-    }
-    return r;
+    return got;
 }
 
 static void

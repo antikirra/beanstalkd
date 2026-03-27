@@ -14,6 +14,22 @@
 
 static int reserve(Wal *w, int n);
 
+// Platform-aware fsync: uses F_FULLFSYNC on macOS for true durability
+// (standard fsync on macOS does not flush drive write caches),
+// plain fsync elsewhere.
+static int
+durable_fsync(int fd)
+{
+#ifdef F_FULLFSYNC
+    int r = fcntl(fd, F_FULLFSYNC, 0);
+    if (r == -1 && errno == ENOTSUP)
+        return fsync(fd);
+    return r;
+#else
+    return fsync(fd);
+#endif
+}
+
 // --- Async fsync thread ---
 //
 // Moves the blocking fsync() call off the main event loop thread.
@@ -53,7 +69,7 @@ sync_thread_fn(void *arg)
 
         // Blocking fsync on our private dup'd fd.
         // Main thread is free to continue processing events.
-        int r = fsync(fd);
+        int r = durable_fsync(fd);
         close(fd); // we own this fd (dup'd by main thread)
 
         pthread_mutex_lock(&sync_mu);
@@ -129,7 +145,7 @@ dirsync(Wal *w)
 {
     int fd = open(w->dir, O_RDONLY);
     if (fd >= 0) {
-        fsync(fd);
+        durable_fsync(fd);
         close(fd);
     }
 }
@@ -291,7 +307,7 @@ walsync(Wal *w)
             pthread_mutex_unlock(&sync_mu);
         } else {
             // Synchronous fallback
-            if (fsync(w->cur->fd) == -1) {
+            if (durable_fsync(w->cur->fd) == -1) {
                 twarn("fsync");
                 return 0;
             }

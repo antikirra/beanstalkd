@@ -5,6 +5,16 @@
 
 static uint64 next_id = 1;
 
+// Free list for Job reuse. Reduces malloc/free overhead and heap
+// fragmentation for high-throughput workloads with uniform job sizes.
+// Entries are linked via ht_next (safe: job is removed from hash before pooling).
+// Only exact body_size matches are reused to avoid memory waste.
+#define JOB_POOL_CAP     4096
+#define JOB_POOL_MEM_MAX (8 << 20) // 8MB
+static Job    *job_pool;
+static int     job_pool_len;
+static size_t  job_pool_mem;
+
 static int cur_prime = 0;
 
 static Job *all_jobs_init[12289] = {0};
@@ -88,19 +98,48 @@ job_find(uint64 job_id)
 Job *
 allocate_job(int body_size)
 {
-    Job *j;
+    Job *j = NULL;
 
-    j = malloc(sizeof(Job) + body_size);
-    if (!j) {
-        twarnx("OOM");
-        return (Job *) 0;
+    // Reuse from pool if head matches the requested body size exactly.
+    if (job_pool && job_pool->r.body_size == body_size) {
+        j = job_pool;
+        job_pool = j->ht_next;
+        job_pool_len--;
+        job_pool_mem -= sizeof(Job) + body_size;
     }
 
-    memset(j, 0, sizeof(Job));
+    if (!j) {
+        j = malloc(sizeof(Job) + body_size);
+        if (!j) {
+            twarnx("OOM");
+            return (Job *) 0;
+        }
+    }
+
+    // Zero only cold/WAL fields. Hot fields (r.id, r.pri, r.delay, r.ttr,
+    // heap_index, tube, reserver) are set by make_job_with_id or callers.
+    // Avoids touching 3 cache lines when only 1 needs clearing.
     j->r.created_at = now ? now : nanoseconds();
     j->r.body_size = body_size;
+    j->r.deadline_at = 0;
+    j->r.reserve_ct = 0;
+    j->r.timeout_ct = 0;
+    j->r.release_ct = 0;
+    j->r.bury_ct = 0;
+    j->r.kick_ct = 0;
+    j->r.state = 0;
+    j->heap_index = 0;
+    j->tube = NULL;
+    j->reserver = NULL;
     j->body = (char *)j + sizeof(Job);
-    job_list_reset(j);
+    j->prev = j;
+    j->next = j;
+    j->ht_next = NULL;
+    j->file = NULL;
+    j->fnext = NULL;
+    j->fprev = NULL;
+    j->walresv = 0;
+    j->walused = 0;
     return j;
 }
 
@@ -152,9 +191,23 @@ job_hash_free(Job *j)
 void
 job_free(Job *j)
 {
-    if (j) {
-        TUBE_ASSIGN(j->tube, NULL);
-        if (j->r.state != Copy) job_hash_free(j);
+    if (!j) return;
+
+    int is_copy = (j->r.state == Copy);
+
+    TUBE_ASSIGN(j->tube, NULL);
+    if (!is_copy) job_hash_free(j);
+
+    // Pool regular jobs for reuse; copies and excess go to free().
+    size_t entry_bytes = sizeof(Job) + j->r.body_size;
+    if (!is_copy
+        && job_pool_len < JOB_POOL_CAP
+        && job_pool_mem + entry_bytes <= JOB_POOL_MEM_MAX) {
+        j->ht_next = job_pool;
+        job_pool = j;
+        job_pool_len++;
+        job_pool_mem += entry_bytes;
+        return;
     }
 
     free(j);

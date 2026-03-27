@@ -84,12 +84,14 @@ make_tube(const char *name)
     if (!t)
         return NULL;
 
-    strncpy(t->name, name, MAX_TUBE_NAME_LEN);
-    if (t->name[MAX_TUBE_NAME_LEN - 1] != '\0') {
-        t->name[MAX_TUBE_NAME_LEN - 1] = '\0';
+    size_t nlen = strlen(name);
+    if (nlen >= MAX_TUBE_NAME_LEN) {
         twarnx("truncating tube name");
+        nlen = MAX_TUBE_NAME_LEN - 1;
     }
-    t->name_len = strlen(t->name);
+    memcpy(t->name, name, nlen);
+    t->name[nlen] = '\0';
+    t->name_len = nlen;
 
     t->ready.less = job_pri_less;
     t->delay.less = job_delay_less;
@@ -150,8 +152,13 @@ make_and_insert_tube(const char *name)
     /* We want this global tube list to behave like "weak" refs, so don't
      * increment the ref count. */
     r = ms_append(&tubes, t);
-    if (!r)
-        return tube_dref(t), (Tube *) 0;
+    if (!r) {
+        ms_clear(&t->waiting_conns);
+        free(t->ready.data);
+        free(t->delay.data);
+        free(t);
+        return NULL;
+    }
 
     tube_ht_add(t);
     return t;

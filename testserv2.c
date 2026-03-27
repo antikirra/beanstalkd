@@ -238,7 +238,7 @@ cttest_release_cycle()
         snd(fd, "reserve-with-timeout 0\r\n");
         cksub(fd, "RESERVED 1");
         char tmp[256];
-        read(fd, tmp, sizeof tmp);
+        { ssize_t n_ = read(fd, tmp, sizeof tmp); (void)n_; }
         snd(fd, "release 1 100 0\r\n");
         ck(fd, "RELEASED\r\n");
     }
@@ -247,7 +247,7 @@ cttest_release_cycle()
     snd(fd, "peek 1\r\n");
     cksub(fd, "FOUND 1");
     char tmp[256];
-    read(fd, tmp, sizeof tmp);
+    { ssize_t n_ = read(fd, tmp, sizeof tmp); (void)n_; }
 
     snd(fd, "delete 1\r\n");
     ck(fd, "DELETED\r\n");
@@ -267,7 +267,7 @@ cttest_bury_kick_cycle()
         snd(fd, "reserve-with-timeout 0\r\n");
         cksub(fd, "RESERVED");
         char tmp[256];
-        read(fd, tmp, sizeof tmp);
+        { ssize_t n_ = read(fd, tmp, sizeof tmp); (void)n_; }
         snd(fd, "bury 1 0\r\n");
         ck(fd, "BURIED\r\n");
 
@@ -279,7 +279,7 @@ cttest_bury_kick_cycle()
     snd(fd, "peek-ready\r\n");
     cksub(fd, "FOUND 1 3");
     char body[32];
-    read(fd, body, sizeof body);
+    { ssize_t n_ = read(fd, body, sizeof body); (void)n_; }
     assertf(memcmp(body, "abc\r\n", 5) == 0, "body must be preserved after bury/kick cycles");
 }
 
@@ -320,7 +320,7 @@ cttest_use_watch_ignore_sequence()
     snd(fd, "reserve-with-timeout 0\r\n");
     cksub(fd, "RESERVED");
     char tmp[256];
-    read(fd, tmp, sizeof tmp);
+    { ssize_t n_ = read(fd, tmp, sizeof tmp); (void)n_; }
 }
 
 void
@@ -399,7 +399,7 @@ cttest_reserve_job_already_reserved_v2()
     snd(fd, "reserve-with-timeout 0\r\n");
     cksub(fd, "RESERVED");
     char tmp[256];
-    read(fd, tmp, sizeof tmp);
+    { ssize_t n_ = read(fd, tmp, sizeof tmp); (void)n_; }
 
     /* reserve-job on already-reserved job must fail */
     snd(fd, "reserve-job 1\r\n");

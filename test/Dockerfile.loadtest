@@ -15,7 +15,7 @@ COPY . .
 
 RUN make clean && make \
     CC=gcc \
-    CFLAGS="-O1 -g -fsanitize=address -fno-omit-frame-pointer -Wall -Wformat=2" \
+    CFLAGS="-O2 -g -fsanitize=address -fno-omit-frame-pointer" \
     LDFLAGS="-fsanitize=address" \
     LDLIBS="-lrt -lpthread" \
     && cp beanstalkd /usr/local/bin/beanstalkd-asan

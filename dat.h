@@ -303,6 +303,11 @@ int64 nanoseconds(void);
 // prot_init(), prot_replay(). Use instead of nanoseconds() in hot paths.
 extern int64 now;
 
+// Interval in nanoseconds between malloc_trim() calls.
+// Set via -m flag (in seconds). 0 disables trim.
+// Default: 60 seconds. Only effective on glibc.
+extern int64 mem_trim_rate;
+
 int   rawfalloc(int fd, int len);
 
 // Take ID for a jobs from next_id and allocate and store the job.

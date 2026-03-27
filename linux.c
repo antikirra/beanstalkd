@@ -74,7 +74,7 @@ socknext(Socket **s, int64 timeout)
 
     if (r > 0) {
         *s = ev.data.ptr;
-        if (ev.events & (EPOLLHUP|EPOLLRDHUP)) {
+        if (ev.events & (EPOLLERR|EPOLLHUP|EPOLLRDHUP)) {
             return 'h';
         } else if (ev.events & EPOLLIN) {
             return 'r';

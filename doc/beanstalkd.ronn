@@ -83,6 +83,11 @@ and format of the `beanstalkd` protocol.
 * `-z` <bytes>:
   The maximum size in bytes of a job.
 
+* `-m` <sec>:
+  Return unused memory to the OS at most once every <sec> seconds.
+  This helps reduce resident memory after mass job deletion on glibc
+  systems. A value of 0 disables this behavior. The default is 60.
+
 * `-c`:
   This flag has no effect. It is kept for historical compatibility only.
 

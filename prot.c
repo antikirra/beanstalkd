@@ -18,9 +18,14 @@
 #include <stdarg.h>
 #include <signal.h>
 #include <limits.h>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 
 /* job body cannot be greater than this many bytes long */
 size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
+
+int64 mem_trim_rate = 60000000000LL; /* 60 seconds in nanoseconds */
 
 #define NAME_CHARS \
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ" \
@@ -661,6 +666,21 @@ enqueue_job(Server *s, Job *j, int64 delay, char update_store)
 
     if (update_store) {
         if (!walwrite(&s->wal, j)) {
+            // Rollback: remove from heap so callers don't face
+            // a job present in two data structures.
+            if (delay) {
+                heapremove(&j->tube->delay, j->heap_index);
+                delayed_ct--;
+                delay_tube_update(j->tube);
+            } else {
+                heapremove(&j->tube->ready, j->heap_index);
+                ready_ct--;
+                if (j->r.pri < URGENT_THRESHOLD) {
+                    global_stat.urgent_ct--;
+                    j->tube->stat.urgent_ct--;
+                }
+                matchable_update(j->tube);
+            }
             return 0;
         }
         if (!walmaint(&s->wal)) {
@@ -1695,6 +1715,11 @@ dispatch_cmd(Conn *c)
         if (delay) {
             int z = walresvupdate(&c->srv->wal);
             if (!z) {
+                /* Undo remove_reserved_job: restore counters and re-link. */
+                global_stat.reserved_ct++;
+                j->tube->stat.reserved_ct++;
+                job_list_insert(&c->reserved_jobs, j);
+                j->reserver = c;
                 reply_serr(c, MSG_OUT_OF_MEMORY);
                 return;
             }
@@ -1736,7 +1761,18 @@ dispatch_cmd(Conn *c)
         j->r.pri = pri;
         r = bury_job(c->srv, j, 1);
         if (!r) {
-            reply_serr(c, MSG_INTERNAL_ERROR);
+            if (j->r.state == Buried) {
+                // Job was buried in memory but WAL write failed.
+                // WAL is now disabled; in-memory state is correct.
+                reply_msg(c, MSG_BURIED);
+            } else {
+                // WAL reservation failed; undo remove_reserved_job.
+                global_stat.reserved_ct++;
+                j->tube->stat.reserved_ct++;
+                job_list_insert(&c->reserved_jobs, j);
+                j->reserver = c;
+                reply_serr(c, MSG_INTERNAL_ERROR);
+            }
             return;
         }
         reply_msg(c, MSG_BURIED);
@@ -2342,6 +2378,19 @@ prottick(Server *s)
     // and expired reservation re-enqueues.
     process_queue();
 
+    // Periodically return unused heap pages to the OS.
+    // Addresses glibc not releasing memory after mass job deletion.
+    // Controlled by -m flag; 0 disables.
+#ifdef __GLIBC__
+    if (mem_trim_rate > 0) {
+        static int64 last_trim;
+        if (now - last_trim >= mem_trim_rate) {
+            malloc_trim(0);
+            last_trim = now;
+        }
+    }
+#endif
+
     epollq_apply();
 
     return period;
@@ -2353,55 +2402,56 @@ h_accept(const int fd, const short which, Server *s)
     UNUSED_PARAMETER(which);
     struct sockaddr_storage addr;
 
-    socklen_t addrlen = sizeof addr;
-    int cfd = accept(fd, (struct sockaddr *)&addr, &addrlen);
-    if (cfd == -1) {
-        if (errno == EMFILE || errno == ENFILE) {
-            twarnx("accept: too many open files");
-        } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            twarn("accept()");
+    // Drain all pending connections from the accept queue.
+    // With level-triggered epoll each pending conn would otherwise
+    // cost a full epoll_wait + prottick round-trip.
+    for (;;) {
+        socklen_t addrlen = sizeof addr;
+        int cfd = accept(fd, (struct sockaddr *)&addr, &addrlen);
+        if (cfd == -1) {
+            if (errno == EMFILE || errno == ENFILE) {
+                twarnx("accept: too many open files");
+            } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                twarn("accept()");
+            }
+            break;
         }
-        epollq_apply();
-        return;
-    }
-    if (verbose) {
-        printf("accept %d\n", cfd);
-    }
-
-    int r = make_nonblocking(cfd);
-    if (r == -1) {
-        close(cfd);
         if (verbose) {
-            printf("close %d\n", cfd);
+            printf("accept %d\n", cfd);
         }
-        epollq_apply();
-        return;
-    }
 
-    int flags = 1;
-    setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &flags, sizeof flags);
-
-    Conn *c = make_conn(cfd, STATE_WANT_COMMAND, default_tube, default_tube);
-    if (!c) {
-        twarnx("make_conn() failed");
-        close(cfd);
-        if (verbose) {
-            printf("close %d\n", cfd);
+        int r = make_nonblocking(cfd);
+        if (r == -1) {
+            close(cfd);
+            if (verbose) {
+                printf("close %d\n", cfd);
+            }
+            continue;
         }
-        epollq_apply();
-        return;
-    }
-    c->srv = s;
-    c->sock.x = c;
-    c->sock.f = (Handle)prothandle;
-    c->sock.fd = cfd;
 
-    r = sockwant(&c->sock, 'r');
-    if (r == -1) {
-        twarn("sockwant");
-        connclose(c);
-        epollq_apply();
-        return;
+        int flags = 1;
+        setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &flags, sizeof flags);
+
+        Conn *c = make_conn(cfd, STATE_WANT_COMMAND, default_tube, default_tube);
+        if (!c) {
+            twarnx("make_conn() failed");
+            close(cfd);
+            if (verbose) {
+                printf("close %d\n", cfd);
+            }
+            continue;
+        }
+        c->srv = s;
+        c->sock.x = c;
+        c->sock.f = (Handle)prothandle;
+        c->sock.fd = cfd;
+
+        r = sockwant(&c->sock, 'r');
+        if (r == -1) {
+            twarn("sockwant");
+            connclose(c);
+            continue;
+        }
     }
     epollq_apply();
 }
@@ -2444,8 +2494,10 @@ prot_init()
     matchable_heap.setpos = tube_match_setpos;
 
     TUBE_ASSIGN(default_tube, tube_find_or_make("default"));
-    if (!default_tube)
+    if (!default_tube) {
         twarnx("Out of memory during startup!");
+        exit(1);
+    }
 }
 
 // For each job in list, inserts the job into the appropriate data

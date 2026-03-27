@@ -1,105 +1,112 @@
 # beanstalkd (hardened fork)
 
-Blazing fast, hardened fork of [beanstalkd](https://github.com/beanstalkd/beanstalkd) — simple and ultra-performant general purpose work queue.
+Hardened, optimized fork of [beanstalkd](https://github.com/beanstalkd/beanstalkd) — simple, fast general purpose work queue.
 
-This fork delivers significantly higher throughput and lower latency than the original through O(1) scheduling algorithms, minimal syscall overhead, and vectorized WAL writes. It fixes **22 confirmed bugs**, adds 92 hostile unit tests, and maintains **100% wire protocol and WAL format compatibility**. Every existing client works unmodified — drop-in replacement for upstream with immediate performance gains.
+Drop-in replacement for upstream: **100% wire protocol and WAL format compatibility**. Every existing client works unmodified. Fixes 32 bugs, adds 92 tests, delivers lower latency through O(1) scheduling and reduced syscall overhead.
 
-See [doc/protocol.txt](doc/protocol.txt) for details of the network protocol.
+See [doc/protocol.txt](doc/protocol.txt) for the network protocol.
 
-## What's different from upstream
-
-### Bug fixes (22 total)
-
-- **P0 crashes fixed** — NULL dereference in conn_timeout (SIGSEGV), infinite loop in rawfalloc, WAL balance rollback corruption
-- **P1 leaks and data loss** — memory leak in h_accept, job leak in enqueue_incoming_job, job_copy dangling body pointer, WAL nrec increment on failure, corrupt WAL records silently skipped, walmaint errors silently ignored, prot_replay orphaned jobs and leaked WAL space
-- **P2 hardening** — OP_KICK/OP_RESERVE_TIMEOUT input validation, darwin/sunos event loop fixes, option parsing boundary checks, integer overflow in -f flag, parallel make race condition
-- **CLOCK_MONOTONIC** — replaced gettimeofday with clock_gettime(CLOCK_MONOTONIC); NTP jumps no longer cause mass job timeouts
-- **Directory fsync** — WAL file creation and deletion followed by fsync(dirfd) to prevent crash-resurrection of unlinked binlogs
-
-### Performance
-
-- **O(1) job scheduling** — matchable tube heap replaces O(tubes) linear scan in process_queue
-- **O(1) delayed job lookup** — global delay tube heap replaces O(tubes) scan per tick
-- **O(1) waiting conn removal** — index-hinted ms_remove_at with swap-tracking callback
-- **O(1) tube lookup** — hash table replaces linear scan for global tube lookup
-- **Minimal syscalls** — 2 clock_gettime per tick (was ~15), single writev per WAL record (was 2-4 write calls)
-- **Per-tick time cache** — global `now` variable eliminates redundant clock_gettime across all hot paths
-- **Async fsync** — WAL fsync runs in a background pthread, so the event loop never blocks on disk I/O
-- **TCP_NODELAY on client connections** — eliminates Nagle's ~40ms buffering delay on small replies
-- **First-byte command dispatch** — switch on first character reduces average strncmp calls from ~12 to ~2
-- **Cache-aligned Job struct** — hot fields (heap_index, tube, reserver) grouped adjacent to Jobrec; sizeof(Job) reduced 176 → 168 bytes, better L1 cache locality
-- **Cached tube name length** — eliminates repeated strlen calls in WAL write and list-tubes paths
-- **Consolidated process_queue** — single call at end of prottick replaces N scattered calls; eliminates redundant O(tubes) scans per tick
-- **Single-pass formatting** — stats and list-tubes responses formatted directly into output buffer; no two-pass measure+format overhead
-- **realloc in heap/ms growth** — allows in-place expansion without copy
-
-### Stability
-
-- **NASA-inspired loop safety** — bounded loops with break on impossible states, no infinite loop risk
-- **Counter consistency** — delayed_ct, paused_ct, ready_ct tracked with matching increment/decrement on all paths including OOM and tube destruction
-- **Graceful OOM degradation** — heap insertion failures are non-fatal and retried on next operation
-- **Hash table resilience** — removed permanent OOM latch that blocked rehash forever after one failure; downscale hysteresis prevents thrashing at initial capacity
-- **Orphan-safe process_queue** — re-enqueues job on impossible state instead of leaking it
-- **Hidden side-effect removal** — process_queue no longer called implicitly from enqueue_job; all callers explicit
-- **EMFILE visibility** — accept() EMFILE/ENFILE condition logged for operator awareness
-
-### Testing
-
-- **192 tests** (100 legacy + 92 hostile) — adversarial tests that cover edge cases, OOM paths, copy independence, boundary values, heap ordering, counter invariants, and stress scenarios
-- **Docker-based integration testing** — ASan, Valgrind, and WAL crash recovery validation
-
-## Quick Start
+## Quick start
 
     $ make
     $ ./beanstalkd
 
-also try,
+    $ make check           # run 192 unit tests
+    $ make bench           # run benchmarks
+    $ ./beanstalkd -h      # show all options
 
-    $ ./beanstalkd -h
-    $ ./beanstalkd -VVV
-    $ make -j4 CFLAGS=-O2
-    $ make CC=clang
-    $ make check
-    $ make install
-    $ make install PREFIX=/usr
+Requires Linux (2.6.17+), Mac OS X, FreeBSD, or Illumos. Any C99 compiler; tested with GCC and clang.
 
-Requires Linux (2.6.17+), Mac OS X, FreeBSD, or Illumos.
-Any C99 compiler should work; tested with GCC and clang.
+## What's different from upstream
 
-On Linux, the build links `-lpthread` (for the async fsync thread) and `-lrt` automatically.
+### Bug fixes (32)
 
-## Tests
+- **P0 crashes** — NULL dereference in conn_timeout (SIGSEGV), infinite loop in rawfalloc, WAL balance rollback corruption, `exit()` in signal handler replaced with async-signal-safe `_exit()`, `EPOLLERR` handling prevents 100% CPU busy-loop, `prot_init` exits on default tube OOM instead of silent SIGSEGV
+- **P1 data loss** — memory leak in h_accept, job leak in enqueue_incoming_job, job_copy dangling body pointer, WAL nrec increment on failure, corrupt WAL records silently skipped, walmaint errors silently ignored, prot_replay orphaned jobs and leaked WAL space, `enqueue_job` WAL failure now rolls back heap insertion (prevents job in two data structures), `release`/`bury` WAL failure restores job to reserved list (prevents orphan)
+- **P2 hardening** — OP_KICK/OP_RESERVE_TIMEOUT input validation, darwin/sunos event loop fixes, option parsing boundary checks, integer overflow in `-f` flag, parallel make race condition, tube memory leak on `ms_append` failure
+- **Clock** — replaced gettimeofday with `clock_gettime(CLOCK_MONOTONIC)`; NTP jumps no longer cause mass job timeouts
+- **WAL integrity** — directory fsync after binlog creation/deletion; durable fsync via `F_FULLFSYNC` on macOS; `readfull` handles EINTR and short reads; `rawfalloc` EINTR no longer corrupts loop counter; `readrec` body_size consistency check fixed (was dead code)
+- **Build** — strncpy buffer safety for GCC 9+ (`-Werror=stringop-truncation`)
+
+### Performance
+
+**Scheduling (O(1) algorithms replacing O(tubes) scans):**
+- Matchable tube heap in `process_queue` — finds next job-to-connection match in O(1)
+- Delay tube heap in `soonest_delayed_job` — finds nearest delayed deadline in O(1)
+- Index-hinted `ms_remove_at` — removes waiting connection from tube in O(1)
+- Hash table for global tube-by-name lookup
+
+**Syscall and I/O reduction:**
+- Per-tick time cache — global `now` eliminates ~13 redundant `clock_gettime` calls per tick
+- Vectorized WAL writes — single `writev` per record instead of 2-4 `write` calls
+- Async fsync — WAL fsync runs in a background pthread; event loop never blocks on disk
+- TCP_NODELAY on accepted connections — eliminates Nagle's ~40ms buffering delay
+- Consolidated `process_queue` — single call per tick instead of N scattered calls
+
+**Memory:**
+- Job pool — LIFO free-list recycles allocations with exact body_size match (up to 4096 entries / 8MB); eliminates malloc/free overhead and heap fragmentation
+- Periodic `malloc_trim` — returns unused glibc heap pages to OS; addresses RSS staying high after mass job deletion (configurable via `-m`, default 60s)
+- Cache-friendly Job struct — hot fields grouped adjacent; sizeof(Job) reduced from 176 to 168 bytes
+- `realloc` for heap/ms growth — allows in-place expansion without copy
+
+**Command parsing:**
+- First-byte dispatch — switch on `cmd[0]` reduces average strncmp calls from ~12 to ~2
+- Cached tube `name_len` — eliminates repeated strlen in WAL write and list-tubes paths
+- Single-pass stats formatting — direct write into output buffer, no measure-then-format
+
+**Build:**
+- Default `-O2` optimization (upstream builds at `-O0`)
+
+### Stability
+
+- Bounded loops with break on impossible states
+- `delayed_ct`, `paused_ct`, `ready_ct` counters tracked with matching inc/dec on all paths including OOM and tube destruction
+- Graceful OOM degradation — heap insertion failures are non-fatal, retried on next operation
+- Hash table downscale hysteresis — prevents thrashing at initial capacity
+- `process_queue` no longer called implicitly from `enqueue_job`; all call sites explicit
+- `accept()` EMFILE/ENFILE condition logged for operator awareness
+
+### Testing
+
+- **192 unit tests** — 100 legacy + 92 hostile (edge cases, OOM paths, copy independence, boundary values, heap ordering, counter invariants, stress up to 1000 elements)
+- **Docker integration** — AddressSanitizer, Valgrind memcheck, WAL crash recovery
+
+## Configuration
+
+All upstream flags are preserved. New flags:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-m SEC` | 60 | Return unused memory to OS every SEC seconds. `0` to disable. Only effective on glibc. |
+
+Full flag list: `./beanstalkd -h`
+
+## Testing
 
 ### Unit tests
 
-Unit tests are in `test*.c`. Run them with:
-
     $ make check
 
-The suite includes 100 legacy regression tests and 92 hostile tests covering edge cases, OOM paths, copy independence, boundary values, heap ordering, counter invariants, O(1) removal hints, and stress scenarios up to 1000 elements.
+### Benchmarks
 
-See https://github.com/kr/ct for information on the test framework.
+    $ make bench
 
 ### Docker integration tests
-
-The Docker-based test suite runs a full load test with three phases:
-
-1. **AddressSanitizer** — memory safety under load (500 put/reserve/delete cycles)
-2. **Valgrind memcheck** — leak detection with definite/indirect leak checks
-3. **WAL crash recovery** — insert 100 jobs, `kill -9`, restart, verify recovery
-
-Run it with:
 
     $ docker build -f test/Dockerfile.loadtest -t beanstalkd-test .
     $ docker run --rm beanstalkd-test
 
-## Subdirectories
+Runs three phases: AddressSanitizer (memory safety), Valgrind memcheck (leak detection), WAL crash recovery (`kill -9` + restart + verify).
 
-- `adm` — files useful for system administrators
-- `ct` — testing tool; vendored from https://github.com/kr/ct
-- `doc` — documentation
-- `pkg` — scripts to make releases
-- `test` — Docker-based integration test suite
+## Project structure
+
+| Directory | Contents |
+|-----------|----------|
+| `adm` | Files for system administrators |
+| `ct` | Test framework (vendored from [kr/ct](https://github.com/kr/ct)) |
+| `doc` | Protocol documentation, man page |
+| `pkg` | Release scripts |
+| `test` | Docker-based integration tests |
 
 ## Links
 

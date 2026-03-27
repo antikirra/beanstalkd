@@ -115,6 +115,8 @@ usage(int code)
             "          max allowed is %d bytes\n"
             " -s BYTES set the size of each write-ahead log file (default is %d);\n"
             "          will be rounded up to a multiple of 4096 bytes\n"
+            " -m SEC   return unused memory to OS every SEC seconds (default is 60);\n"
+            "          use -m0 to disable\n"
             " -v       show version information\n"
             " -V       increase verbosity\n"
             " -h       show this help\n",
@@ -213,6 +215,11 @@ optparse(Server *s, char **argv)
                     s->wal.dir = EARGF(flagusage("-b"));
                     s->wal.use = 1;
                     break;
+                case 'm': {
+                    int64 sec = (int64)parse_size_t(EARGF(flagusage("-m")));
+                    mem_trim_rate = sec * 1000000000LL;
+                    break;
+                }
                 case 'h':
                     usage(0);
                 case 'v':
