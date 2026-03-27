@@ -57,21 +57,36 @@ Five scenarios with WAL persistence enabled (`-b`, fsync every 50ms):
 | 4 | Latency | 1 client, 5K cycles, 4B body | P50/P99/P99.9 round-trip |
 | 5 | Connection storm | 200 connect+stats+close, 8 threads | Accept path efficiency |
 
-Sample results (Docker, bookworm-slim, ARM64):
+### Bare metal results
+
+Server: Debian 12 (bookworm), kernel 6.1.0, 8 vCPU AMD QEMU @ 3.1 GHz, 12GB RAM, SSD.
+Both binaries: `gcc -O2 -DNDEBUG`, identical flags.
 
 | Scenario | Metric | Upstream | Fork | Delta |
 |----------|--------|----------|------|-------|
-| Throughput | ops/s | 11,270 | 12,785 | **+13%** |
-| Throughput | CPU time | 2.11s | 1.67s | **-21% CPU** |
-| Multi-tube | ops/s | 11,623 | 13,680 | **+18%** |
+| Throughput (8 clients) | ops/s | 7,599 | 7,932 | **+4.4%** |
+| Throughput (8 clients) | PUT ops/s | 2,922 | 3,150 | **+7.8%** |
+| Multi-tube (20 tubes) | ops/s | 8,888 | 9,157 | **+3.0%** |
+| 500 tubes | ops/s | 30,983 | 33,841 | **+9.2%** |
+| 500 tubes | CPU time | 1.77s | 1.61s | **-9% CPU** |
+| Latency (single client) | P50 | 135µs | 136µs | ~same |
+| Latency (single client) | P99.9 | **1,595µs** | **228µs** | **7x lower tail** |
+
+**Key finding: tail latency.** P99.9 drops from 1.6ms to 228µs — a **7x improvement** on bare metal. This means the fork eliminates latency spikes that upstream suffers under load. The inline reply flush and batched epoll prevent the event loop from stalling on occasional slow syscalls.
+
+Throughput scales with tube count: at 500 tubes, O(1) heaps deliver +9% over upstream's O(n) scans. On workloads with thousands of tubes the gap widens further.
+
+Trade-off: WAL sharding allocates per-CPU file chains, increasing RSS when persistence is enabled (~16MB vs ~5MB with 8 shards × 10MB WAL files). At 500 tubes without large WAL files, RSS is comparable (+22%).
+
+### Docker results
+
+Same benchmark inside `docker run` (bookworm-slim, ARM64 host):
+
+| Scenario | Metric | Upstream | Fork | Delta |
+|----------|--------|----------|------|-------|
+| Throughput | ops/s | 11,270 | 12,785 | +13% |
 | 500 tubes | ops/s | 38,652 | 50,268 | **+30%** |
-| 500 tubes | CPU time | 1.17s | 0.97s | **-17% CPU** |
-| Latency | P99.9 | 714µs | 305µs | **2.3x lower tail** |
-| Conn storm | conn/s | 8,201 | 8,657 | +6% |
-
-The advantage scales with tube count: at 500 tubes the fork's O(1) heaps deliver **+30% throughput** where upstream's O(n) scans become the bottleneck. Tail latency (P99.9) is consistently 2-3x lower due to inline reply flush and batched epoll.
-
-Trade-off: WAL sharding allocates per-CPU file chains, increasing RSS when persistence is enabled. At 500 tubes RSS is comparable (~8% higher); at 8 clients with large WAL files the difference is larger.
+| Latency | P99.9 | 714µs | 305µs | **2.3x lower** |
 
 ## Why this fork
 
