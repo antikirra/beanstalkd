@@ -6,7 +6,7 @@ Drop-in replacement for [upstream beanstalkd](https://github.com/beanstalkd/bean
 
 ## Platform
 
-This fork targets **Linux 6.1+** exclusively. No cross-platform abstractions, no trade-offs. The codebase uses Linux-specific APIs directly: `epoll_create1`, `accept4`, `fallocate`, `fdatasync`, `CLOCK_MONOTONIC_COARSE`, `SOCK_NONBLOCK`, `SOCK_CLOEXEC`, `O_CLOEXEC`, `TCP_FASTOPEN`, `posix_fadvise`, `malloc_trim`.
+This fork targets **Linux 6.1+** exclusively. No cross-platform abstractions, no trade-offs. The codebase uses Linux-specific APIs directly: `epoll_create1`, `accept4`, `fallocate`, `fdatasync`, `CLOCK_MONOTONIC_COARSE`, `SOCK_NONBLOCK`, `SOCK_CLOEXEC`, `O_CLOEXEC`, `TCP_FASTOPEN`, `TCP_CORK`, `TCP_QUICKACK`, `SO_INCOMING_CPU`, `SO_TXREHASH`, `sched_setaffinity`, `posix_fadvise`, `malloc_trim`.
 
 Three ways to run:
 
@@ -209,8 +209,8 @@ To reshard after hardware change: stop beanstalkd, delete `DIR/shards`, restart.
 ```
 .
 ├── dat.h                   # All types, macros, declarations
-├── main.c                  # Entry point, signals, privilege drop
-├── prot.c                  # Protocol: commands, scheduling, stats
+├── main.c                  # Entry point, signals, privilege drop, CPU pinning
+├── prot.c                  # Protocol: commands, scheduling, stats, TCP_CORK/QUICKACK
 ├── serv.c                  # Event loop
 ├── conn.c                  # Connection state machine
 ├── job.c                   # Job alloc/free, hash table, memory pool
@@ -220,7 +220,7 @@ To reshard after hardware change: stop beanstalkd, delete `DIR/shards`, restart.
 ├── walg.c                  # WAL lifecycle, async fsync, sharding
 ├── file.c                  # WAL file I/O, writev, fallocate
 ├── linux.c                 # epoll backend
-├── net.c                   # Socket creation, TCP_FASTOPEN
+├── net.c                   # Socket creation, TCP_FASTOPEN, SO_INCOMING_CPU, SO_TXREHASH
 ├── time.c                  # CLOCK_MONOTONIC_COARSE
 ├── util.c                  # Logging, options, zalloc
 ├── primes.c                # Hash table prime sizes
@@ -230,6 +230,7 @@ To reshard after hardware change: stop beanstalkd, delete `DIR/shards`, restart.
 ├── adm/systemd/            # systemd service + socket units
 ├── Dockerfile              # Production image (multi-stage, bookworm-slim)
 ├── Dockerfile.build        # CI pipeline: UBSan + cppcheck
+├── Dockerfile.benchmark    # A/B comparison vs upstream (5 scenarios)
 └── test/                   # Integration tests (ASan, Valgrind, WAL recovery)
 ```
 
