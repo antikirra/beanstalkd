@@ -742,14 +742,14 @@ enqueue_job(Server *s, Job *j, int64 delay, char update_store)
     if (delay) {
         j->r.deadline_at = now + delay;
         r = heapinsert(&j->tube->delay, j);
-        if (!r)
+        if (unlikely(!r))
             return 0;
         j->r.state = Delayed;
         delayed_ct++;
         delay_tube_update(j->tube);
     } else {
         r = heapinsert(&j->tube->ready, j);
-        if (!r)
+        if (unlikely(!r))
             return 0;
         j->r.state = Ready;
         ready_ct++;
@@ -761,7 +761,7 @@ enqueue_job(Server *s, Job *j, int64 delay, char update_store)
     }
 
     if (update_store) {
-        if (!walwrite(w, j)) {
+        if (unlikely(!walwrite(w, j))) {
             // Rollback: remove from heap so callers don't face
             // a job present in two data structures.
             if (delay) {
@@ -836,8 +836,9 @@ kick_buried_job(Server *s, Job *j)
 {
     int r;
     int z;
+    Wal *w = shard_wal(s, j);
 
-    z = walresvupdate(shard_wal(s, j));
+    z = walresvupdate(w);
     if (!z)
         return 0;
     j->walresv += z;
@@ -850,6 +851,8 @@ kick_buried_job(Server *s, Job *j)
         return 1;
 
     /* ready queue is full, so bury it */
+    walresvreturn(w, z);
+    j->walresv -= z;
     bury_job(s, j, 0);
     return 0;
 }
@@ -861,8 +864,9 @@ kick_delayed_job(Server *s, Job *j)
 {
     int r;
     int z;
+    Wal *w = shard_wal(s, j);
 
-    z = walresvupdate(shard_wal(s, j));
+    z = walresvupdate(w);
     if (!z)
         return 0;
     j->walresv += z;
@@ -876,10 +880,15 @@ kick_delayed_job(Server *s, Job *j)
 
     /* ready queue is full, so delay it again */
     r = enqueue_job(s, j, j->r.delay, 0);
-    if (r == 1)
+    if (r == 1) {
+        walresvreturn(w, z);
+        j->walresv -= z;
         return 0;
+    }
 
     /* last resort */
+    walresvreturn(w, z);
+    j->walresv -= z;
     bury_job(s, j, 0);
     return 0;
 }
@@ -994,10 +1003,10 @@ check_err(Conn *c, const char *s)
 /* Scan the given string for the sequence "\r\n" and return the line length.
  * Always returns at least 2 if a match is found. Returns 0 if no match. */
 static size_t
-scan_line_end(const char *s, int size)
+scan_line_end(const char *s, size_t size)
 {
     const char *p = s;
-    int remaining = size - 1;
+    size_t remaining = size > 0 ? size - 1 : 0;
 
     while (remaining > 0) {
         char *match = memchr(p, '\r', remaining);
@@ -1008,7 +1017,7 @@ scan_line_end(const char *s, int size)
         if (match[1] == '\n')
             return match - s + 2;
 
-        int skip = match - p + 1;
+        size_t skip = match - p + 1;
         remaining -= skip;
         p = match + 1;
     }
@@ -1541,13 +1550,17 @@ remove_reserved_job(Conn *c, Job *j)
     return remove_this_reserved_job(c, j);
 }
 
-static bool
+// is_valid_tube validates a tube name.
+// Returns the name length on success, 0 on failure.
+static size_t
 is_valid_tube(const char *name, size_t max)
 {
-    size_t len = strlen(name);
-    return 0 < len && len <= max &&
-        strspn(name, NAME_CHARS) == len &&
-        name[0] != '-';
+    if (name[0] == '\0' || name[0] == '-')
+        return 0;
+    size_t len = strspn(name, NAME_CHARS);
+    if (len == 0 || len > max || name[len] != '\0')
+        return 0;
+    return len;
 }
 
 static void
@@ -1832,8 +1845,10 @@ dispatch_cmd(Conn *c)
 
         /* We want to update the delay deadline on disk, so reserve space for
          * that. */
+        int z = 0;
         if (delay) {
-            int z = walresvupdate(shard_wal(c->srv, j));
+            Wal *w = shard_wal(c->srv, j);
+            z = walresvupdate(w);
             if (!z) {
                 /* Undo remove_reserved_job: restore counters and re-link. */
                 global_stat.reserved_ct++;
@@ -1858,6 +1873,10 @@ dispatch_cmd(Conn *c)
         }
 
         /* out of memory trying to grow the queue, so it gets buried */
+        if (z) {
+            walresvreturn(shard_wal(c->srv, j), z);
+            j->walresv -= z;
+        }
         bury_job(c->srv, j, 0);
         reply_msg(c, MSG_BURIED);
         return;
@@ -1983,15 +2002,17 @@ dispatch_cmd(Conn *c)
         do_stats(c, fmt_job_stats, j);
         return;
 
-    case OP_STATS_TUBE:
+    case OP_STATS_TUBE: {
+        size_t namelen;
         name = c->cmd + CMD_STATS_TUBE_LEN;
-        if (!is_valid_tube(name, MAX_TUBE_NAME_LEN - 1)) {
+        namelen = is_valid_tube(name, MAX_TUBE_NAME_LEN - 1);
+        if (!namelen) {
             reply_msg(c, MSG_BAD_FORMAT);
             return;
         }
         op_ct[type]++;
 
-        t = tube_find_name(name);
+        t = tube_find_name(name, namelen);
         if (!t) {
             reply_msg(c, MSG_NOTFOUND);
             return;
@@ -1999,6 +2020,7 @@ dispatch_cmd(Conn *c)
         do_stats(c, fmt_stats_tube, t);
         t = NULL;
         return;
+    }
 
     case OP_LIST_TUBES:
         /* don't allow trailing garbage */
@@ -2101,7 +2123,8 @@ dispatch_cmd(Conn *c)
         c->state = STATE_CLOSE;
         return;
 
-    case OP_PAUSE_TUBE:
+    case OP_PAUSE_TUBE: {
+        size_t namelen;
         if (read_tube_name(&name, c->cmd + CMD_PAUSE_TUBE_LEN, &delay_buf) ||
             read_duration(&delay, delay_buf, NULL)) {
             reply_msg(c, MSG_BAD_FORMAT);
@@ -2110,11 +2133,12 @@ dispatch_cmd(Conn *c)
         op_ct[type]++;
 
         *delay_buf = '\0';
-        if (!is_valid_tube(name, MAX_TUBE_NAME_LEN - 1)) {
+        namelen = is_valid_tube(name, MAX_TUBE_NAME_LEN - 1);
+        if (!namelen) {
             reply_msg(c, MSG_BAD_FORMAT);
             return;
         }
-        t = tube_find_name(name);
+        t = tube_find_name(name, namelen);
         if (!t) {
             reply_msg(c, MSG_NOTFOUND);
             return;
@@ -2136,6 +2160,7 @@ dispatch_cmd(Conn *c)
 
         reply_line(c, STATE_SEND_WORD, "PAUSED\r\n");
         return;
+    }
 
     default:
         reply_msg(c, MSG_UNKNOWN_COMMAND);
@@ -2643,7 +2668,8 @@ prot_replay(Server *s, Job *list)
     for (j = list->next ; j != list ; j = nj) {
         nj = j->next;
         job_list_remove(j);
-        int z = walresvupdate(shard_wal(s, j));
+        Wal *w = shard_wal(s, j);
+        int z = walresvupdate(w);
         if (!z) {
             twarnx("failed to reserve space for job %"PRIu64", burying", j->r.id);
             bury_job(s, j, 0);
@@ -2666,6 +2692,8 @@ prot_replay(Server *s, Job *list)
             r = enqueue_job(s, j, delay, 0);
             if (r < 1) {
                 twarnx("error recovering job %"PRIu64", burying", j->r.id);
+                walresvreturn(w, z);
+                j->walresv -= z;
                 bury_job(s, j, 0);
                 ok = 0;
             }

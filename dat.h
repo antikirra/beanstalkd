@@ -233,8 +233,8 @@ struct Job {
     File *file;
     Job  *fnext;
     Job  *fprev;
-    int walresv;
-    int walused;
+    int64 walresv;
+    int64 walused;
 };
 
 struct Tube {
@@ -343,7 +343,7 @@ Tube *make_tube(const char *name);
 void  tube_dref(Tube *t);
 void  tube_iref(Tube *t);
 Tube *tube_find(Ms *tubeset, const char *name);
-Tube *tube_find_name(const char *name);
+Tube *tube_find_name(const char *name, size_t len);
 uint  tube_name_hash(const char *name);
 Tube *tube_find_or_make(const char *name);
 #define TUBE_ASSIGN(a,b) do { \
@@ -410,7 +410,7 @@ struct Conn {
 
     char   cmd[LINE_BUF_SIZE];     // this string is NOT NUL-terminated
     size_t cmd_len;
-    int    cmd_read;
+    size_t cmd_read;
 
     char *reply;
     int  reply_len;
@@ -485,6 +485,7 @@ int  walwrite(Wal*, Job*);
 int  walmaint(Wal*);
 int  walresvput(Wal*, Job*);
 int  walresvupdate(Wal*);
+void walresvreturn(Wal*, int);
 void walgc(Wal*);
 void walsyncstart(Wal*);
 void walsyncstop(Wal*);

@@ -245,19 +245,19 @@ cttest_tube_find_name_adversarial()
     ms_init(&tubes, NULL, NULL);
 
     /* empty hash table */
-    assertf(tube_find_name("anything") == NULL, "empty table must return NULL");
-    assertf(tube_find_name("") == NULL, "empty string must return NULL");
+    assertf(tube_find_name("anything", 8) == NULL, "empty table must return NULL");
+    assertf(tube_find_name("", 0) == NULL, "empty string must return NULL");
 
     /* create one tube, search for variations */
     Tube *t = tube_find_or_make("exact");
     tube_iref(t);
 
-    assertf(tube_find_name("exact") == t, "must find exact");
-    assertf(tube_find_name("EXACT") == NULL, "case sensitive");
-    assertf(tube_find_name("exact ") == NULL, "trailing space");
-    assertf(tube_find_name(" exact") == NULL, "leading space");
-    assertf(tube_find_name("exac") == NULL, "prefix");
-    assertf(tube_find_name("exactt") == NULL, "suffix");
+    assertf(tube_find_name("exact", 5) == t, "must find exact");
+    assertf(tube_find_name("EXACT", 5) == NULL, "case sensitive");
+    assertf(tube_find_name("exact ", 6) == NULL, "trailing space");
+    assertf(tube_find_name(" exact", 6) == NULL, "leading space");
+    assertf(tube_find_name("exac", 4) == NULL, "prefix");
+    assertf(tube_find_name("exactt", 6) == NULL, "suffix");
 
     tube_dref(t);
     ms_clear(&tubes);

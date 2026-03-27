@@ -125,14 +125,14 @@ cttest_tube_hash_find_100()
     /* hash must find every one by name */
     for (i = 0; i < 100; i++) {
         snprintf(name, sizeof name, "tube-%03d", i);
-        Tube *found = tube_find_name(name);
+        Tube *found = tube_find_name(name, strlen(name));
         assertf(found == ptrs[i], "hash must find EXACT pointer for tube %d", i);
     }
 
     /* nonexistent must return NULL */
-    assertf(tube_find_name("nope") == NULL, "nonexistent");
-    assertf(tube_find_name("tube-999") == NULL, "out of range");
-    assertf(tube_find_name("") == NULL, "empty string");
+    assertf(tube_find_name("nope", 4) == NULL, "nonexistent");
+    assertf(tube_find_name("tube-999", 8) == NULL, "out of range");
+    assertf(tube_find_name("", 0) == NULL, "empty string");
 
     for (i = 0; i < 100; i++)
         tube_dref(ptrs[i]);
@@ -201,7 +201,7 @@ cttest_tube_hash_collision_stress_500()
     // Verify all findable
     for (int i = 0; i < 500; i++) {
         snprintf(name, sizeof(name), "collision-%d", i);
-        Tube *found = tube_find_name(name);
+        Tube *found = tube_find_name(name, strlen(name));
         assertf(found == tubes[i],
                 "tube %d must be findable after creation", i);
     }
@@ -215,7 +215,7 @@ cttest_tube_hash_collision_stress_500()
     // Survivors (even indices) must still be findable
     for (int i = 0; i < 500; i += 2) {
         snprintf(name, sizeof(name), "collision-%d", i);
-        Tube *found = tube_find_name(name);
+        Tube *found = tube_find_name(name, strlen(name));
         assertf(found == tubes[i],
                 "surviving tube %d must be findable after alternating deletes", i);
     }
@@ -223,7 +223,7 @@ cttest_tube_hash_collision_stress_500()
     // Deleted tubes must NOT be findable
     for (int i = 1; i < 500; i += 2) {
         snprintf(name, sizeof(name), "collision-%d", i);
-        Tube *found = tube_find_name(name);
+        Tube *found = tube_find_name(name, strlen(name));
         assertf(found == NULL,
                 "deleted tube %d must NOT be findable", i);
     }

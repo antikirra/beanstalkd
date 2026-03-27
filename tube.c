@@ -7,7 +7,7 @@
 struct Ms tubes;
 
 // Hash table for O(1) global tube lookup by name.
-#define TUBE_HASH_SIZE 256
+#define TUBE_HASH_SIZE 4096
 static Tube *tube_ht[TUBE_HASH_SIZE];
 
 // tube_name_hash returns a raw DJB2 hash of the tube name.
@@ -49,9 +49,8 @@ tube_ht_remove(Tube *t)
 
 // tube_find_name finds a tube by name in the global hash table. O(1).
 Tube *
-tube_find_name(const char *name)
+tube_find_name(const char *name, size_t len)
 {
-    size_t len = strlen(name);
     uint i = tube_hash(name);
     Tube *t = tube_ht[i];
     while (t) {
@@ -189,7 +188,7 @@ tube_find(Ms *tubeset, const char *name)
 Tube *
 tube_find_or_make(const char *name)
 {
-    Tube *t = tube_find_name(name);
+    Tube *t = tube_find_name(name, strlen(name));
     if (t)
         return t;
     return make_and_insert_tube(name);

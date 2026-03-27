@@ -49,7 +49,7 @@ struct Jobrec5 {
 
 enum
 {
-	Jobrec5size = offsetof(Jobrec5, pad)
+    Jobrec5size = offsetof(Jobrec5, pad)
 };
 
 // rawfalloc allocates disk space of len bytes.
@@ -564,7 +564,7 @@ filewritev(File *f, Job *j, struct iovec *iov, int iovcnt)
         ssize_t r = writev(f->fd, iov, iovcnt);
         if (r == -1 && errno == EINTR)
             continue;
-        if (r <= 0) {
+        if (unlikely(r <= 0)) {
             twarn("writev");
             return 0;
         }

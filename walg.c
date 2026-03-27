@@ -316,7 +316,7 @@ walwrite(Wal *w, Job *j)
             r = filewrjobfull(w->cur, j);
         }
     }
-    if (!r) {
+    if (unlikely(!r)) {
         filewclose(w->cur);
         w->use = 0;
         return 0;
@@ -523,6 +523,19 @@ walresvupdate(Wal *w)
     z +=sizeof(int);
     z +=sizeof(Jobrec);
     return reserve(w, z);
+}
+
+
+// walresvreturn returns n previously reserved bytes back to the WAL.
+// Used when a planned walwrite will not happen (e.g. enqueue_job failed).
+void
+walresvreturn(Wal *w, int n)
+{
+    if (!w->use) return;
+    if (n <= 0) return;
+    w->resv -= n;
+    w->cur->resv -= n;
+    w->cur->free += n;
 }
 
 

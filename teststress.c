@@ -64,7 +64,7 @@ cttest_tube_stress_with_collision()
     /* verify hash finds every single one */
     for (i = 0; i < N; i++) {
         snprintf(name, sizeof name, "s-%d", i);
-        Tube *t = tube_find_name(name);
+        Tube *t = tube_find_name(name, strlen(name));
         assertf(t, "hash must find s-%d", i);
         assertf(strcmp(t->name, name) == 0, "name mismatch for %d", i);
     }
@@ -72,7 +72,7 @@ cttest_tube_stress_with_collision()
     /* remove every OTHER tube — stress collision chain removal */
     for (i = 0; i < N; i += 2) {
         snprintf(name, sizeof name, "s-%d", i);
-        Tube *t = tube_find_name(name);
+        Tube *t = tube_find_name(name, strlen(name));
         assertf(t, "must find before remove");
         tube_dref(t);
     }
@@ -80,19 +80,19 @@ cttest_tube_stress_with_collision()
     /* verify odd tubes still findable */
     for (i = 1; i < N; i += 2) {
         snprintf(name, sizeof name, "s-%d", i);
-        assertf(tube_find_name(name), "odd tube s-%d must survive", i);
+        assertf(tube_find_name(name, strlen(name)), "odd tube s-%d must survive", i);
     }
 
     /* verify even tubes gone */
     for (i = 0; i < N; i += 2) {
         snprintf(name, sizeof name, "s-%d", i);
-        assertf(tube_find_name(name) == NULL, "even tube s-%d must be gone", i);
+        assertf(tube_find_name(name, strlen(name)) == NULL, "even tube s-%d must be gone", i);
     }
 
     /* cleanup remaining */
     for (i = 1; i < N; i += 2) {
         snprintf(name, sizeof name, "s-%d", i);
-        tube_dref(tube_find_name(name));
+        tube_dref(tube_find_name(name, strlen(name)));
     }
     ms_clear(&tubes);
 }

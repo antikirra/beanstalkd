@@ -94,7 +94,7 @@ heapinsert(Heap *h, void *x)
 void *
 heapremove(Heap *h, size_t k)
 {
-    if (k >= h->len) {
+    if (unlikely(k >= h->len)) {
         return 0;
     }
 
