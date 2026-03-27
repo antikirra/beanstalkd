@@ -30,77 +30,75 @@ durable_fsync(int fd)
 #endif
 }
 
-// --- Async fsync thread ---
+// --- Per-Wal async fsync thread ---
 //
 // Moves the blocking fsync() call off the main event loop thread.
 // The main thread passes a dup()'d fd to the fsync thread; the thread
 // owns that fd and closes it after fsync. This avoids fd lifetime races:
 // the main thread can close/rotate the original fd freely.
 //
+// All fsync state lives inside the Wal struct (not static globals),
+// allowing multiple Wal instances to run independent fsync threads.
+//
 // Thread safety contract:
-//   sync_fd, sync_stop, sync_err — shared, protected by sync_mu
-//   sync_on — main-thread-only flag (set before thread start, cleared after join)
-//   w->use, w->cur, w->* — main-thread-only (fsync thread never reads Wal struct)
+//   w->sync_fd, w->sync_stop, w->sync_err — shared, protected by w->sync_mu
+//   w->sync_on — main-thread-only flag (set before thread start, cleared after join)
+//   w->use, w->cur, w->* — main-thread-only (fsync thread never reads Wal fields)
 //   The ONLY data crossing the thread boundary is the dup'd fd integer.
-
-static pthread_t       sync_thread;
-static pthread_mutex_t sync_mu   = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  sync_cond = PTHREAD_COND_INITIALIZER;
-static int             sync_fd   = -1;
-static int             sync_stop = 0;
-static int             sync_err  = 0;
-static int             sync_on   = 0;
 
 static void *
 sync_thread_fn(void *arg)
 {
-    UNUSED_PARAMETER(arg);
+    Wal *w = arg;
 
-    pthread_mutex_lock(&sync_mu);
+    pthread_mutex_lock(&w->sync_mu);
     for (;;) {
-        while (sync_fd < 0 && !sync_stop)
-            pthread_cond_wait(&sync_cond, &sync_mu);
+        while (w->sync_fd < 0 && !w->sync_stop)
+            pthread_cond_wait(&w->sync_cond, &w->sync_mu);
 
-        if (sync_stop) break;
+        if (w->sync_stop) break;
 
-        int fd = sync_fd;
-        sync_fd = -1;
-        pthread_mutex_unlock(&sync_mu);
+        int fd = w->sync_fd;
+        w->sync_fd = -1;
+        pthread_mutex_unlock(&w->sync_mu);
 
-        // Blocking fsync on our private dup'd fd.
-        // Main thread is free to continue processing events.
         int r = durable_fsync(fd);
-        close(fd); // we own this fd (dup'd by main thread)
+        close(fd);
 
-        pthread_mutex_lock(&sync_mu);
+        pthread_mutex_lock(&w->sync_mu);
         if (r == -1)
-            sync_err = 1;
+            w->sync_err = 1;
     }
-    pthread_mutex_unlock(&sync_mu);
+    pthread_mutex_unlock(&w->sync_mu);
     return NULL;
 }
 
 void
-walsyncstart(void)
+walsyncstart(Wal *w)
 {
-    if (sync_on) return;
-    if (pthread_create(&sync_thread, NULL, sync_thread_fn, NULL) != 0) {
+    if (w->sync_on) return;
+    pthread_mutex_init(&w->sync_mu, NULL);
+    pthread_cond_init(&w->sync_cond, NULL);
+    w->sync_fd = -1;
+    w->sync_stop = 0;
+    w->sync_err = 0;
+    if (pthread_create(&w->sync_thread, NULL, sync_thread_fn, w) != 0) {
         twarnx("failed to start fsync thread, using synchronous fsync");
         return;
     }
-    sync_on = 1;
+    w->sync_on = 1;
 }
 
 void
-walsyncstop(void)
+walsyncstop(Wal *w)
 {
-    if (!sync_on) return;
-    pthread_mutex_lock(&sync_mu);
-    sync_stop = 1;
-    pthread_cond_signal(&sync_cond);
-    pthread_mutex_unlock(&sync_mu);
-    pthread_join(sync_thread, NULL);
-    sync_on = 0;
+    if (!w->sync_on) return;
+    pthread_mutex_lock(&w->sync_mu);
+    w->sync_stop = 1;
+    pthread_cond_signal(&w->sync_cond);
+    pthread_mutex_unlock(&w->sync_mu);
+    pthread_join(w->sync_thread, NULL);
+    w->sync_on = 0;
 }
 
 
@@ -268,45 +266,34 @@ walcompact(Wal *w)
 static int
 walsync(Wal *w)
 {
-    // Check if async thread reported an error from previous fsync
-    if (sync_on) {
-        pthread_mutex_lock(&sync_mu);
-        int err = sync_err;
-        sync_err = 0;
-        pthread_mutex_unlock(&sync_mu);
+    if (w->sync_on) {
+        pthread_mutex_lock(&w->sync_mu);
+        int err = w->sync_err;
+        w->sync_err = 0;
+        pthread_mutex_unlock(&w->sync_mu);
         if (err) {
             twarnx("async fsync failed");
             return 0;
         }
     }
 
-    // Use the per-tick cached now (global, main-thread-only).
-    // walsync is called exclusively from the main thread via
-    // walmaint → walwrite → enqueue_job. The async fsync thread
-    // never calls this function and never reads 'now'.
-    // Syncrate is typically 50ms; sub-tick staleness is negligible.
     if (w->wantsync && now >= w->lastsync+w->syncrate) {
         w->lastsync = now;
-        if (sync_on) {
-            // dup() gives the thread its own fd — safe even if
-            // main thread rotates/closes the original later.
+        if (w->sync_on) {
             int fd = dup(w->cur->fd);
             if (fd == -1) {
                 twarn("dup for async fsync");
                 return 0;
             }
-            pthread_mutex_lock(&sync_mu);
-            if (sync_fd >= 0) {
-                // Previous fsync still in progress — skip this one.
-                // Data will be synced on next cycle.
+            pthread_mutex_lock(&w->sync_mu);
+            if (w->sync_fd >= 0) {
                 close(fd);
             } else {
-                sync_fd = fd;
-                pthread_cond_signal(&sync_cond);
+                w->sync_fd = fd;
+                pthread_cond_signal(&w->sync_cond);
             }
-            pthread_mutex_unlock(&sync_mu);
+            pthread_mutex_unlock(&w->sync_mu);
         } else {
-            // Synchronous fallback
             if (durable_fsync(w->cur->fd) == -1) {
                 twarn("fsync");
                 return 0;

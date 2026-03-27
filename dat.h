@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <stdlib.h>
+#include <pthread.h>
 
 typedef unsigned char uchar;
 typedef uchar         byte;
@@ -349,6 +350,7 @@ void  tube_dref(Tube *t);
 void  tube_iref(Tube *t);
 Tube *tube_find(Ms *tubeset, const char *name);
 Tube *tube_find_name(const char *name);
+uint  tube_name_hash(const char *name);
 Tube *tube_find_or_make(const char *name);
 #define TUBE_ASSIGN(a,b) (tube_dref(a), (a) = (b), tube_iref(a))
 
@@ -469,6 +471,16 @@ struct Wal {
     int    wantsync; // do we sync to disk?
     int64  syncrate; // how often we sync to disk, in nanoseconds
     int64  lastsync;
+
+    // Per-Wal async fsync thread state.
+    // Moved from walg.c statics to support multiple Wal instances (sharding).
+    pthread_t       sync_thread;
+    pthread_mutex_t sync_mu;
+    pthread_cond_t  sync_cond;
+    int             sync_fd;
+    int             sync_stop;
+    int             sync_err;
+    int             sync_on;
 };
 int  waldirlock(Wal*);
 void walinit(Wal*, Job *list);
@@ -477,8 +489,8 @@ int  walmaint(Wal*);
 int  walresvput(Wal*, Job*);
 int  walresvupdate(Wal*);
 void walgc(Wal*);
-void walsyncstart(void);
-void walsyncstop(void);
+void walsyncstart(Wal*);
+void walsyncstop(Wal*);
 
 
 struct File {
@@ -519,7 +531,14 @@ struct Server {
 
     // Connections that must produce deadline or timeout, ordered by the time.
     Heap   conns;
+
+    // Per-shard WAL instances. Jobs are routed to shards by tube name hash.
+    // Parallelizes disk I/O (writes + fsync) across CPU count threads.
+    // NULL and nshards=0 when WAL is disabled or legacy single-WAL mode.
+    Wal    *shards;
+    int    nshards;
 };
 void srv_acquire_wal(Server *s);
+int  detect_ncpu(void);
 void srvserve(Server *s);
 void srvaccept(Server *s, int ev);

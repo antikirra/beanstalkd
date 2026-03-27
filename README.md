@@ -11,7 +11,7 @@ See [doc/protocol.txt](doc/protocol.txt) for the network protocol.
     $ make
     $ ./beanstalkd
 
-    $ make check           # run 192 unit tests
+    $ make check           # run 197 unit tests
     $ make bench           # run benchmarks
     $ ./beanstalkd -h      # show all options
 
@@ -26,8 +26,8 @@ Requires Linux (2.6.17+), Mac OS X, FreeBSD, or Illumos. Any C99 compiler; teste
 | Syscalls per command | ~4 (read + epoll + write + epoll) | ~2 (read + write, inline flush) |
 | Job hash table rehash | Stop-the-world O(n) | Incremental, 16 buckets/op |
 | Job pool reuse | Exact size match only | 11 size classes, O(1) hit rate |
-| WAL fsync | Blocks event loop | Async pthread |
-| Unit tests | 100 | 192 |
+| WAL disk I/O | Single file chain, 1 fsync thread | Per-CPU sharded WAL, N fsync threads |
+| Unit tests | 100 | 197 |
 
 ## What changed
 
@@ -81,6 +81,17 @@ Directory fsync after binlog ops, `F_FULLFSYNC` on macOS, EINTR/short-read handl
 | Periodic `malloc_trim` | Returns unused glibc pages to OS (configurable via `-m`) |
 | Cache-friendly Job struct | Hot fields grouped; sizeof(Job) 176 → 168 bytes |
 
+**WAL sharding** — parallel disk I/O across CPU cores:
+
+When WAL is enabled (`-b`), jobs are distributed across N independent WAL instances (one per CPU core) by tube name hash. Each shard has its own directory, file chain, compaction, and async fsync thread. The event loop (single-threaded) routes `walwrite` to the correct shard in O(1). Shard count is detected from CPU cores on first run, then persisted to `<wal_dir>/shards` so routing stays stable across hardware changes.
+
+| Metric | Value |
+|--------|-------|
+| Shard count | auto-detected from CPU cores, persisted on first run |
+| Routing | `DJB2(tube_name) % nshards` — deterministic, O(1) |
+| Aggregate throughput | ~33K ops/s with 8 concurrent clients + WAL + fsync=50ms |
+| Legacy compatibility | Old `binlog.*` in root dir replayed at startup, new writes go to shard subdirs |
+
 **Parsing:** first-byte command dispatch (~6x fewer strncmp), cached tube name_len, single-pass stats formatting. Default `-O2` (upstream: `-O0`).
 
 ### Stability
@@ -99,7 +110,7 @@ Directory fsync after binlog ops, `F_FULLFSYNC` on macOS, EINTR/short-read handl
 
     $ make check
 
-192 tests: 100 legacy + 92 hostile (OOM paths, boundary values, heap ordering, counter invariants, copy independence, stress up to 1000 elements).
+197 tests: 100 legacy + 97 hostile (OOM paths, boundary values, heap ordering, counter invariants, copy independence, WAL shard routing/recovery, stress up to 1000 elements).
 
 ### Benchmarks
 
@@ -121,6 +132,32 @@ All upstream flags preserved. New:
 | `-m SEC` | 60 | Return unused memory to OS every SEC seconds. `0` to disable. glibc only. |
 
 Full list: `./beanstalkd -h`
+
+### WAL sharding
+
+When persistence is enabled (`-b DIR`), the WAL is automatically sharded across CPU cores:
+
+```
+DIR/
+  shards          ← shard count (written once on first run)
+  lock            ← root directory lock
+  binlog.*        ← legacy WAL (read on startup for migration)
+  s0/binlog.*     ← shard 0
+  s1/binlog.*     ← shard 1
+  ...
+  sN/binlog.*     ← shard N-1
+```
+
+**Shard count stability.** The number of shards is auto-detected from CPU cores on first run and persisted to `DIR/shards`. On subsequent runs this file is read, keeping routing stable even if CPU count changes. If the file is missing, a new shard layout is created.
+
+**Changing shard count.** To reshard (e.g., after hardware upgrade):
+
+1. Stop beanstalkd
+2. Delete `DIR/shards`
+3. Start beanstalkd — it detects the new CPU count and creates a fresh shard layout
+4. Existing shard WALs are replayed into the new layout automatically
+
+**Disabling sharding.** Delete `DIR/shards` and all `DIR/s*/` directories. beanstalkd falls back to the single legacy WAL in `DIR/`.
 
 ## Project structure
 

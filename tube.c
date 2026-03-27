@@ -10,13 +10,21 @@ struct Ms tubes;
 #define TUBE_HASH_SIZE 256
 static Tube *tube_ht[TUBE_HASH_SIZE];
 
-static uint
-tube_hash(const char *name)
+// tube_name_hash returns a raw DJB2 hash of the tube name.
+// Used for tube hash table lookup and WAL shard routing.
+uint
+tube_name_hash(const char *name)
 {
     uint h = 5381;
     while (*name)
         h = h * 33 + (unsigned char)*name++;
-    return h % TUBE_HASH_SIZE;
+    return h;
+}
+
+static uint
+tube_hash(const char *name)
+{
+    return tube_name_hash(name) % TUBE_HASH_SIZE;
 }
 
 static void

@@ -79,6 +79,7 @@ startsrv(void)
     sigemptyset(&sa.sa_mask);
     sigaction(SIGTERM, &sa, 0);
     prot_init();
+    srv_acquire_wal(&srv);
     srvserve(&srv);
     exit(1);
 }
@@ -404,4 +405,55 @@ cttest_reserve_job_already_reserved_v2()
     /* reserve-job on already-reserved job must fail */
     snd(fd, "reserve-job 1\r\n");
     ck(fd, "NOT_FOUND\r\n");
+}
+
+void
+cttest_shard_wal_write_and_recover()
+{
+    /* Write jobs across multiple tubes (hitting different WAL shards),
+     * kill the server, restart, verify all jobs survive. */
+    srv.wal.dir = ctdir();
+    srv.wal.use = 1;
+    srv.wal.syncrate = 0;
+    srv.wal.wantsync = 0;
+    srv.nshards = 4;
+
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    /* Put 5 jobs in each of 4 tubes = 20 jobs across shards. */
+    int t, i;
+    for (t = 0; t < 4; t++) {
+        char cmd[64];
+        snprintf(cmd, sizeof(cmd), "use shard-tube-%d\r\n", t);
+        snd(fd, cmd);
+        cksub(fd, "USING");
+        for (i = 0; i < 5; i++) {
+            snd(fd, "put 0 0 60 4\r\ntest\r\n");
+            cksub(fd, "INSERTED");
+        }
+    }
+    close(fd);
+
+    /* Kill server, restart with same WAL dir and shard count. */
+    killsrv2();
+    srv.nshards = 4;
+    port = startsrv();
+    fd = diallocal(port);
+
+    /* Verify all 20 jobs recovered: watch each tube and reserve. */
+    for (t = 0; t < 4; t++) {
+        char cmd[64];
+        snprintf(cmd, sizeof(cmd), "watch shard-tube-%d\r\n", t);
+        snd(fd, cmd);
+        cksub(fd, "WATCHING");
+    }
+    for (i = 0; i < 20; i++) {
+        snd(fd, "reserve-with-timeout 0\r\n");
+        cksub(fd, "RESERVED");
+        rd(fd); /* drain body */
+    }
+    /* 21st reserve must timeout — all jobs consumed. */
+    snd(fd, "reserve-with-timeout 0\r\n");
+    ck(fd, "TIMED_OUT\r\n");
 }

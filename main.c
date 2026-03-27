@@ -108,14 +108,31 @@ main(int argc, char **argv)
         su(srv.user);
     set_sig_handlers();
 
+    // Enable WAL sharding: one WAL instance per CPU core.
+    // Parallelizes disk I/O (writes + fsync) for durable workloads.
+    if (srv.wal.use) {
+        srv.nshards = detect_ncpu();
+    }
+
     srv_acquire_wal(&srv);
 
     if (srv.wal.use && srv.wal.wantsync) {
-        walsyncstart();
+        // Start fsync threads for all WAL shards (or single legacy WAL).
+        if (srv.nshards > 0) {
+            for (int i = 0; i < srv.nshards; i++)
+                walsyncstart(&srv.shards[i]);
+        } else {
+            walsyncstart(&srv.wal);
+        }
     }
 
     srvserve(&srv);
 
-    walsyncstop();
+    if (srv.nshards > 0) {
+        for (int i = 0; i < srv.nshards; i++)
+            walsyncstop(&srv.shards[i]);
+    } else {
+        walsyncstop(&srv.wal);
+    }
     exit(0);
 }

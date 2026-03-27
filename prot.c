@@ -28,6 +28,20 @@ size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
 
 int64 mem_trim_rate = 60000000000LL; /* 60 seconds in nanoseconds */
 
+// shard_wal returns the WAL instance for a job based on its tube name.
+// With sharding enabled, jobs are distributed across per-CPU WAL instances
+// by tube name hash, parallelizing disk I/O (writes + fsync).
+// Falls back to the single legacy WAL when sharding is not active.
+static Wal *
+shard_wal(Server *s, Job *j)
+{
+    if (s->nshards > 0 && s->shards && j->tube) {
+        uint h = tube_name_hash(j->tube->name);
+        return &s->shards[h % s->nshards];
+    }
+    return &s->wal;
+}
+
 #define NAME_CHARS \
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ" \
     "abcdefghijklmnopqrstuvwxyz" \
@@ -737,7 +751,7 @@ enqueue_job(Server *s, Job *j, int64 delay, char update_store)
     }
 
     if (update_store) {
-        if (!walwrite(&s->wal, j)) {
+        if (!walwrite(shard_wal(s, j), j)) {
             // Rollback: remove from heap so callers don't face
             // a job present in two data structures.
             if (delay) {
@@ -755,7 +769,7 @@ enqueue_job(Server *s, Job *j, int64 delay, char update_store)
             }
             return 0;
         }
-        if (!walmaint(&s->wal)) {
+        if (!walmaint(shard_wal(s, j))) {
             twarnx("walmaint failed after walwrite");
         }
     }
@@ -767,7 +781,7 @@ static int
 bury_job(Server *s, Job *j, char update_store)
 {
     if (update_store) {
-        int z = walresvupdate(&s->wal);
+        int z = walresvupdate(shard_wal(s, j));
         if (!z)
             return 0;
         j->walresv += z;
@@ -781,10 +795,10 @@ bury_job(Server *s, Job *j, char update_store)
     j->r.bury_ct++;
 
     if (update_store) {
-        if (!walwrite(&s->wal, j)) {
+        if (!walwrite(shard_wal(s, j), j)) {
             return 0;
         }
-        if (!walmaint(&s->wal)) {
+        if (!walmaint(shard_wal(s, j))) {
             twarnx("walmaint failed after bury walwrite");
         }
     }
@@ -812,7 +826,7 @@ kick_buried_job(Server *s, Job *j)
     int r;
     int z;
 
-    z = walresvupdate(&s->wal);
+    z = walresvupdate(shard_wal(s, j));
     if (!z)
         return 0;
     j->walresv += z;
@@ -837,7 +851,7 @@ kick_delayed_job(Server *s, Job *j)
     int r;
     int z;
 
-    z = walresvupdate(&s->wal);
+    z = walresvupdate(shard_wal(s, j));
     if (!z)
         return 0;
     j->walresv += z;
@@ -1130,7 +1144,7 @@ enqueue_incoming_job(Conn *c)
         reply_serr(c, MSG_INTERNAL_ERROR);
         return;
     }
-    j->walresv = walresvput(&c->srv->wal, j);
+    j->walresv = walresvput(shard_wal(c->srv, j), j);
     if (!j->walresv) {
         job_free(j);
         reply_serr(c, MSG_OUT_OF_MEMORY);
@@ -1753,8 +1767,8 @@ dispatch_cmd(Conn *c)
         j->tube->stat.total_delete_ct++;
 
         j->r.state = Invalid;
-        r = walwrite(&c->srv->wal, j);
-        if (r && !walmaint(&c->srv->wal)) {
+        r = walwrite(shard_wal(c->srv, j), j);
+        if (r && !walmaint(shard_wal(c->srv, j))) {
             twarnx("walmaint failed after delete walwrite");
         }
         job_free(j);
@@ -1785,7 +1799,7 @@ dispatch_cmd(Conn *c)
         /* We want to update the delay deadline on disk, so reserve space for
          * that. */
         if (delay) {
-            int z = walresvupdate(&c->srv->wal);
+            int z = walresvupdate(shard_wal(c->srv, j));
             if (!z) {
                 /* Undo remove_reserved_job: restore counters and re-link. */
                 global_stat.reserved_ct++;
@@ -2593,7 +2607,7 @@ prot_replay(Server *s, Job *list)
     for (j = list->next ; j != list ; j = nj) {
         nj = j->next;
         job_list_remove(j);
-        int z = walresvupdate(&s->wal);
+        int z = walresvupdate(shard_wal(s, j));
         if (!z) {
             twarnx("failed to reserve space");
             return 0;

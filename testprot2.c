@@ -729,3 +729,88 @@ cttest_job_hash_no_downscale_at_initial()
 
     tube_dref(t);
 }
+
+/* --- WAL shard routing --- */
+
+void
+cttest_tube_name_hash_deterministic()
+{
+    /* Same name must always produce same hash. */
+    uint h1 = tube_name_hash("email");
+    uint h2 = tube_name_hash("email");
+    assertf(h1 == h2, "hash must be deterministic: %u != %u", h1, h2);
+
+    /* Different names should (almost certainly) differ. */
+    uint h3 = tube_name_hash("video");
+    assertf(h1 != h3, "email and video should hash differently");
+
+    /* Empty string is valid. */
+    uint h4 = tube_name_hash("");
+    uint h5 = tube_name_hash("");
+    assertf(h4 == h5, "empty hash must be deterministic");
+    assertf(h4 != h1, "empty must differ from email");
+}
+
+void
+cttest_shard_wal_routing()
+{
+    /* Verify that shard index is always in bounds and deterministic. */
+    int nshards = 4;
+    int i;
+    const char *names[] = {
+        "a","b","c","default","email","video","x.y.z",
+        "queue-0","queue-1","queue-2","queue-3",NULL
+    };
+    for (i = 0; names[i]; i++) {
+        uint h1 = tube_name_hash(names[i]) % nshards;
+        uint h2 = tube_name_hash(names[i]) % nshards;
+        assertf(h1 == h2, "'%s' routing not deterministic", names[i]);
+        assertf(h1 < (uint)nshards, "shard %u out of bounds for '%s'", h1, names[i]);
+    }
+
+    /* Stress: 200 tube names, all route in bounds. */
+    for (i = 0; i < 200; i++) {
+        char name[32];
+        snprintf(name, sizeof(name), "tube-%d", i);
+        uint h = tube_name_hash(name) % nshards;
+        assertf(h < (uint)nshards, "shard %u out of bounds for '%s'", h, name);
+    }
+}
+
+void
+cttest_shard_wal_ncpu()
+{
+    int n = detect_ncpu();
+    assertf(n >= 1, "ncpu must be >= 1, got %d", n);
+    assertf(n <= 64, "ncpu must be <= 64, got %d", n);
+}
+
+void
+cttest_shard_wal_init_creates_dirs()
+{
+    /* When nshards > 0, srv_acquire_wal must create shard subdirectories
+     * with independent WAL instances. */
+    char *dir = ctdir();
+
+    srv.wal.dir = dir;
+    srv.wal.use = 1;
+    srv.wal.filesize = Filesizedef;
+    srv.wal.syncrate = 0;
+    srv.wal.wantsync = 0;
+    srv.nshards = 3;
+
+    srv_acquire_wal(&srv);
+
+    assertf(srv.shards != NULL, "shards must be allocated");
+    int i;
+    for (i = 0; i < 3; i++) {
+        assertf(srv.shards[i].use == 1, "shard %d must be active", i);
+        assertf(srv.shards[i].dir != NULL, "shard %d dir must be set", i);
+        assertf(srv.shards[i].cur != NULL, "shard %d must have cur file", i);
+    }
+
+    /* Clean up. */
+    srv.nshards = 0;
+    srv.shards = NULL;
+    srv.wal.use = 0;
+}
