@@ -21,7 +21,7 @@ Requires Linux (2.6.17+), Mac OS X, FreeBSD, or Illumos. Any C99 compiler; teste
 
 | Area | Upstream | This fork |
 |------|----------|-----------|
-| Known crash/data-loss bugs | 22 open | 32 fixed |
+| Known crash/data-loss bugs | 22 open | 35 fixed |
 | Scheduling complexity | O(tubes) per tick | O(1) via heaps |
 | Syscalls per command | ~4 (read + epoll + write + epoll) | ~2 (read + write, inline flush) |
 | Job hash table rehash | Stop-the-world O(n) | Incremental, 16 buckets/op |
@@ -37,10 +37,10 @@ Requires Linux (2.6.17+), Mac OS X, FreeBSD, or Illumos. Any C99 compiler; teste
 NULL deref in conn_timeout, infinite loop in rawfalloc, WAL balance rollback corruption, unsafe `exit()` in signal handler, `EPOLLERR` causing 100% CPU, OOM in `prot_init` leading to SIGSEGV.
 
 **Data loss (P1):**
-Memory/job leaks in h_accept and enqueue_incoming_job, job_copy dangling pointer, WAL nrec increment on failure, corrupt WAL records silently skipped, walmaint errors silently ignored, prot_replay orphaning jobs and leaking WAL space, `enqueue_job` WAL failure leaving job in two structures, `release`/`bury` WAL failure orphaning jobs.
+Memory/job leaks in h_accept and enqueue_incoming_job, job_copy dangling pointer, WAL nrec increment on failure, corrupt WAL records silently skipped, walmaint errors silently ignored, prot_replay orphaning jobs and leaking WAL space, `enqueue_job` WAL failure leaving job in two structures, `release`/`bury` WAL failure orphaning jobs, `delayed_ct` stats truncated to 32 bits, `pause-time-left` uint64 wraparound, WAL stats not aggregated across shards.
 
 **Hardening (P2):**
-Input validation for OP_KICK/OP_RESERVE_TIMEOUT, darwin/sunos event loop fixes, option parsing boundary checks, `-f` flag overflow, parallel make race, tube leak on `ms_append` failure.
+Input validation for OP_KICK/OP_RESERVE_TIMEOUT, darwin/sunos event loop fixes, option parsing boundary checks, `-f` flag overflow, parallel make race, tube leak on `ms_append` failure, EMFILE busy loop (listen socket deregistration + auto re-add), `scan_line_end` bare `\r` handling.
 
 **Clock:**
 `clock_gettime(CLOCK_MONOTONIC)` replaces gettimeofday; NTP jumps no longer cause mass timeouts.
@@ -92,6 +92,15 @@ When WAL is enabled (`-b`), jobs are distributed across N independent WAL instan
 | Aggregate throughput | ~33K ops/s with 8 concurrent clients + WAL + fsync=50ms |
 | Legacy compatibility | Old `binlog.*` in root dir replayed at startup, new writes go to shard subdirs |
 
+**Internal:**
+
+| Optimization | Effect |
+|-------------|--------|
+| `shard_wal()` cached | 1 hash per WAL op instead of 2–3 |
+| `epollq_rmconn` pointer-to-pointer | O(n) without list reversal side-effect |
+| `fmt_fn` signatures | `void*` parameter eliminates UB function-pointer casts |
+| `zalloc(size_t)` | Correct type for allocation size (was `int`) |
+
 **Parsing:** first-byte command dispatch (~6x fewer strncmp), cached tube name_len, single-pass stats formatting. Default `-O2` (upstream: `-O0`).
 
 ### Stability
@@ -102,7 +111,9 @@ When WAL is enabled (`-b`), jobs are distributed across N independent WAL instan
 - **Incremental rehash** — dual-table lookup during migration, no job invisible mid-rehash
 - **Downscale hysteresis** — hash table never shrinks below initial capacity
 - **Explicit process_queue** — no longer called implicitly from `enqueue_job`
-- **EMFILE logging** — fd exhaustion logged for operator awareness
+- **EMFILE backpressure** — fd exhaustion deregisters the listen socket from epoll, preventing 100% CPU busy loop; re-registers automatically when a connection closes
+- **Stats correctness** — `delayed_ct` no longer truncated to 32 bits; `pause-time-left` uses signed arithmetic with clamping (no uint64 wraparound); WAL metrics (`binlog-records-written`, `binlog-records-migrated`) aggregate across all shards
+- **Robust line scanning** — `scan_line_end` finds `\r\n` even after bare `\r` bytes
 
 ## Testing
 

@@ -292,7 +292,7 @@ struct Tube {
 void warn(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void warnx(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 char* fmtalloc(char *fmt, ...) __attribute__((format(printf, 1, 2)));
-void* zalloc(int n);
+void* zalloc(size_t n);
 #define new(T) zalloc(sizeof(T))
 void optparse(Server*, char**);
 

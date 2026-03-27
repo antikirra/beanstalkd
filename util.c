@@ -74,7 +74,7 @@ fmtalloc(char *fmt, ...)
 // returns a pointer to it.
 // If insufficient memory is available, zalloc returns 0.
 void*
-zalloc(int n)
+zalloc(size_t n)
 {
     void *p;
 

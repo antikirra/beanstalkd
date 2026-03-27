@@ -66,8 +66,8 @@ sockwant(Socket *s, int rw)
     }
 
     int r = kevent(kq, evs, n, NULL, 0, &ts);
-    if (r == 0 && rw) {
-        s->added = evs[n-1].filter;
+    if (r == 0) {
+        s->added = rw ? evs[n-1].filter : 0;
     }
     return r;
 }

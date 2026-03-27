@@ -271,5 +271,9 @@ connclose(Conn *c)
         c->in_conns = 0;
     }
 
+    if (c->srv && !c->srv->sock.added) {
+        sockwant(&c->srv->sock, 'r');
+    }
+
     free(c);
 }

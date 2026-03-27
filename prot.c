@@ -163,7 +163,7 @@ shard_wal(Server *s, Job *j)
     "current-jobs-urgent: %" PRIu64 "\n" \
     "current-jobs-ready: %" PRIu64 "\n" \
     "current-jobs-reserved: %" PRIu64 "\n" \
-    "current-jobs-delayed: %u\n" \
+    "current-jobs-delayed: %" PRIu64 "\n" \
     "current-jobs-buried: %" PRIu64 "\n" \
     "cmd-put: %" PRIu64 "\n" \
     "cmd-peek: %" PRIu64 "\n" \
@@ -471,21 +471,15 @@ epollq_add(Conn *c, char rw) {
 static void
 epollq_rmconn(Conn *c)
 {
-    Conn *x, *newhead = NULL;
-
-    while (epollq) {
-        // x as next element from epollq.
-        x = epollq;
-        epollq = epollq->next;
-        x->next = NULL;
-
-        // put x back into newhead list.
-        if (x != c) {
-            x->next = newhead;
-            newhead = x;
+    Conn **pp = &epollq;
+    while (*pp) {
+        if (*pp == c) {
+            *pp = c->next;
+            c->next = NULL;
+            return;
         }
+        pp = &(*pp)->next;
     }
-    epollq = newhead;
 }
 
 // Propagate changes to event notification mechanism about expected operations
@@ -727,6 +721,7 @@ static int
 enqueue_job(Server *s, Job *j, int64 delay, char update_store)
 {
     int r;
+    Wal *w = shard_wal(s, j);
 
     j->reserver = NULL;
     if (delay) {
@@ -751,7 +746,7 @@ enqueue_job(Server *s, Job *j, int64 delay, char update_store)
     }
 
     if (update_store) {
-        if (!walwrite(shard_wal(s, j), j)) {
+        if (!walwrite(w, j)) {
             // Rollback: remove from heap so callers don't face
             // a job present in two data structures.
             if (delay) {
@@ -769,7 +764,7 @@ enqueue_job(Server *s, Job *j, int64 delay, char update_store)
             }
             return 0;
         }
-        if (!walmaint(shard_wal(s, j))) {
+        if (!walmaint(w)) {
             twarnx("walmaint failed after walwrite");
         }
     }
@@ -780,8 +775,9 @@ enqueue_job(Server *s, Job *j, int64 delay, char update_store)
 static int
 bury_job(Server *s, Job *j, char update_store)
 {
+    Wal *w = shard_wal(s, j);
     if (update_store) {
-        int z = walresvupdate(shard_wal(s, j));
+        int z = walresvupdate(w);
         if (!z)
             return 0;
         j->walresv += z;
@@ -795,10 +791,10 @@ bury_job(Server *s, Job *j, char update_store)
     j->r.bury_ct++;
 
     if (update_store) {
-        if (!walwrite(shard_wal(s, j), j)) {
+        if (!walwrite(w, j)) {
             return 0;
         }
-        if (!walmaint(shard_wal(s, j))) {
+        if (!walmaint(w)) {
             twarnx("walmaint failed after bury walwrite");
         }
     }
@@ -985,15 +981,22 @@ check_err(Conn *c, const char *s)
 static size_t
 scan_line_end(const char *s, int size)
 {
-    char *match;
+    const char *p = s;
+    int remaining = size - 1;
 
-    match = memchr(s, '\r', size - 1);
-    if (!match)
-        return 0;
+    while (remaining > 0) {
+        char *match = memchr(p, '\r', remaining);
+        if (!match)
+            return 0;
 
-    /* this is safe because we only scan size - 1 chars above */
-    if (match[1] == '\n')
-        return match - s + 2;
+        /* safe: remaining guarantees match[1] is within the buffer */
+        if (match[1] == '\n')
+            return match - s + 2;
+
+        int skip = match - p + 1;
+        remaining -= skip;
+        p = match + 1;
+    }
 
     return 0;
 }
@@ -1180,6 +1183,8 @@ fmt_stats(char *buf, size_t size, void *x)
     int whead = 0, wcur = 0;
     Server *s = x;
     struct rusage ru;
+    int64 total_nmig = s->wal.nmig;
+    int64 total_nrec = s->wal.nrec;
 
     if (s->wal.head) {
         whead = s->wal.head->seq;
@@ -1189,12 +1194,17 @@ fmt_stats(char *buf, size_t size, void *x)
         wcur = s->wal.cur->seq;
     }
 
+    for (int i = 0; i < s->nshards; i++) {
+        total_nmig += s->shards[i].nmig;
+        total_nrec += s->shards[i].nrec;
+    }
+
     getrusage(RUSAGE_SELF, &ru); /* don't care if it fails */
     return snprintf(buf, size, STATS_FMT,
                     global_stat.urgent_ct,
                     ready_ct,
                     global_stat.reserved_ct,
-                    (uint)delayed_ct,
+                    delayed_ct,
                     global_stat.buried_ct,
                     op_ct[OP_PUT],
                     op_ct[OP_PEEKJOB],
@@ -1234,8 +1244,8 @@ fmt_stats(char *buf, size_t size, void *x)
                     uptime(),
                     whead,
                     wcur,
-                    s->wal.nmig,
-                    s->wal.nrec,
+                    total_nmig,
+                    total_nrec,
                     s->wal.filesize,
                     drain_mode ? "true" : "false",
                     instance_hex,
@@ -1414,8 +1424,9 @@ do_list_tubes(Conn *c, Ms *l)
 }
 
 static int
-fmt_job_stats(char *buf, size_t size, Job *j)
+fmt_job_stats(char *buf, size_t size, void *x)
 {
+    Job *j = x;
     int64 t;
     int64 time_left;
     int file = 0;
@@ -1447,12 +1458,14 @@ fmt_job_stats(char *buf, size_t size, Job *j)
 }
 
 static int
-fmt_stats_tube(char *buf, size_t size, Tube *t)
+fmt_stats_tube(char *buf, size_t size, void *x)
 {
-    uint64 time_left;
+    Tube *t = x;
+    int64 time_left;
 
     if (t->pause > 0) {
-        time_left = (t->unpause_at - now) / 1000000000;
+        int64 d = t->unpause_at - now;
+        time_left = d > 0 ? d / 1000000000 : 0;
     } else {
         time_left = 0;
     }
@@ -1767,9 +1780,12 @@ dispatch_cmd(Conn *c)
         j->tube->stat.total_delete_ct++;
 
         j->r.state = Invalid;
-        r = walwrite(shard_wal(c->srv, j), j);
-        if (r && !walmaint(shard_wal(c->srv, j))) {
-            twarnx("walmaint failed after delete walwrite");
+        {
+            Wal *w = shard_wal(c->srv, j);
+            r = walwrite(w, j);
+            if (r && !walmaint(w)) {
+                twarnx("walmaint failed after delete walwrite");
+            }
         }
         job_free(j);
 
@@ -1946,7 +1962,7 @@ dispatch_cmd(Conn *c)
             reply_serr(c, MSG_INTERNAL_ERROR);
             return;
         }
-        do_stats(c, (fmt_fn) fmt_job_stats, j);
+        do_stats(c, fmt_job_stats, j);
         return;
 
     case OP_STATS_TUBE:
@@ -1962,7 +1978,7 @@ dispatch_cmd(Conn *c)
             reply_msg(c, MSG_NOTFOUND);
             return;
         }
-        do_stats(c, (fmt_fn) fmt_stats_tube, t);
+        do_stats(c, fmt_stats_tube, t);
         t = NULL;
         return;
 
@@ -2498,6 +2514,7 @@ h_accept(const int fd, const short which, Server *s)
         if (cfd == -1) {
             if (errno == EMFILE || errno == ENFILE) {
                 twarnx("accept: too many open files");
+                sockwant(&s->sock, 0);
             } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
                 twarn("accept()");
             }

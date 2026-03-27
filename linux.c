@@ -50,6 +50,7 @@ sockwant(Socket *s, int rw)
         s->added = 1;
         op = EPOLL_CTL_ADD;
     } else if (!rw) {
+        s->added = 0;
         op = EPOLL_CTL_DEL;
     } else {
         op = EPOLL_CTL_MOD;
