@@ -9,7 +9,7 @@
 
 #define SAFETY_MARGIN (1000000000) /* 1 second */
 
-static int cur_conn_ct = 0, cur_worker_ct = 0, cur_producer_ct = 0;
+static uint cur_conn_ct = 0, cur_worker_ct = 0, cur_producer_ct = 0;
 static uint tot_conn_ct = 0;
 int verbose = 0;
 
@@ -81,7 +81,7 @@ connsetworker(Conn *c)
     cur_worker_ct++; /* stats */
 }
 
-int
+uint
 count_cur_conns()
 {
     return cur_conn_ct;
@@ -93,13 +93,13 @@ count_tot_conns()
     return tot_conn_ct;
 }
 
-int
+uint
 count_cur_producers()
 {
     return cur_producer_ct;
 }
 
-int
+uint
 count_cur_workers()
 {
     return cur_worker_ct;
@@ -150,8 +150,7 @@ connsched(Conn *c)
     }
     c->tickat = conntickat(c);
     if (c->tickat) {
-        heapinsert(&c->srv->conns, c);
-        c->in_conns = 1;
+        c->in_conns = heapinsert(&c->srv->conns, c);
     }
 }
 

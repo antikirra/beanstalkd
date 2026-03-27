@@ -226,7 +226,7 @@ shard_wal(Server *s, Job *j)
     "current-waiting: %" PRIu64 "\n" \
     "cmd-delete: %" PRIu64 "\n" \
     "cmd-pause-tube: %" PRIu64 "\n" \
-    "pause: %" PRIu64 "\n" \
+    "pause: %" PRId64 "\n" \
     "pause-time-left: %" PRId64 "\n" \
     "\r\n"
 
@@ -571,7 +571,7 @@ reply_line(Conn *c, int state, const char *fmt, ...)
     va_end(ap);
 
     /* Make sure the buffer was big enough. If not, we have a bug. */
-    if (r >= LINE_BUF_SIZE) {
+    if (r < 0 || r >= LINE_BUF_SIZE) {
         reply_serr(c, MSG_INTERNAL_ERROR);
         return;
     }
@@ -1373,7 +1373,7 @@ do_stats(Conn *c, fmt_fn fmt, void *data)
 
     c->out_job->r.state = Copy;
     int r = fmt(c->out_job->body, STATS_BUF_SIZE, data);
-    if (r >= STATS_BUF_SIZE) {
+    if (r < 0 || r >= STATS_BUF_SIZE) {
         job_free(c->out_job);
         c->out_job = NULL;
         reply_serr(c, MSG_INTERNAL_ERROR);

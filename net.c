@@ -107,7 +107,7 @@ make_inet_socket(char *host, char *port)
         }
         if (verbose) {
             char hbuf[NI_MAXHOST], pbuf[NI_MAXSERV], *h = host, *p = port;
-            struct sockaddr_in addr;
+            struct sockaddr_storage addr;
             socklen_t addrlen;
 
             addrlen = sizeof(addr);

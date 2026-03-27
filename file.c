@@ -594,8 +594,10 @@ filewrjobfull(File *f, Job *j)
         { .iov_base = j->body,       .iov_len = j->r.body_size },
     };
 
-    fileaddjob(f, j);
-    return filewritev(f, j, iov, 4);
+    int r = filewritev(f, j, iov, 4);
+    if (r)
+        fileaddjob(f, j);
+    return r;
 }
 
 
@@ -612,6 +614,7 @@ filewclose(File *f)
     }
     if (close(f->fd) == -1)
         twarn("close");
+    f->fd = -1;
     f->iswopen = 0;
     filedecref(f);
 }

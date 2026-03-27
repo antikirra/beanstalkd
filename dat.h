@@ -357,10 +357,10 @@ Tube *tube_find_or_make(const char *name);
 
 Conn *make_conn(int fd, char start_state, Tube *use, Tube *watch);
 
-int count_cur_conns(void);
+uint count_cur_conns(void);
 uint count_tot_conns(void);
-int count_cur_producers(void);
-int count_cur_workers(void);
+uint count_cur_producers(void);
+uint count_cur_workers(void);
 
 
 extern size_t primes[];

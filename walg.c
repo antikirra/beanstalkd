@@ -561,6 +561,7 @@ waldirlock(Wal *w)
     r = fcntl(fd, F_SETLK, &lk);
     if (r) {
         twarn("fcntl");
+        close(fd);
         return 0;
     }
 
