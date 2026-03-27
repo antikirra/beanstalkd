@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "dat.h"
 #include <stdint.h>
 #include <signal.h>
@@ -8,6 +9,7 @@
 #include <unistd.h>
 #include <pwd.h>
 #include <fcntl.h>
+#include <sched.h>
 
 static void
 su(const char *user) 
@@ -94,6 +96,17 @@ main(int argc, char **argv)
     setenv("MALLOC_ARENA_MAX", "1", 0);
 
     optparse(&srv, argv+1);
+
+    if (srv.cpu >= 0) {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(srv.cpu, &cpuset);
+        if (sched_setaffinity(0, sizeof(cpuset), &cpuset) == -1) {
+            twarn("sched_setaffinity(%d)", srv.cpu);
+        } else if (verbose) {
+            printf("pinned to CPU %d\n", srv.cpu);
+        }
+    }
 
     if (verbose) {
         printf("pid %d\n", getpid());

@@ -9,6 +9,7 @@
 
 struct Server srv = {
     .port = Portdef,
+    .cpu = -1,
     .wal = {
         .filesize = Filesizedef,
         .wantsync = 1,

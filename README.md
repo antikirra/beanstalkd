@@ -181,6 +181,7 @@ When WAL is enabled (`-b`), jobs are distributed across N independent WAL instan
 | `-s BYTES` | 10MB | WAL file size |
 | `-u USER` | | Drop privileges to user |
 | `-m SEC` | 60 | Return unused memory to OS interval (0 = disable) |
+| `-t CPU` | disabled | Pin main thread to CPU core (eliminates cache migration) |
 | `-V` | | Increase verbosity (repeatable) |
 
 ## WAL sharding layout

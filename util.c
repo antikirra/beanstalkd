@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>
+#include <unistd.h>
 
 #ifdef HAVE_LIBSYSTEMD
 #include <systemd/sd-daemon.h>
@@ -112,6 +113,7 @@ usage(int code)
             "          will be rounded up to a multiple of 4096 bytes\n"
             " -m SEC   return unused memory to OS every SEC seconds (default is 60);\n"
             "          use -m0 to disable\n"
+            " -t CPU   pin main thread to CPU core (default is no pinning)\n"
             " -v       show version information\n"
             " -V       increase verbosity\n"
             " -h       show this help\n",
@@ -207,6 +209,16 @@ optparse(Server *s, char **argv)
                 case 'm': {
                     int64 sec = (int64)parse_size_t(EARGF(flagusage("-m")));
                     mem_trim_rate = sec * 1000000000LL;
+                    break;
+                }
+                case 't': {
+                    int cpu = (int)parse_size_t(EARGF(flagusage("-t")));
+                    int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+                    if (cpu < 0 || cpu >= ncpu) {
+                        warnx("-t %d: CPU out of range (0..%d)", cpu, ncpu - 1);
+                        usage(5);
+                    }
+                    s->cpu = cpu;
                     break;
                 }
                 case 'h':

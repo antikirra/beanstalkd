@@ -522,6 +522,7 @@ struct Server {
     char *port;
     char *addr;
     char *user;
+    int  cpu;           // CPU core to pin main thread (-1 = no pinning)
 
     Wal    wal;
     Socket sock;
