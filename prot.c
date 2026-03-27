@@ -2423,10 +2423,21 @@ h_conn(const int fd, const short which, Conn *c)
     }
 
     conn_process_io(c);
+
+    // Cork the socket before dispatching commands: coalesce multiple
+    // replies into a single TCP segment when processing pipelined commands.
+    int cork = 1;
+    setsockopt(c->sock.fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof cork);
+
     while (cmd_data_ready(c) && (c->cmd_len = scan_line_end(c->cmd, c->cmd_read))) {
         dispatch_cmd(c);
         fill_extra_data(c);
     }
+
+    // Uncork: flush all coalesced replies as one TCP segment.
+    cork = 0;
+    setsockopt(c->sock.fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof cork);
+
     if (c->state == STATE_CLOSE) {
         epollq_rmconn(c);
         connclose(c);

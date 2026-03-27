@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <linux/socket.h>
 
 #ifdef HAVE_LIBSYSTEMD
 #include <systemd/sd-daemon.h>
@@ -84,6 +85,25 @@ make_inet_socket(char *host, char *port)
             close(fd);
             continue;
         }
+
+        // Hint kernel to deliver incoming packets on the CPU where
+        // the listening socket is pinned. Improves cache locality
+        // when combined with -t (CPU pinning).
+#ifdef SO_INCOMING_CPU
+        if (srv.cpu >= 0) {
+            int cpu = srv.cpu;
+            setsockopt(fd, SOL_SOCKET, SO_INCOMING_CPU, &cpu, sizeof cpu);
+        }
+#endif
+
+        // Allow kernel to rehash socket's transport hash for better
+        // distribution across RX queues.
+#ifdef SO_TXREHASH
+        {
+            int val = SOCK_TXREHASH_ENABLED;
+            setsockopt(fd, SOL_SOCKET, SO_TXREHASH, &val, sizeof val);
+        }
+#endif
 
         if (host == NULL && ai->ai_family == AF_INET6) {
             flags = 0;
