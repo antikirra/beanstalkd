@@ -2225,6 +2225,12 @@ conn_process_io(Conn *c)
     Job *j;
     struct iovec iov[2];
 
+    // Disable delayed ACK for this connection's current exchange.
+    // Kernel resets this after each recv, so we set it every time.
+    // Eliminates up to 40ms delayed ACK penalty in request-response patterns.
+    int quickack = 1;
+    setsockopt(c->sock.fd, IPPROTO_TCP, TCP_QUICKACK, &quickack, sizeof quickack);
+
     switch (c->state) {
     case STATE_WANT_COMMAND:
         r = read(c->sock.fd, c->cmd + c->cmd_read, LINE_BUF_SIZE - c->cmd_read);
