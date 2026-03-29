@@ -696,6 +696,7 @@ remove_waiting_conn(Conn *c)
     c->type &= ~CONN_TYPE_WAITING;
     global_stat.waiting_ct--;
     Tube *t = c->watch;
+    if (!t) return;
     t->stat.waiting_ct--;
     ms_remove_at(&t->waiting_conns, c->watch_idx, c);
 }
@@ -2266,6 +2267,7 @@ dispatch_cmd(Conn *c)
                 }
 
                 if (send_fd(c->srv->peer_fd[target], c->sock.fd, &mm, sizeof(mm)) == 0) {
+                    sockwant(&c->sock, 0); // deregister from epoll before giving away fd
                     c->sock.fd = -1;
                     remove_waiting_conn(c);
                     c->state = STATE_CLOSE;
@@ -2290,9 +2292,7 @@ use_local:
         if (c->srv->nworkers > 1 && c->watch != c->use) {
             remove_waiting_conn(c);
             c->watch->watching_ct--;
-            tube_dref(c->watch);
-            c->watch = c->use;
-            tube_iref(c->watch);
+            TUBE_ASSIGN(c->watch, c->use);
             c->watch->watching_ct++;
         }
 
@@ -2336,7 +2336,7 @@ use_local:
                 }
 
                 if (send_fd(c->srv->peer_fd[target], c->sock.fd, &mm, sizeof(mm)) == 0) {
-                    // Detach fd without closing — the receiving worker owns it now.
+                    sockwant(&c->sock, 0); // deregister from epoll before giving away fd
                     c->sock.fd = -1;
                     remove_waiting_conn(c);
                     c->state = STATE_CLOSE;
@@ -2354,12 +2354,9 @@ watch_local:
         }
 
         if (c->watch != t) {
-            // If currently waiting, unregister from old tube first.
             remove_waiting_conn(c);
             c->watch->watching_ct--;
-            tube_dref(c->watch);
-            c->watch = t;
-            tube_iref(t);
+            TUBE_ASSIGN(c->watch, t);
             c->watch->watching_ct++;
         }
 
@@ -3144,7 +3141,11 @@ h_accept_migrated(int cfd, Server *s, struct MigMsg *mm)
             if (c->sock.fd < 0) break; // re-migrated
             fill_extra_data(c);
         }
-        if (c->sock.fd < 0) return; // connection migrated away
+        if (c->sock.fd < 0 || c->state == STATE_CLOSE) {
+            connclose(c);
+            epollq_apply();
+            return;
+        }
     }
 
     if (c->state == STATE_CLOSE) {

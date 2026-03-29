@@ -36,6 +36,8 @@ make_conn(int fd, char start_state, Tube *use, Tube *watch)
         return NULL;
     }
 
+    c->sock.fd = fd;
+
     TUBE_ASSIGN(c->watch, watch);
     c->watch->watching_ct++;
 
@@ -251,10 +253,14 @@ connclose(Conn *c)
     if (has_reserved_job(c))
         enqueue_reserved_jobs(c);
 
-    c->watch->watching_ct--;
-    TUBE_ASSIGN(c->watch, NULL);
-    c->use->using_ct--;
-    TUBE_ASSIGN(c->use, NULL);
+    if (c->watch) {
+        c->watch->watching_ct--;
+        TUBE_ASSIGN(c->watch, NULL);
+    }
+    if (c->use) {
+        c->use->using_ct--;
+        TUBE_ASSIGN(c->use, NULL);
+    }
 
     if (c->in_conns) {
         heapremove(&c->srv->conns, c->tickpos);

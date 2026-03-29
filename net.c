@@ -276,7 +276,8 @@ recv_fd(int sock, void *buf, size_t buflen)
     if (r <= 0 || (size_t)r < buflen) return -1; // reject partial messages
 
     struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-    if (!cmsg || cmsg->cmsg_type != SCM_RIGHTS) return -1;
+    if (!cmsg || cmsg->cmsg_type != SCM_RIGHTS
+        || cmsg->cmsg_len < CMSG_LEN(sizeof(int))) return -1;
 
     int fd;
     memcpy(&fd, CMSG_DATA(cmsg), sizeof(int));
