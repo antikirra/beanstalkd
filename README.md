@@ -4,7 +4,7 @@ Linux-native, multi-core work queue in C99. Single binary, zero dependencies.
 
 Fork of [upstream beanstalkd](https://github.com/beanstalkd/beanstalkd) with 35 bug fixes, multi-process architecture, and per-syscall optimizations. Wire protocol and WAL format are unchanged — existing client libraries work unmodified.
 
-> **Breaking change:** each connection watches exactly one tube. The `watch` command switches the tube (not accumulates). This restriction enables multi-core parallelism — see [Single-tube watch](#single-tube-watch) below.
+> **Breaking change:** each connection watches exactly one tube. The `watch` command switches the tube (not accumulates). `use` and `watch` are independent — `use` sets the producing tube locally, `watch` migrates the connection to the consuming tube's worker. See [Single-tube watch](#single-tube-watch) below.
 
 ## Requirements
 
@@ -30,10 +30,13 @@ make && ./beanstalkd
 ```sh
 make                                    # build
 make check                              # 205 unit tests
+make check-mw                           # 9 multi-worker integration tests
 make bench                              # benchmarks
 docker build -f Dockerfile.build .      # CI: UBSan + cppcheck
 docker build -f Dockerfile.benchmark .  # A/B comparison vs upstream
 ```
+
+CI pipeline (`Dockerfile.build`): 205 unit tests (UBSan) + 9 multi-worker integration tests + cppcheck.
 
 Production image (`Dockerfile`): multi-stage build on bookworm-slim, LTO, `-Os -march=native -fvisibility=hidden`, full RELRO.
 
@@ -50,7 +53,7 @@ Production image (`Dockerfile`): multi-stage build on bookworm-slim, LTO, `-Os -
 | Job pool | Exact size match | 11 size classes, O(1) reuse |
 | WAL | Single file, 1 fsync thread | Per-worker, async fsync |
 | Known crash/data bugs | 22 open | 35 fixed |
-| Unit tests | 100 | 205 |
+| Tests | 100 unit | 205 unit + 13 multi-worker integration |
 
 ## Single-tube watch
 
@@ -61,10 +64,20 @@ This fork restricts each connection to one watched tube:
 - `watch <tube>` — **switches** to `<tube>`, always replies `WATCHING 1`
 - `ignore <tube>` — no-op if it's the current tube (cannot have zero), always replies `WATCHING 1`
 - `reserve` — blocks on the single watched tube only
+- `use <tube>` — changes producer tube **independently** of `watch` (no migration)
 
-This makes tube-based sharding possible: each tube is owned by exactly one worker process, all scheduling is local, no cross-process coordination.
+`use` and `watch` are fully independent, as in upstream. `use` determines where `put` sends jobs. `watch` determines where `reserve` receives jobs. A client can `use` one tube for producing and `watch` another for consuming. When the `use` tube is on a different worker, puts are transparently forwarded via Unix socket IPC.
 
-**Client migration:** most clients already use one tube per connection (one `use` for producing, one `watch` for consuming). Clients that watched multiple tubes need one connection per tube.
+**Client library compatibility:** all major libraries (Pheanstalk, Beaneater, go-beanstalk, beanstalkc) support multi-tube watch as a core feature. In this fork, calling `watch` multiple times switches the tube — only the last one is active. Clients that use multi-tube watch need one connection per tube. Run with `-V` to log tube switches for debugging.
+
+```
+# Before (upstream, one connection):
+conn.watch('emails').watch('notifications').reserve()
+
+# After (this fork, two connections):
+conn1.watch('emails').reserve()        # connection 1
+conn2.watch('notifications').reserve() # connection 2
+```
 
 ## Multi-process architecture
 
@@ -80,10 +93,13 @@ By default, beanstalkd forks N worker processes (one per CPU core). Override wit
 - Allocates interleaved job IDs (worker K → 1+K, 1+K+N, 1+K+2N, ...)
 
 **Connection routing:**
-- On accept, worker speculatively reads the first command; if `use`/`watch` targets a remote tube, the fd is migrated via `SCM_RIGHTS` before creating a `Conn`
-- Mid-session `use`/`watch` for a remote tube migrates the fd transparently (buffered pipeline data travels with it)
-- `stats-tube`/`pause-tube` for remote tubes are forwarded via Unix socket IPC
+- `watch` migrates the connection to the tube's owner worker via `SCM_RIGHTS` fd passing (buffered pipeline data travels with the fd)
+- `use` is local — does not migrate. `put` commands are forwarded to the tube's owner worker via `PutFwdMsg` (up to 32KB body, larger jobs enqueue locally)
+- `peek <id>`, `stats-job <id>`, `kick-job <id>` are forwarded to the job's owner worker by ID routing (`(id-1) % nworkers`)
+- `stats-tube`, `pause-tube`, `peek-ready/delayed/buried`, `kick` are forwarded to the tube's owner worker
 - `stats` aggregates all workers' counters via `mmap`'d shared memory (1Hz publish)
+- On accept, worker speculatively reads the first command; if `watch` targets a remote tube, the fd is migrated before creating a `Conn`
+- Master monitors workers and restarts crashed ones with full mesh recovery (new socketpairs distributed via control pipe + `SCM_RIGHTS`)
 
 **Single-process fallback:** `-t CPU` (pin to core), `-w 0`, `-w 1`, or 1 CPU detected.
 

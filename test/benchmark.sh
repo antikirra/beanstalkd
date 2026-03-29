@@ -322,8 +322,11 @@ run_full() {
 echo "━━━ Running UPSTREAM ━━━"
 run_full "up" "$UPSTREAM" 11600
 echo ""
-echo "━━━ Running FORK ━━━"
+echo "━━━ Running FORK (single-process) ━━━"
 run_full "fk" "$FORK" 11700 "-w 1"
+echo ""
+echo "━━━ Running FORK (multi-worker) ━━━"
+run_full "mw" "$FORK" 11800
 echo ""
 
 # ═══════════════════════════════════════════════════════════════
@@ -373,6 +376,11 @@ export fk_s3_wall fk_s3_ops fk_s3_tubes fk_s3_rss fk_s3_cpu
 export up_s4_avg up_s4_p50 up_s4_p99 up_s4_p999
 export fk_s4_avg fk_s4_p50 fk_s4_p99 fk_s4_p999
 export up_s5_wall up_s5_cps fk_s5_wall fk_s5_cps
+export mw_s1_wall mw_s1_ops mw_s1_put mw_s1_cycle mw_s1_rss mw_s1_cpu
+export mw_s2_wall mw_s2_ops mw_s2_rss
+export mw_s3_wall mw_s3_ops mw_s3_tubes mw_s3_rss mw_s3_cpu
+export mw_s4_avg mw_s4_p50 mw_s4_p99 mw_s4_p999
+export mw_s5_wall mw_s5_cps
 
 python3 << 'PYEOF'
 import os
@@ -436,6 +444,19 @@ print('  │ Metric                │ Upstream  │ Fork      │ Delta        
 print('  ├───────────────────────┼───────────┼───────────┼──────────────────┤')
 row('Wall time (s)',e('up_s5_wall'),e('fk_s5_wall'),True)
 row('Connections/s',e('up_s5_cps'),e('fk_s5_cps'),fmt='d')
+print('  └───────────────────────┴───────────┴───────────┴──────────────────┘')
+
+print()
+print('  MULTI-WORKER MODE (fork -w auto)')
+print('  ┌───────────────────────┬───────────┬───────────┬──────────────────┐')
+print('  │ Metric                │ Upstream  │ Fork (MW) │ Delta            │')
+print('  ├───────────────────────┼───────────┼───────────┼──────────────────┤')
+row('S1 Throughput (ops/s)',e('up_s1_ops'),e('mw_s1_ops'),fmt='d')
+row('S2 Multi-tube (ops/s)',e('up_s2_ops'),e('mw_s2_ops'),fmt='d')
+row('S3 500 tubes (ops/s)',e('up_s3_ops'),e('mw_s3_ops'),fmt='d')
+row('S4 Avg latency (μs)',e('up_s4_avg'),e('mw_s4_avg'),True,pr=1)
+row('S4 P99.9 latency (μs)',e('up_s4_p999'),e('mw_s4_p999'),True,pr=1)
+row('S5 Connections/s',e('up_s5_cps'),e('mw_s5_cps'),fmt='d')
 print('  └───────────────────────┴───────────┴───────────┴──────────────────┘')
 
 print()

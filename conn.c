@@ -27,7 +27,9 @@ make_conn(int fd, char start_state, Tube *use, Tube *watch)
         c = conn_pool;
         conn_pool = c->next;
         conn_pool_len--;
+        uint64 gen = c->gen + 1;
         memset(c, 0, sizeof(Conn));
+        c->gen = gen;
     } else {
         c = new(Conn);
     }
@@ -231,9 +233,15 @@ connclose(Conn *c)
         }
     }
 
-    // Clear dangling reference if this conn was waiting for a forwarded reply.
-    if (c->srv && c->srv->pending_fwd_conn == c)
-        c->srv->pending_fwd_conn = NULL;
+    // Clear all pending forward slots referencing this conn.
+    if (c->srv) {
+        for (int i = 0; i < PENDING_FWD_SLOTS; i++) {
+            if (c->srv->pending_fwd[i].conn == c) {
+                c->srv->pending_fwd[i].conn = NULL;
+                c->srv->pending_fwd[i].seq = 0;
+            }
+        }
+    }
 
     job_free(c->in_job);
 

@@ -141,8 +141,9 @@ pin_to_cpu(int cpu)
 
 // Start a single worker process. Returns child PID to master,
 // does not return in child (calls srvserve then _exit).
+// ctl_fd: control pipe from master for peer updates (-1 to disable).
 static pid_t
-spawn_worker(int id, int nworkers, int mesh[MAX_WORKERS][MAX_WORKERS])
+spawn_worker(int id, int nworkers, int mesh[MAX_WORKERS][MAX_WORKERS], int ctl_fd)
 {
     pid_t pid = fork();
     if (pid == -1) {
@@ -154,6 +155,7 @@ spawn_worker(int id, int nworkers, int mesh[MAX_WORKERS][MAX_WORKERS])
 
     // === CHILD: become worker ===
     srv.worker_id = id;
+    srv.ctl_fd = ctl_fd;
 
     // Keep only our row of the mesh; close everything else.
     for (int i = 0; i < nworkers; i++) {
@@ -206,6 +208,68 @@ spawn_worker(int id, int nworkers, int mesh[MAX_WORKERS][MAX_WORKERS])
     _exit(0);
 }
 
+// Master-held control pipe write ends (one per worker).
+static int master_ctl_fd[MAX_WORKERS];
+
+// Restart a crashed worker: create new peer socketpairs,
+// push new fds to surviving workers via control pipe.
+static void
+restart_worker(int id, int nworkers)
+{
+    // Create new mesh row for the restarted worker.
+    int mesh[MAX_WORKERS][MAX_WORKERS];
+    memset(mesh, -1, sizeof(mesh));
+
+    for (int j = 0; j < nworkers; j++) {
+        if (j == id) continue;
+        int sv[2];
+        if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, sv) == -1) {
+            twarn("socketpair for workers %d↔%d", id, j);
+            continue;
+        }
+        mesh[id][j] = sv[0]; // new worker's end
+        mesh[j][id] = sv[1]; // surviving worker's end
+
+        // Send the surviving worker's end via control pipe.
+        if (master_ctl_fd[j] >= 0) {
+            struct CtlPeerUpdate msg = { CTL_PEER_UPDATE_MAGIC, id };
+            if (send_fd(master_ctl_fd[j], sv[1], &msg, sizeof(msg)) == 0) {
+                close(sv[1]); // master's copy; worker got its own via SCM_RIGHTS
+                mesh[j][id] = -1; // don't pass to new worker
+            } else {
+                // Failed to notify surviving worker — close both ends.
+                close(sv[0]);
+                close(sv[1]);
+                mesh[id][j] = -1;
+                mesh[j][id] = -1;
+            }
+        }
+    }
+
+    // Create new control pipe for the restarted worker.
+    int ctl[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, ctl) == -1) {
+        twarn("control pipe for worker %d", id);
+        ctl[0] = ctl[1] = -1;
+    }
+
+    pid_t newpid = spawn_worker(id, nworkers, mesh, ctl[0]);
+    if (newpid > 0) {
+        srv.worker_pids[id] = newpid;
+        if (ctl[0] >= 0) close(ctl[0]); // child's end
+        if (master_ctl_fd[id] >= 0) close(master_ctl_fd[id]);
+        master_ctl_fd[id] = ctl[1]; // master's write end
+    } else {
+        if (ctl[0] >= 0) close(ctl[0]);
+        if (ctl[1] >= 0) close(ctl[1]);
+    }
+
+    // Close master's copies of new worker's mesh fds.
+    for (int j = 0; j < nworkers; j++) {
+        if (mesh[id][j] >= 0) close(mesh[id][j]);
+    }
+}
+
 // Master process: monitor workers, restart on crash, forward signals.
 static void
 master_loop(int nworkers)
@@ -213,12 +277,9 @@ master_loop(int nworkers)
     set_master_sig_handlers();
 
     for (;;) {
-        // Block on waitpid — woken by SIGCHLD, SIGTERM, or SIGUSR1.
-        // No busy-wait, zero CPU usage in steady state.
         int status;
         pid_t pid = waitpid(-1, &status, 0);
 
-        // Forward signals to workers.
         if (got_sigterm) {
             for (int i = 0; i < nworkers; i++) {
                 if (srv.worker_pids[i] > 0)
@@ -239,17 +300,12 @@ master_loop(int nworkers)
         }
 
         if (pid > 0) {
-            // Reap all terminated children (multiple may die simultaneously).
             do {
                 for (int i = 0; i < nworkers; i++) {
                     if (srv.worker_pids[i] == pid) {
                         twarnx("worker %d (pid %d) exited status %d, restarting",
                                i, (int)pid, status);
-                        int empty_mesh[MAX_WORKERS][MAX_WORKERS];
-                        memset(empty_mesh, -1, sizeof(empty_mesh));
-                        pid_t newpid = spawn_worker(i, nworkers, empty_mesh);
-                        if (newpid > 0)
-                            srv.worker_pids[i] = newpid;
+                        restart_worker(i, nworkers);
                         break;
                     }
                 }
@@ -372,20 +428,31 @@ main(int argc, char **argv)
         }
     }
 
-    // Copy mesh row into srv.peer_fd before forking.
-    // Each worker inherits the full mesh; spawn_worker closes non-own fds.
+    // Create control pipes (master → worker) for peer fd updates.
+    memset(master_ctl_fd, -1, sizeof(master_ctl_fd));
     for (int i = 0; i < nworkers; i++) {
-        pid_t pid = spawn_worker(i, nworkers, mesh);
+        int ctl[2];
+        if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, ctl) == -1) {
+            twarn("control pipe for worker %d", i);
+            exit(111);
+        }
+        master_ctl_fd[i] = ctl[1]; // master's write end
+
+        pid_t pid = spawn_worker(i, nworkers, mesh, ctl[0]);
         if (pid == -1) {
             twarnx("failed to spawn worker %d", i);
             exit(111);
         }
+        close(ctl[0]); // child inherited its copy
         srv.worker_pids[i] = pid;
     }
 
-    // Master keeps mesh fds open — workers inherited copies via fork.
-    // Closing master's copies would NOT affect workers (fd is per-process),
-    // but we keep them to avoid confusing fd accounting.
+    // Close master's copies of mesh fds (workers inherited via fork).
+    for (int i = 0; i < nworkers; i++)
+        for (int j = i + 1; j < nworkers; j++) {
+            if (mesh[i][j] >= 0) close(mesh[i][j]);
+            if (mesh[j][i] >= 0) close(mesh[j][i]);
+        }
 
     master_loop(nworkers);
     exit(0);

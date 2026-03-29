@@ -249,7 +249,10 @@ send_fd(int sock, int fd, void *buf, size_t buflen)
     cmsg->cmsg_len = CMSG_LEN(sizeof(int));
     memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
 
-    ssize_t r = sendmsg(sock, &msg, MSG_NOSIGNAL);
+    ssize_t r;
+    do {
+        r = sendmsg(sock, &msg, MSG_NOSIGNAL);
+    } while (r == -1 && errno == EINTR);
     if (r == -1) {
         twarn("send_fd");
         return -1;
@@ -272,8 +275,11 @@ recv_fd(int sock, void *buf, size_t buflen)
     msg.msg_control = cmsgbuf;
     msg.msg_controllen = sizeof(cmsgbuf);
 
-    ssize_t r = recvmsg(sock, &msg, 0);
-    if (r <= 0 || (size_t)r < buflen) return -1; // reject partial messages
+    ssize_t r;
+    do {
+        r = recvmsg(sock, &msg, 0);
+    } while (r == -1 && errno == EINTR);
+    if (r <= 0 || (size_t)r < buflen) return -1;
 
     struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
     if (!cmsg || cmsg->cmsg_type != SCM_RIGHTS

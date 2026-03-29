@@ -47,6 +47,9 @@ TOFILES=\
 	testcore.o\
 	testprot2.o\
 
+MWTOFILES=\
+	testworker.o\
+
 HFILES=\
 	dat.h\
 
@@ -100,6 +103,21 @@ check: ct/_ctcheck
 bench: ct/_ctcheck
 	ct/_ctcheck -b
 
+.PHONY: check-mw
+check-mw: $(TARG) ct/_ctcheck_mw
+	ct/_ctcheck_mw
+
+ct/_ctcheck_mw: ct/_ctcheck_mw.o ct/ct.o $(OFILES) $(MWTOFILES)
+	$(LINK.o) -o $@ $^ $(LDLIBS)
+
+ct/_ctcheck_mw.o: ct/_ctcheck_mw.c
+
+ct/_ctcheck_mw.c: $(MWTOFILES) ct/gen
+	ct/gen $(MWTOFILES) >$@.part
+	mv $@.part $@
+
+$(MWTOFILES): $(HFILES) ct/ct.h
+
 ct/_ctcheck: ct/_ctcheck.o ct/ct.o $(OFILES) $(TOFILES)
 	$(LINK.o) -o $@ $^ $(LDLIBS)
 
@@ -114,6 +132,7 @@ ct/ct.o ct/_ctcheck.o: ct/ct.h ct/internal.h
 $(TOFILES): $(HFILES) ct/ct.h
 
 CLEANFILES+=$(wildcard ct/_* ct/*.o ct/*.gc*)
+CLEANFILES+=ct/_ctcheck_mw ct/_ctcheck_mw.c ct/_ctcheck_mw.o
 
 ifneq ($(shell ./verc.sh),$(shell cat vers.c 2>/dev/null))
 .PHONY: vers.c

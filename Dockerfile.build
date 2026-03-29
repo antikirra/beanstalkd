@@ -9,11 +9,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /src
 COPY . .
 
-# Build and run 197 tests under UBSan (traps on first undefined behavior)
+# Build and run unit tests under UBSan (traps on first undefined behavior)
 RUN make clean && make check \
     CFLAGS="-O2 -Wall -Werror -Wformat=2 -g -fsanitize=undefined -fno-sanitize-recover=all" \
     LDFLAGS="-fsanitize=undefined" \
     LDLIBS="-lrt -lpthread -lubsan"
+
+# Multi-worker integration tests (requires compiled beanstalkd binary)
+RUN make clean && make && make check-mw \
+    CFLAGS="-O2 -Wall -Werror -Wformat=2 -g" \
+    LDLIBS="-lrt -lpthread"
 
 # cppcheck: zero false-positive static analysis
 RUN cppcheck --error-exitcode=1 --enable=warning,performance \

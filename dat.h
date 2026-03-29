@@ -415,6 +415,7 @@ struct CmdFwdMsg {
     char   cmd[LINE_BUF_SIZE];
     size_t cmd_len;
     int    from_worker;           // who to send reply back to
+    uint32 seq;                   // sequence number for reply routing
 };
 
 #define CMD_FWD_REPLY_SIZE 4096
@@ -422,8 +423,35 @@ struct CmdReplyMsg {
     uint32 magic;
     char   data[CMD_FWD_REPLY_SIZE];
     int    data_len;
+    uint32 seq;                   // echo back sequence from CmdFwdMsg
 };
+// Put forwarding: forward a put command + body to the tube's owner worker.
+// Uses a flexible array member for the body.
+// Put forwarding body limit. AF_UNIX SOCK_SEQPACKET max message ~212KB
+// (SO_SNDBUF default). Use job_data_size_limit default (65535) as cap.
+#define PUT_FWD_MAGIC 0x50555446  // "PUTF"
+#define PUT_FWD_MAX_BODY 65535
+struct PutFwdMsg {
+    uint32 magic;
+    int    from_worker;
+    uint32 seq;
+    uint32 pri;
+    int64  delay;
+    int64  ttr;
+    char   tube[MAX_TUBE_NAME_LEN];
+    int    body_size;
+    char   body[PUT_FWD_MAX_BODY + 2];
+};
+
 int  prot_replay(Server *s, Job *list);
+
+// Control message from master to worker: update peer_fd for a restarted worker.
+// Sent via ctl_fd with SCM_RIGHTS carrying the new socketpair end.
+#define CTL_PEER_UPDATE_MAGIC 0x50455552  // "PEER"
+struct CtlPeerUpdate {
+    uint32 magic;
+    int    peer_idx;    // which peer_fd slot to update
+};
 
 
 int make_server_socket(char *host, char *port);
@@ -444,9 +472,11 @@ struct Conn {
     char   type;        // combination of CONN_TYPE_* values
     Conn   *next;       // only used in epollq functions
     Tube   *use;        // tube currently in use
+    uint64 gen;         // generation counter, incremented on pool reuse
     int64  tickat;      // time at which to do more work; determines pos in heap
     size_t tickpos;     // position in srv->conns, stale when in_conns=0
     byte   in_conns;    // 1 if the conn is in srv->conns heap, 0 otherwise
+    byte   fwd_pending; // 1 if waiting for forwarded command reply
     Job    *soonest_job;// memoization of the soonest job
     int    rw;          // currently want: 'r', 'w', or 'h'
 
@@ -596,7 +626,19 @@ struct Server {
     int    worker_id;         // -1 for master, 0..N-1 for workers
     pid_t  worker_pids[MAX_WORKERS]; // master: child PIDs
     int    peer_fd[MAX_WORKERS];     // Unix sockets to peer workers
-    Conn   *pending_fwd_conn;       // conn waiting for forwarded cmd reply
+    int    ctl_fd;                   // control pipe from master (recv new peer fds)
+
+    // Pending forwarded commands: ring buffer for concurrent in-flight forwards.
+    // Each entry tracks the connection waiting for a reply, with generation
+    // and sequence number to detect stale/reused Conn pointers.
+    #define PENDING_FWD_SLOTS 16
+    struct {
+        Conn   *conn;
+        uint64  gen;      // conn generation at time of forward
+        uint32  seq;      // sequence number sent with the forward
+        int64   at;       // nanoseconds when forward was sent
+    } pending_fwd[PENDING_FWD_SLOTS];
+    uint32  pending_fwd_seq;        // next sequence number to assign
 };
 void srv_acquire_wal(Server *s);
 int  detect_ncpu(void);

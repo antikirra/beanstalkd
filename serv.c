@@ -1,5 +1,6 @@
 #include "dat.h"
 #include <stdint.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -7,6 +8,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <errno.h>
 
 struct SharedStats *shared_stats = NULL;
 
@@ -20,6 +22,7 @@ struct Server srv = {
     },
     .nworkers = 0,
     .worker_id = 0,
+    .ctl_fd = -1,
 };
 
 // Detect available CPU cores for WAL sharding.
@@ -137,6 +140,7 @@ srv_acquire_wal(Server *s)
 // Execute a forwarded command locally and send reply back.
 // Called when a peer worker sends a CmdFwdMsg for stats-tube/pause-tube.
 void prot_handle_forwarded_cmd(Server *s, struct CmdFwdMsg *fwd);
+void prot_handle_forwarded_put(Server *s, struct PutFwdMsg *pm);
 
 // Per-peer context passed through Socket.x to avoid linear scan.
 struct PeerCtx {
@@ -144,6 +148,7 @@ struct PeerCtx {
     int     peer_idx;
 };
 static struct PeerCtx peer_ctx[MAX_WORKERS];
+static Socket peer_socks[MAX_WORKERS];
 
 // Handler for incoming data on a peer worker socket.
 // Dispatches migration (MigMsg), command forwarding (CmdFwdMsg),
@@ -158,6 +163,29 @@ handle_peer(struct PeerCtx *ctx, int ev)
     // Peek at the magic to determine message type.
     uint32 magic = 0;
     ssize_t r = recv(fd, &magic, sizeof(magic), MSG_PEEK);
+    if (r == 0 || (r == -1 && errno != EAGAIN && errno != EINTR)) {
+        // Peer closed or broken — deregister to prevent busy loop.
+        // Release all clients waiting for forwarded replies.
+        for (int i = 0; i < PENDING_FWD_SLOTS; i++) {
+            if (s->pending_fwd[i].conn) {
+                Conn *pc = s->pending_fwd[i].conn;
+                if (pc->gen == s->pending_fwd[i].gen && pc->sock.fd >= 0) {
+                    write(pc->sock.fd, "NOT_FOUND\r\n", 11);
+                    pc->fwd_pending = 0;
+                    sockwant(&pc->sock, 'r');
+                    if (pc->cmd_read > 0)
+                        pc->sock.f(pc->sock.x, 'r');
+                }
+                s->pending_fwd[i].conn = NULL;
+                s->pending_fwd[i].seq = 0;
+            }
+        }
+        sockwant(&peer_socks[ctx->peer_idx], 0);
+        close(fd);
+        s->peer_fd[ctx->peer_idx] = -1;
+        twarnx("peer %d disconnected", ctx->peer_idx);
+        return;
+    }
     if (r < (ssize_t)sizeof(magic))
         return;
 
@@ -173,15 +201,39 @@ handle_peer(struct PeerCtx *ctx, int ev)
         if (r < (ssize_t)sizeof(fwd))
             return;
         prot_handle_forwarded_cmd(s, &fwd);
+    } else if (magic == PUT_FWD_MAGIC) {
+        struct PutFwdMsg *pm = malloc(sizeof(struct PutFwdMsg));
+        if (!pm) return;
+        memset(pm, 0, sizeof(*pm));
+        r = read(fd, pm, sizeof(*pm));
+        // Minimum: header without body.
+        if (r < (ssize_t)offsetof(struct PutFwdMsg, body)) { free(pm); return; }
+        if (pm->body_size < 0 || pm->body_size > PUT_FWD_MAX_BODY + 2) { free(pm); return; }
+        prot_handle_forwarded_put(s, pm);
+        free(pm);
     } else if (magic == CMD_REPLY_MAGIC) {
         struct CmdReplyMsg rpl;
         r = read(fd, &rpl, sizeof(rpl));
         if (r < (ssize_t)sizeof(rpl))
             return;
-        // Write reply directly to the waiting connection's socket.
-        if (s->pending_fwd_conn && rpl.data_len > 0) {
-            write(s->pending_fwd_conn->sock.fd, rpl.data, rpl.data_len);
-            s->pending_fwd_conn = NULL;
+        // Match reply to pending slot by sequence number.
+        if (rpl.data_len > 0 && rpl.data_len <= CMD_FWD_REPLY_SIZE && rpl.seq) {
+            for (int i = 0; i < PENDING_FWD_SLOTS; i++) {
+                if (s->pending_fwd[i].seq == rpl.seq && s->pending_fwd[i].conn) {
+                    Conn *pc = s->pending_fwd[i].conn;
+                    if (pc->gen == s->pending_fwd[i].gen && pc->sock.fd >= 0) {
+                        write(pc->sock.fd, rpl.data, rpl.data_len);
+                        pc->fwd_pending = 0;
+                        // Re-register for read + resume pipelined commands.
+                        sockwant(&pc->sock, 'r');
+                        if (pc->cmd_read > 0)
+                            pc->sock.f(pc->sock.x, 'r');
+                    }
+                    s->pending_fwd[i].conn = NULL;
+                    s->pending_fwd[i].seq = 0;
+                    break;
+                }
+            }
         }
     } else {
         // Unknown magic — drain the data.
@@ -190,8 +242,52 @@ handle_peer(struct PeerCtx *ctx, int ev)
     }
 }
 
-// Per-peer Socket structs for epoll registration.
-static Socket peer_socks[MAX_WORKERS];
+// Register (or re-register) a peer socket in epoll.
+static void
+register_peer(Server *s, int idx)
+{
+    if (s->peer_fd[idx] < 0 || idx == s->worker_id)
+        return;
+    peer_ctx[idx].srv = s;
+    peer_ctx[idx].peer_idx = idx;
+    peer_socks[idx].fd = s->peer_fd[idx];
+    peer_socks[idx].x = &peer_ctx[idx];
+    peer_socks[idx].f = (Handle)handle_peer;
+    peer_socks[idx].added = 0;
+    peer_socks[idx].rw_cached = 0;
+    if (sockwant(&peer_socks[idx], 'r') == -1)
+        twarn("sockwant peer %d", idx);
+}
+
+// Handler for control pipe from master (peer fd updates).
+static Socket ctl_sock;
+static void
+handle_ctl(Server *s, int ev)
+{
+    UNUSED_PARAMETER(ev);
+    struct CtlPeerUpdate msg;
+    int newfd = recv_fd(s->ctl_fd, &msg, sizeof(msg));
+    if (newfd < 0) return;
+    if (msg.magic != CTL_PEER_UPDATE_MAGIC) {
+        close(newfd);
+        return;
+    }
+    int idx = msg.peer_idx;
+    if (idx < 0 || idx >= MAX_WORKERS || idx >= s->nworkers || idx == s->worker_id) {
+        close(newfd);
+        return;
+    }
+    // Close old broken peer socket if still registered.
+    if (s->peer_fd[idx] >= 0) {
+        sockwant(&peer_socks[idx], 0);
+        close(s->peer_fd[idx]);
+    }
+    s->peer_fd[idx] = newfd;
+    register_peer(s, idx);
+    if (verbose)
+        printf("worker %d: peer %d reconnected (fd %d)\n",
+               s->worker_id, idx, newfd);
+}
 
 void
 srvserve(Server *s)
@@ -214,17 +310,16 @@ srvserve(Server *s)
     }
 
     // Register peer worker sockets for migration receive.
-    for (int i = 0; i < s->nworkers; i++) {
-        if (s->peer_fd[i] < 0 || i == s->worker_id)
-            continue;
-        peer_ctx[i].srv = s;
-        peer_ctx[i].peer_idx = i;
-        peer_socks[i].fd = s->peer_fd[i];
-        peer_socks[i].x = &peer_ctx[i];
-        peer_socks[i].f = (Handle)handle_peer;
-        if (sockwant(&peer_socks[i], 'r') == -1) {
-            twarn("sockwant peer %d", i);
-        }
+    for (int i = 0; i < s->nworkers; i++)
+        register_peer(s, i);
+
+    // Register control pipe from master for peer updates.
+    if (s->ctl_fd >= 0) {
+        ctl_sock.fd = s->ctl_fd;
+        ctl_sock.x = s;
+        ctl_sock.f = (Handle)handle_ctl;
+        if (sockwant(&ctl_sock, 'r') == -1)
+            twarn("sockwant ctl");
     }
 
     for (;;) {
