@@ -60,7 +60,7 @@ sync_thread_fn(void *arg)
 
         pthread_mutex_lock(&w->sync_mu);
         if (r == -1)
-            w->sync_err = 1;
+            __atomic_store_n(&w->sync_err, 1, __ATOMIC_RELAXED);
     }
     pthread_mutex_unlock(&w->sync_mu);
     return NULL;
@@ -136,7 +136,24 @@ static void
 dirsync(Wal *w)
 {
     int fd = open(w->dir, O_RDONLY|O_CLOEXEC);
-    if (fd >= 0) {
+    if (fd < 0) return;
+
+    // If async fsync thread is running, hand off dirsync to it.
+    // This avoids a 1-10ms hard block on the hot path.
+    if (w->sync_on) {
+        pthread_mutex_lock(&w->sync_mu);
+        if (w->sync_fd >= 0) {
+            // Thread is busy — fall through to sync dirsync.
+            pthread_mutex_unlock(&w->sync_mu);
+            durable_fsync(fd);
+            close(fd);
+        } else {
+            w->sync_fd = fd;
+            pthread_cond_signal(&w->sync_cond);
+            pthread_mutex_unlock(&w->sync_mu);
+            // fd is now owned by the sync thread; do not close.
+        }
+    } else {
         durable_fsync(fd);
         close(fd);
     }
@@ -261,12 +278,13 @@ walcompact(Wal *w)
 static int
 walsync(Wal *w)
 {
+    // Fast lock-free error check: avoid mutex on every walmaint call.
+    // Only take the mutex for the rare sync handoff or error reset.
     if (w->sync_on) {
-        pthread_mutex_lock(&w->sync_mu);
-        int err = w->sync_err;
-        w->sync_err = 0;
-        pthread_mutex_unlock(&w->sync_mu);
-        if (err) {
+        if (__atomic_load_n(&w->sync_err, __ATOMIC_RELAXED)) {
+            pthread_mutex_lock(&w->sync_mu);
+            w->sync_err = 0;
+            pthread_mutex_unlock(&w->sync_mu);
             twarnx("async fsync failed");
             return 0;
         }
@@ -328,11 +346,16 @@ walwrite(Wal *w, Job *j)
 
 // walmaint performs wal compaction and sync.
 // Returns 1 on success, 0 if WAL was disabled due to error.
+// Compaction is rate-limited to avoid redundant work during pipelining.
 int
 walmaint(Wal *w)
 {
     if (!w->use) return 1;
-    if (!walcompact(w)) return 0;
+    // Rate-limit compaction per WAL instance to avoid redundant work.
+    if (now - w->lastcompact >= 1000000) { // 1ms
+        w->lastcompact = now;
+        if (!walcompact(w)) return 0;
+    }
     if (!walsync(w)) return 0;
     return 1;
 }

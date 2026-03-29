@@ -103,6 +103,7 @@ struct Heap {
 };
 int   heapinsert(Heap *h, void *x);
 void* heapremove(Heap *h, size_t k);
+void  heapresift(Heap *h, size_t k);
 
 
 struct Socket {
@@ -119,6 +120,10 @@ struct Socket {
     // Value of 1 - socket was already added to event notifications,
     // otherwise it is 0.
     int    added;
+
+    // Cached registered event mode to skip redundant epoll_ctl calls.
+    // 0=none, 'r'=read, 'w'=write, 'h'=hangup.
+    char   rw_cached;
 };
 
 int sockinit(void);
@@ -241,13 +246,12 @@ struct Tube {
     uint refs;
     char name[MAX_TUBE_NAME_LEN];
     size_t name_len;                    // cached strlen(name)
+    uint   name_hash;                   // cached tube_name_hash(name)
     Tube *ht_next; // hash table chain for global tube lookup
     Heap ready;
     Heap delay;
     size_t delay_heap_index;    // position in global delay tube heap
     int in_delay_heap;          // 1 if tube is in global delay heap
-    size_t matchable_index;     // position in matchable tube heap
-    int in_matchable;           // 1 if tube is in matchable heap
     size_t pause_heap_index;    // position in global pause tube heap
     int in_pause_heap;          // 1 if tube is in pause heap
     Ms waiting_conns;           // conns waiting for the job at this moment
@@ -315,6 +319,7 @@ Job *allocate_job(int body_size);
 Job *make_job_with_id(uint pri, int64 delay, int64 ttr,
                       int body_size, Tube *tube, uint64 id);
 void job_free(Job *j);
+void job_init_id(int worker_id, int nworkers);
 
 /* Lookup a job by job ID */
 Job *job_find(uint64 job_id);
@@ -328,8 +333,13 @@ Job *job_copy(Job *j);
 
 const char * job_state(Job *j);
 
-void job_list_reset(Job *head);
-int job_list_is_empty(Job *head);
+static inline void job_list_reset(Job *head) {
+    head->prev = head;
+    head->next = head;
+}
+static inline int job_list_is_empty(Job *head) {
+    return head->next == head && head->prev == head;
+}
 Job *job_list_remove(Job *j);
 void job_list_insert(Job *head, Job *j);
 
@@ -340,8 +350,15 @@ size_t get_all_jobs_used(void);
 extern struct Ms tubes;
 
 Tube *make_tube(const char *name);
-void  tube_dref(Tube *t);
-void  tube_iref(Tube *t);
+void  tube_free(Tube *t);
+// Inline fast path: decrement refs, only call tube_free on the rare free path.
+static inline void tube_dref(Tube *t) {
+    if (!t) return;
+    if (t->refs < 1) return; // safety: already zero
+    --t->refs;
+    if (t->refs < 1) tube_free(t);
+}
+static inline void tube_iref(Tube *t) { if (t) ++t->refs; }
 Tube *tube_find(Ms *tubeset, const char *name);
 Tube *tube_find_name(const char *name, size_t len);
 uint  tube_name_hash(const char *name);
@@ -375,6 +392,40 @@ void enqueue_reserved_jobs(Conn *c);
 
 void enter_drain_mode(int sig);
 void h_accept(const int fd, const short which, Server *s);
+
+// Migration message sent alongside the fd via SCM_RIGHTS.
+#define MIG_MSG_MAGIC 0x4D494742  // "MIGB"
+struct MigMsg {
+    uint32 magic;
+    char   use_tube[MAX_TUBE_NAME_LEN];    // c->use->name
+    char   watch_tube[MAX_TUBE_NAME_LEN];  // c->watch->name
+    char   cmd[LINE_BUF_SIZE];             // buffered command data
+    size_t cmd_len;                         // bytes in cmd
+    char   pending_reply[LINE_BUF_SIZE];   // reply to send after migration
+    int    pending_reply_len;
+    byte   type;                            // CONN_TYPE_* flags
+};
+
+void h_accept_migrated(int cfd, Server *s, struct MigMsg *mm);
+
+// Command forwarding between workers for remote tube operations
+// (stats-tube, pause-tube). Sent WITHOUT fd (no SCM_RIGHTS needed).
+#define CMD_FWD_MAGIC  0x434D4446  // "CMDF"
+#define CMD_REPLY_MAGIC 0x52504C59 // "RPLY"
+
+struct CmdFwdMsg {
+    uint32 magic;
+    char   cmd[LINE_BUF_SIZE];
+    size_t cmd_len;
+    int    from_worker;           // who to send reply back to
+};
+
+#define CMD_FWD_REPLY_SIZE 4096
+struct CmdReplyMsg {
+    uint32 magic;
+    char   data[CMD_FWD_REPLY_SIZE];
+    int    data_len;
+};
 int  prot_replay(Server *s, Job *list);
 
 
@@ -427,9 +478,8 @@ struct Conn {
     Job *out_job;               // a job to be sent to the client
     int out_job_sent;           // how many bytes of *out_job were sent already
 
-    Ms  watch;                  // the set of watched tubes by the connection
-    size_t *watch_idx;          // parallel to watch.items: position in each tube's waiting_conns
-    size_t  watch_idx_cap;      // allocated capacity of watch_idx
+    Tube   *watch;              // the single watched tube
+    size_t  watch_idx;          // position in watch->waiting_conns for O(1) removal
     Job reserved_jobs;          // linked list header
 };
 int  conn_less(void *ca, void *cb);
@@ -438,6 +488,9 @@ void connsched(Conn *c);
 void connclose(Conn *c);
 void connsetproducer(Conn *c);
 void connsetworker(Conn *c);
+// Fast-path macros: skip function call when type already set (branch always taken after first call).
+#define CONNSETPRODUCER(c) do { if (likely((c)->type & CONN_TYPE_PRODUCER)) {} else connsetproducer(c); } while(0)
+#define CONNSETWORKER(c) do { if (likely((c)->type & CONN_TYPE_WORKER)) {} else connsetworker(c); } while(0)
 Job *connsoonestjob(Conn *c);
 int  conndeadlinesoon(Conn *c);
 int conn_ready(Conn *c);
@@ -468,6 +521,7 @@ struct Wal {
     int    wantsync; // do we sync to disk?
     int64  syncrate; // how often we sync to disk, in nanoseconds
     int64  lastsync;
+    int64  lastcompact;
 
     // Per-Wal async fsync thread state.
     // Moved from walg.c statics to support multiple Wal instances (sharding).
@@ -519,6 +573,8 @@ int  filewrjobfull(File*, Job*);
 
 #define Portdef "11300"
 
+#define MAX_WORKERS 64
+
 struct Server {
     char *port;
     char *addr;
@@ -536,8 +592,45 @@ struct Server {
     // NULL and nshards=0 when WAL is disabled or legacy single-WAL mode.
     Wal    *shards;
     int    nshards;
+
+    // Multi-process workers. Master forks nworkers children, each with own
+    // SO_REUSEPORT socket, epoll loop, tubes, and WAL shard.
+    int    nworkers;          // 0 = legacy single-process mode
+    int    worker_id;         // -1 for master, 0..N-1 for workers
+    pid_t  worker_pids[MAX_WORKERS]; // master: child PIDs
+    int    peer_fd[MAX_WORKERS];     // Unix sockets to peer workers
+    Conn   *pending_fwd_conn;       // conn waiting for forwarded cmd reply
 };
 void srv_acquire_wal(Server *s);
 int  detect_ncpu(void);
 void srvserve(Server *s);
 void srvaccept(Server *s, int ev);
+
+// SCM_RIGHTS fd passing for connection migration between workers.
+int  send_fd(int sock, int fd, void *buf, size_t buflen);
+int  recv_fd(int sock, void *buf, size_t buflen);
+
+// Shared memory stats for cross-worker aggregation.
+// Each worker writes its own slot; stats command sums all slots.
+#define SHARED_STATS_OPS 26
+#define SHARED_MAX_TUBES 1024
+struct SharedStats {
+    uint64 ready_ct;
+    uint64 delayed_ct;
+    uint64 buried_ct;
+    uint64 reserved_ct;
+    uint64 urgent_ct;
+    uint64 waiting_ct;
+    uint64 timeout_ct;
+    uint64 total_jobs_ct;
+    uint64 op_ct[SHARED_STATS_OPS];
+    uint32 cur_conn_ct;
+    uint32 cur_producer_ct;
+    uint32 cur_worker_ct;
+    uint32 tot_conn_ct;
+    uint32 tube_count;
+    char   tube_names[SHARED_MAX_TUBES][MAX_TUBE_NAME_LEN];
+};
+
+// Pointer to mmap'd array of nworkers SharedStats entries.
+extern struct SharedStats *shared_stats;

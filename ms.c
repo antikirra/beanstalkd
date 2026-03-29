@@ -109,7 +109,7 @@ ms_take(Ms *a)
     // The result of last behaviour is that ms_take returns the oldest elements
     // first, exception is a row of multiple take calls without inserts on ms
     // of even number of elements. See the test.
-    a->last = a->last % a->len;
+    if (a->last >= a->len) a->last = 0;
     item = a->items[a->last];
     ms_delete(a, a->last);
     ++a->last;

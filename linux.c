@@ -48,7 +48,11 @@ sockwant(Socket *s, int rw)
         op = EPOLL_CTL_ADD;
     } else if (!rw) {
         s->added = 0;
+        s->rw_cached = 0;
         op = EPOLL_CTL_DEL;
+    } else if (s->rw_cached == rw) {
+        // Already registered for this mode — skip the syscall.
+        return 0;
     } else {
         op = EPOLL_CTL_MOD;
     }
@@ -65,7 +69,10 @@ sockwant(Socket *s, int rw)
     ev.events |= EPOLLRDHUP | EPOLLPRI;
     ev.data.ptr = s;
 
-    return epoll_ctl(epfd, op, s->fd, &ev);
+    int r = epoll_ctl(epfd, op, s->fd, &ev);
+    if (r == 0)
+        s->rw_cached = rw;
+    return r;
 }
 
 

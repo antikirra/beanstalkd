@@ -73,6 +73,12 @@ make_inet_socket(char *host, char *port)
             close(fd);
             continue;
         }
+        r = setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &flags, sizeof flags);
+        if (r == -1) {
+            twarn("setting SO_REUSEPORT on fd %d", fd);
+            close(fd);
+            continue;
+        }
         r = setsockopt(fd, SOL_SOCKET, SO_LINGER, &linger, sizeof linger);
         if (r == -1) {
             twarn("setting SO_LINGER on fd %d", fd);
@@ -89,21 +95,17 @@ make_inet_socket(char *host, char *port)
         // Hint kernel to deliver incoming packets on the CPU where
         // the listening socket is pinned. Improves cache locality
         // when combined with -t (CPU pinning).
-#ifdef SO_INCOMING_CPU
         if (srv.cpu >= 0) {
             int cpu = srv.cpu;
             setsockopt(fd, SOL_SOCKET, SO_INCOMING_CPU, &cpu, sizeof cpu);
         }
-#endif
 
         // Allow kernel to rehash socket's transport hash for better
         // distribution across RX queues.
-#ifdef SO_TXREHASH
         {
             int val = SOCK_TXREHASH_ENABLED;
             setsockopt(fd, SOL_SOCKET, SO_TXREHASH, &val, sizeof val);
         }
-#endif
 
         if (host == NULL && ai->ai_family == AF_INET6) {
             flags = 0;
@@ -223,6 +225,61 @@ make_unix_socket(char *path)
         return -1;
     }
 
+    return fd;
+}
+
+// Send a file descriptor and auxiliary data over a Unix socket via SCM_RIGHTS.
+// buf/buflen carry the migration message alongside the fd.
+// Returns 0 on success, -1 on error.
+int
+send_fd(int sock, int fd, void *buf, size_t buflen)
+{
+    struct msghdr msg = {0};
+    struct iovec iov = { .iov_base = buf, .iov_len = buflen };
+    char cmsgbuf[CMSG_SPACE(sizeof(int))];
+
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsgbuf;
+    msg.msg_controllen = sizeof(cmsgbuf);
+
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
+
+    ssize_t r = sendmsg(sock, &msg, MSG_NOSIGNAL);
+    if (r == -1) {
+        twarn("send_fd");
+        return -1;
+    }
+    return 0;
+}
+
+// Receive a file descriptor and auxiliary data from a Unix socket via SCM_RIGHTS.
+// buf/buflen receive the migration message.
+// Returns the received fd, or -1 on error.
+int
+recv_fd(int sock, void *buf, size_t buflen)
+{
+    struct msghdr msg = {0};
+    struct iovec iov = { .iov_base = buf, .iov_len = buflen };
+    char cmsgbuf[CMSG_SPACE(sizeof(int))];
+
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsgbuf;
+    msg.msg_controllen = sizeof(cmsgbuf);
+
+    ssize_t r = recvmsg(sock, &msg, 0);
+    if (r <= 0 || (size_t)r < buflen) return -1; // reject partial messages
+
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    if (!cmsg || cmsg->cmsg_type != SCM_RIGHTS) return -1;
+
+    int fd;
+    memcpy(&fd, CMSG_DATA(cmsg), sizeof(int));
     return fd;
 }
 

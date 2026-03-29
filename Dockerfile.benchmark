@@ -22,6 +22,9 @@ RUN make clean && make \
     CFLAGS="-O2 -DNDEBUG" \
     && cp beanstalkd /usr/local/bin/beanstalkd-fork
 
+# ─── Build C benchmark client ──────────────────────────────
+RUN gcc -O2 -o /usr/local/bin/bench test/bench.c -lm
+
 # Clean up build artifacts
 RUN rm -rf /upstream /fork
 

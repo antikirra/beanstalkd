@@ -399,63 +399,6 @@ cttest_prot_remove_tube_no_crash_unpaused()
     tube_dref(t); /* → tube_free → prot_remove_tube (all zero, no-op) */
 }
 
-/* --- matchable heap: tube fields --- */
-
-void
-cttest_matchable_heap_flag_init()
-{
-    Tube *t = make_tube("matchable-init");
-    assertf(t->in_matchable == 0,
-            "fresh tube: in_matchable must be 0, got %d", t->in_matchable);
-    assertf(t->matchable_index == 0,
-            "fresh tube: matchable_index must be 0");
-    tube_dref(t);
-}
-
-/* --- tube_match_less: comparator for matchable heap --- */
-
-void
-cttest_tube_match_less_ordering()
-{
-    now = nanoseconds();
-    prot_init();
-
-    Tube *t1 = tube_find_or_make("match-hi");
-    Tube *t2 = tube_find_or_make("match-lo");
-    tube_iref(t1);
-    tube_iref(t2);
-
-    /* Create jobs with different priorities */
-    Job *j1 = make_job(10, 0, 1, 0, t1); /* priority 10 (higher = lower pri) */
-    Job *j2 = make_job(1, 0, 1, 0, t2);  /* priority 1 (lower = higher pri) */
-
-    /* Insert into ready heaps */
-    heapinsert(&t1->ready, j1);
-    j1->r.state = Ready;
-    heapinsert(&t2->ready, j2);
-    j2->r.state = Ready;
-
-    /* t2 has higher priority job (pri=1 < pri=10) */
-    assertf(t1->ready.len == 1, "t1 must have 1 ready job");
-    assertf(t2->ready.len == 1, "t2 must have 1 ready job");
-
-    /* job_pri_less: lower pri value = higher priority */
-    Job *top1 = t1->ready.data[0];
-    Job *top2 = t2->ready.data[0];
-    assertf(top1->r.pri == 10, "t1 top job pri must be 10");
-    assertf(top2->r.pri == 1, "t2 top job pri must be 1");
-    assertf(job_pri_less(top2, top1) == 1,
-            "job with pri=1 must be less than pri=10");
-
-    /* Clean up */
-    heapremove(&t1->ready, j1->heap_index);
-    heapremove(&t2->ready, j2->heap_index);
-    job_free(j1);
-    job_free(j2);
-    tube_dref(t1);
-    tube_dref(t2);
-}
-
 /* --- ms_remove_at: O(1) hinted removal --- */
 
 void

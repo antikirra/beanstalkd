@@ -3,9 +3,12 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+struct SharedStats *shared_stats = NULL;
 
 struct Server srv = {
     .port = Portdef,
@@ -15,6 +18,8 @@ struct Server srv = {
         .wantsync = 1,
         .syncrate = DEFAULT_FSYNC_MS * 1000000,
     },
+    .nworkers = 0,
+    .worker_id = 0,
 };
 
 // Detect available CPU cores for WAL sharding.
@@ -129,6 +134,65 @@ srv_acquire_wal(Server *s)
     }
 }
 
+// Execute a forwarded command locally and send reply back.
+// Called when a peer worker sends a CmdFwdMsg for stats-tube/pause-tube.
+void prot_handle_forwarded_cmd(Server *s, struct CmdFwdMsg *fwd);
+
+// Per-peer context passed through Socket.x to avoid linear scan.
+struct PeerCtx {
+    Server *srv;
+    int     peer_idx;
+};
+static struct PeerCtx peer_ctx[MAX_WORKERS];
+
+// Handler for incoming data on a peer worker socket.
+// Dispatches migration (MigMsg), command forwarding (CmdFwdMsg),
+// and command replies (CmdReplyMsg) based on message magic.
+static void
+handle_peer(struct PeerCtx *ctx, int ev)
+{
+    UNUSED_PARAMETER(ev);
+    Server *s = ctx->srv;
+    int fd = s->peer_fd[ctx->peer_idx];
+
+    // Peek at the magic to determine message type.
+    uint32 magic = 0;
+    ssize_t r = recv(fd, &magic, sizeof(magic), MSG_PEEK);
+    if (r < (ssize_t)sizeof(magic))
+        return;
+
+    if (magic == MIG_MSG_MAGIC) {
+        struct MigMsg mm;
+        int cfd = recv_fd(fd, &mm, sizeof(mm));
+        if (cfd < 0)
+            return;
+        h_accept_migrated(cfd, s, &mm);
+    } else if (magic == CMD_FWD_MAGIC) {
+        struct CmdFwdMsg fwd;
+        r = read(fd, &fwd, sizeof(fwd));
+        if (r < (ssize_t)sizeof(fwd))
+            return;
+        prot_handle_forwarded_cmd(s, &fwd);
+    } else if (magic == CMD_REPLY_MAGIC) {
+        struct CmdReplyMsg rpl;
+        r = read(fd, &rpl, sizeof(rpl));
+        if (r < (ssize_t)sizeof(rpl))
+            return;
+        // Write reply directly to the waiting connection's socket.
+        if (s->pending_fwd_conn && rpl.data_len > 0) {
+            write(s->pending_fwd_conn->sock.fd, rpl.data, rpl.data_len);
+            s->pending_fwd_conn = NULL;
+        }
+    } else {
+        // Unknown magic — drain the data.
+        char drain[4096];
+        read(fd, drain, sizeof(drain));
+    }
+}
+
+// Per-peer Socket structs for epoll registration.
+static Socket peer_socks[MAX_WORKERS];
+
 void
 srvserve(Server *s)
 {
@@ -149,18 +213,36 @@ srvserve(Server *s)
         exit(2);
     }
 
+    // Register peer worker sockets for migration receive.
+    for (int i = 0; i < s->nworkers; i++) {
+        if (s->peer_fd[i] < 0 || i == s->worker_id)
+            continue;
+        peer_ctx[i].srv = s;
+        peer_ctx[i].peer_idx = i;
+        peer_socks[i].fd = s->peer_fd[i];
+        peer_socks[i].x = &peer_ctx[i];
+        peer_socks[i].f = (Handle)handle_peer;
+        if (sockwant(&peer_socks[i], 'r') == -1) {
+            twarn("sockwant peer %d", i);
+        }
+    }
+
     for (;;) {
         int64 period = prottick(s);
 
-        int rw = socknext(&sock, period);
+        // Drain ALL ready events from the epoll batch before calling
+        // prottick again. Reduces prottick overhead from once-per-event
+        // to once-per-batch (~64 events). Timer accuracy unaffected:
+        // TTR/delay are second-scale, batch processing adds <100us jitter.
+        int rw;
+        while ((rw = socknext(&sock, period)) > 0) {
+            now = nanoseconds();
+            sock->f(sock->x, rw);
+            period = 0; // subsequent calls use zero timeout (non-blocking drain)
+        }
         if (rw == -1) {
             twarnx("socknext");
             exit(1);
-        }
-
-        if (rw) {
-            now = nanoseconds();
-            sock->f(sock->x, rw);
         }
     }
 }

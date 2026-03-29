@@ -267,38 +267,38 @@ PYEOF
 # Runner
 # ═══════════════════════════════════════════════════════════════
 run_full() {
-    local label=$1 bin=$2 port=$3
+    local label=$1 bin=$2 port=$3 extra=${4:-""}
 
     # S1: Throughput
     local w="/tmp/wal-$$-$label-s1"; rm -rf "$w"; mkdir -p "$w"
-    "$bin" -p "$port" -b "$w" -f 50 & local pid=$!; sleep 1
+    "$bin" $extra -p "$port" -b "$w" -f 50 & local pid=$!; sleep 1
     local s1=$(run_throughput "$port")
     local st1=$(get_proc_stats $pid)
     kill $pid 2>/dev/null; wait $pid 2>/dev/null || true
 
     # S2: Multi-tube
     w="/tmp/wal-$$-$label-s2"; rm -rf "$w"; mkdir -p "$w"
-    "$bin" -p "$port" -b "$w" -f 50 & pid=$!; sleep 1
+    "$bin" $extra -p "$port" -b "$w" -f 50 & pid=$!; sleep 1
     local s2=$(run_multitube "$port")
     local st2=$(get_proc_stats $pid)
     kill $pid 2>/dev/null; wait $pid 2>/dev/null || true
 
     # S3: Many tubes (500)
     w="/tmp/wal-$$-$label-s3"; rm -rf "$w"; mkdir -p "$w"
-    "$bin" -p "$port" -b "$w" -f 50 & pid=$!; sleep 1
+    "$bin" $extra -p "$port" -b "$w" -f 50 & pid=$!; sleep 1
     local s3=$(run_many_tubes "$port")
     local st3=$(get_proc_stats $pid)
     kill $pid 2>/dev/null; wait $pid 2>/dev/null || true
 
     # S4: Latency
     w="/tmp/wal-$$-$label-s4"; rm -rf "$w"; mkdir -p "$w"
-    "$bin" -p "$port" -b "$w" -f 50 & pid=$!; sleep 1
+    "$bin" $extra -p "$port" -b "$w" -f 50 & pid=$!; sleep 1
     local s4=$(run_latency "$port")
     kill $pid 2>/dev/null; wait $pid 2>/dev/null || true
 
     # S5: Connection storm
     w="/tmp/wal-$$-$label-s5"; rm -rf "$w"; mkdir -p "$w"
-    "$bin" -p "$port" -b "$w" -f 50 & pid=$!; sleep 1
+    "$bin" $extra -p "$port" -b "$w" -f 50 & pid=$!; sleep 1
     local s5=$(run_conn_storm "$port")
     kill $pid 2>/dev/null; wait $pid 2>/dev/null || true
     rm -rf /tmp/wal-$$-$label-*
@@ -323,7 +323,7 @@ echo "━━━ Running UPSTREAM ━━━"
 run_full "up" "$UPSTREAM" 11600
 echo ""
 echo "━━━ Running FORK ━━━"
-run_full "fk" "$FORK" 11700
+run_full "fk" "$FORK" 11700 "-w 1"
 echo ""
 
 # ═══════════════════════════════════════════════════════════════

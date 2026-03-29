@@ -5,6 +5,14 @@
 
 static uint64 next_id = 1;
 
+void
+job_init_id(int worker_id, int nworkers)
+{
+    if (nworkers > 1) {
+        next_id = (uint64)worker_id + 1;
+    }
+}
+
 // Size-classed free list for O(1) job reuse across varied body sizes.
 // Jobs are allocated at power-of-2 boundaries (64, 128, ..., 65536).
 // Any body_size within a class reuses entries from that class.
@@ -113,31 +121,35 @@ store_job(Job *j)
     all_jobs[index] = j;
     all_jobs_used++;
 
-    rehash_step();
+    if (rehash_old) rehash_step();
 
     /* accept a load factor of 4 */
-    if (!rehash_old && all_jobs_used > (all_jobs_cap << 2))
+    if (!rehash_old && all_jobs_used > (all_jobs_cap << 1))
         rehash_start(1);
 }
 
-Job *
+__attribute__((hot)) Job *
 job_find(uint64 job_id)
 {
     size_t index = job_id % all_jobs_cap;
     Job *jh = all_jobs[index];
 
-    while (jh && jh->r.id != job_id)
+    while (jh && jh->r.id != job_id) {
+        if (jh->ht_next) __builtin_prefetch(jh->ht_next, 0, 1);
         jh = jh->ht_next;
+    }
 
     // Check old table if rehash in progress and not found in new.
     if (!jh && rehash_old) {
         index = job_id % rehash_old_cap;
         jh = rehash_old[index];
-        while (jh && jh->r.id != job_id)
+        while (jh && jh->r.id != job_id) {
+            if (jh->ht_next) __builtin_prefetch(jh->ht_next, 0, 1);
             jh = jh->ht_next;
+        }
     }
 
-    rehash_step();
+    if (rehash_old) rehash_step();
     return jh;
 }
 
@@ -149,7 +161,7 @@ allocate_job(int body_size)
     int asize = cls >= 0 ? (64 << cls) : body_size;
 
     // Reuse from size-class pool. O(1) lookup, guaranteed fit.
-    if (cls >= 0 && pool_head[cls]) {
+    if (likely(cls >= 0 && pool_head[cls])) {
         j = pool_head[cls];
         pool_head[cls] = j->ht_next;
         pool_len[cls]--;
@@ -164,30 +176,14 @@ allocate_job(int body_size)
         }
     }
 
-    // Zero only cold/WAL fields. Hot fields (r.id, r.pri, r.delay, r.ttr,
-    // heap_index, tube, reserver) are set by make_job_with_id or callers.
-    // Avoids touching 3 cache lines when only 1 needs clearing.
+    // Bulk-zero the struct, then set the few non-zero fields.
+    // memset is SIMD-optimized in glibc, faster than 18 individual stores.
+    memset(j, 0, sizeof(Job));
     j->r.created_at = now ? now : nanoseconds();
     j->r.body_size = body_size;
-    j->r.deadline_at = 0;
-    j->r.reserve_ct = 0;
-    j->r.timeout_ct = 0;
-    j->r.release_ct = 0;
-    j->r.bury_ct = 0;
-    j->r.kick_ct = 0;
-    j->r.state = 0;
-    j->heap_index = 0;
-    j->tube = NULL;
-    j->reserver = NULL;
     j->body = (char *)j + sizeof(Job);
     j->prev = j;
     j->next = j;
-    j->ht_next = NULL;
-    j->file = NULL;
-    j->fnext = NULL;
-    j->fprev = NULL;
-    j->walresv = 0;
-    j->walused = 0;
     return j;
 }
 
@@ -205,11 +201,22 @@ make_job_with_id(uint32 pri, int64 delay, int64 ttr,
 
     if (id) {
         j->r.id = id;
-        if (id >= next_id) next_id = id + 1;
-        if (!next_id) next_id = 1;
+        // Advance next_id past recovered ID, maintaining interleaving stride.
+        int step = srv.nworkers > 1 ? srv.nworkers : 1;
+        if (id >= next_id) {
+            // Round up to next valid ID for this worker.
+            uint64 base = (srv.worker_id >= 0 ? srv.worker_id : 0) + 1;
+            next_id = id + step - ((id - base) % step);
+            if (next_id <= id) next_id = id + step; // overflow guard
+        }
+        if (!next_id) next_id = (srv.worker_id >= 0 ? srv.worker_id : 0) + 1;
     } else {
-        j->r.id = next_id++;
-        if (!next_id) next_id = 1;
+        j->r.id = next_id;
+        // In multi-worker mode, IDs are interleaved: worker 0 gets 1,N+1,2N+1,...
+        // worker 1 gets 2,N+2,2N+2,... This guarantees no collisions.
+        int step = srv.nworkers > 1 ? srv.nworkers : 1;
+        next_id += step;
+        if (!next_id) next_id = (srv.worker_id >= 0 ? srv.worker_id : 0) + 1;
     }
     j->r.pri = pri;
     j->r.delay = delay;
@@ -247,11 +254,11 @@ job_hash_free(Job *j)
     }
 
 done:
-    rehash_step();
+    if (rehash_old) rehash_step();
 
     // Downscale when the hashmap is too sparse, but never below initial size.
     // Only when no rehash in progress.
-    if (!rehash_old && cur_prime > 0 && all_jobs_used < (all_jobs_cap >> 4))
+    if (!rehash_old && cur_prime > 0 && all_jobs_used < (all_jobs_cap >> 3))
         rehash_start(0);
 }
 
@@ -350,19 +357,6 @@ job_state(Job *j)
 
 // job_list_reset detaches head from the list,
 // marking the list starting in head pointing to itself.
-void
-job_list_reset(Job *head)
-{
-    head->prev = head;
-    head->next = head;
-}
-
-int
-job_list_is_empty(Job *head)
-{
-    return head->next == head && head->prev == head;
-}
-
 Job *
 job_list_remove(Job *j)
 {

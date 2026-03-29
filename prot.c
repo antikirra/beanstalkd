@@ -19,9 +19,7 @@
 #include <stdarg.h>
 #include <signal.h>
 #include <limits.h>
-#ifdef __GLIBC__
 #include <malloc.h>
-#endif
 
 /* job body cannot be greater than this many bytes long */
 size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
@@ -36,7 +34,7 @@ static Wal *
 shard_wal(Server *s, Job *j)
 {
     if (s->nshards > 0 && s->shards && j->tube) {
-        uint h = tube_name_hash(j->tube->name);
+        uint h = j->tube->name_hash;
         return &s->shards[h % s->nshards];
     }
     return &s->wal;
@@ -46,6 +44,23 @@ shard_wal(Server *s, Job *j)
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ" \
     "abcdefghijklmnopqrstuvwxyz" \
     "0123456789-+/;.$_()"
+
+// Static lookup table for valid tube name characters.
+// Avoids strspn's per-call bitmap construction (~20ns savings).
+static const char valid_name_char[256] = {
+    ['A']=1,['B']=1,['C']=1,['D']=1,['E']=1,['F']=1,['G']=1,['H']=1,
+    ['I']=1,['J']=1,['K']=1,['L']=1,['M']=1,['N']=1,['O']=1,['P']=1,
+    ['Q']=1,['R']=1,['S']=1,['T']=1,['U']=1,['V']=1,['W']=1,['X']=1,
+    ['Y']=1,['Z']=1,
+    ['a']=1,['b']=1,['c']=1,['d']=1,['e']=1,['f']=1,['g']=1,['h']=1,
+    ['i']=1,['j']=1,['k']=1,['l']=1,['m']=1,['n']=1,['o']=1,['p']=1,
+    ['q']=1,['r']=1,['s']=1,['t']=1,['u']=1,['v']=1,['w']=1,['x']=1,
+    ['y']=1,['z']=1,
+    ['0']=1,['1']=1,['2']=1,['3']=1,['4']=1,['5']=1,['6']=1,['7']=1,
+    ['8']=1,['9']=1,
+    ['-']=1,['+']=1,['/']=1,[';']=1,['.']=1,['$']=1,['_']=1,['(']=1,
+    [')']=1,
+};
 
 #define CMD_PUT "put "
 #define CMD_PEEKJOB "peek "
@@ -112,6 +127,7 @@ shard_wal(Server *s, Job *j)
 #define MSG_BURIED_FMT "BURIED %"PRIu64"\r\n"
 #define MSG_INSERTED_FMT "INSERTED %"PRIu64"\r\n"
 #define MSG_NOT_IGNORED "NOT_IGNORED\r\n"
+#define MSG_WATCHING_1  "WATCHING 1\r\n"
 
 #define MSG_OUT_OF_MEMORY "OUT_OF_MEMORY\r\n"
 #define MSG_INTERNAL_ERROR "INTERNAL_ERROR\r\n"
@@ -299,57 +315,15 @@ delay_tube_update(Tube *t)
         return 1;
     }
     if (t->in_delay_heap) {
-        heapremove(&delay_tube_heap, t->delay_heap_index);
+        // Resift in-place: O(log n) single traversal vs remove+insert.
+        heapresift(&delay_tube_heap, t->delay_heap_index);
+        return 1;
     }
     t->in_delay_heap = heapinsert(&delay_tube_heap, t);
     if (!t->in_delay_heap) {
         twarnx("delay_tube_update: OOM inserting tube %s into delay heap", t->name);
     }
     return t->in_delay_heap;
-}
-
-// Matchable tube heap: tubes with ready jobs AND waiting connections.
-// Provides O(1) lookup of the highest-priority matchable job,
-// replacing the O(tubes.len) scan in next_awaited_job().
-static Heap matchable_heap;
-
-static int
-tube_match_less(void *ta, void *tb)
-{
-    Tube *a = ta;
-    Tube *b = tb;
-    if (a->ready.len == 0) return 0;
-    if (b->ready.len == 0) return 1;
-    return job_pri_less(a->ready.data[0], b->ready.data[0]);
-}
-
-static void
-tube_match_setpos(void *t, size_t pos)
-{
-    ((Tube *)t)->matchable_index = pos;
-}
-
-// Update tube's membership in the matchable heap.
-// A tube is matchable when it has ready jobs, waiting connections,
-// and is not paused. Call after any change to these conditions.
-static void
-matchable_update(Tube *t)
-{
-    int dominated = t->ready.len > 0
-                 && t->waiting_conns.len > 0
-                 && !t->pause;
-    if (dominated) {
-        if (t->in_matchable) {
-            heapremove(&matchable_heap, t->matchable_index);
-        }
-        t->in_matchable = heapinsert(&matchable_heap, t);
-        if (!t->in_matchable) {
-            twarnx("matchable_update: OOM inserting tube %s into matchable heap", t->name);
-        }
-    } else if (t->in_matchable) {
-        heapremove(&matchable_heap, t->matchable_index);
-        t->in_matchable = 0;
-    }
 }
 
 // Pause tube heap: paused tubes ordered by unpause_at (soonest first).
@@ -384,7 +358,8 @@ pause_tube_update(Tube *t)
         return;
     }
     if (t->in_pause_heap) {
-        heapremove(&pause_tube_heap, t->pause_heap_index);
+        heapresift(&pause_tube_heap, t->pause_heap_index);
+        return;
     }
     t->in_pause_heap = heapinsert(&pause_tube_heap, t);
     if (!t->in_pause_heap) {
@@ -406,10 +381,6 @@ prot_remove_tube(Tube *t)
     if (t->in_delay_heap) {
         heapremove(&delay_tube_heap, t->delay_heap_index);
         t->in_delay_heap = 0;
-    }
-    if (t->in_matchable) {
-        heapremove(&matchable_heap, t->matchable_index);
-        t->in_matchable = 0;
     }
     if (t->in_pause_heap) {
         heapremove(&pause_tube_heap, t->pause_heap_index);
@@ -493,6 +464,8 @@ epollq_rmconn(Conn *c)
     }
 }
 
+static void conn_want_command(Conn *c);
+
 // Propagate changes to event notification mechanism about expected operations
 // in connections' sockets. Clear the epollq list.
 static void
@@ -504,10 +477,12 @@ epollq_apply()
         c = epollq;
         epollq = epollq->next;
         c->next = NULL;
-        int r = sockwant(&c->sock, c->rw);
-        if (r == -1) {
-            twarn("sockwant");
-            connclose(c);
+        if (c->sock.fd >= 0) {
+            int r = sockwant(&c->sock, c->rw);
+            if (r == -1 && errno != EBADF) {
+                twarn("sockwant");
+                connclose(c);
+            }
         }
     }
 }
@@ -518,7 +493,7 @@ epollq_apply()
 #define reply_serr(c, e) \
     (twarnx("server error: %s", (e)), reply_msg((c), (e)))
 
-static void
+__attribute__((hot)) static void
 reply(Conn *c, char *line, int len, int state)
 {
     if (!c)
@@ -532,9 +507,9 @@ reply(Conn *c, char *line, int len, int state)
     // Saves 2 syscalls per command (epoll_ctl MOD + epoll_wait)
     // by skipping the read→epoll→write→epoll round-trip.
     // Falls through to normal epoll-based send on EAGAIN or partial write.
-    if (state == STATE_SEND_WORD) {
+    if (likely(state == STATE_SEND_WORD)) {
         int r = write(c->sock.fd, line, len);
-        if (r == len) {
+        if (likely(r == len)) {
             c->reply = line;
             c->reply_len = len;
             c->reply_sent = 0;
@@ -542,7 +517,10 @@ reply(Conn *c, char *line, int len, int state)
             if (c->out_job && c->out_job->r.state == Copy)
                 job_free(c->out_job);
             c->out_job = NULL;
-            connsched(c);
+            // Skip heap operations when connection has no pending timeouts.
+            // Pure producers (no reserved jobs, not waiting) don't need scheduling.
+            if (c->in_conns || c->pending_timeout >= 0)
+                connsched(c);
             return;
         }
         // Partial write: record progress, fall through to epoll.
@@ -559,6 +537,52 @@ reply(Conn *c, char *line, int len, int state)
             c->state = STATE_CLOSE;
             return;
         }
+    }
+
+    // Fast path for STATE_SEND_JOB: immediate writev of header + body.
+    // Eliminates 2 syscalls (epoll_ctl MOD + epoll_wait) per reserve/peek.
+    if (state == STATE_SEND_JOB && c->out_job) {
+        struct iovec iov[2];
+        iov[0].iov_base = line;
+        iov[0].iov_len = len;
+        iov[1].iov_base = c->out_job->body;
+        iov[1].iov_len = c->out_job->r.body_size;
+
+        ssize_t total = len + c->out_job->r.body_size;
+        ssize_t r = writev(c->sock.fd, iov, 2);
+        if (r == total) {
+            // Fully sent header + body in one shot.
+            c->reply = line;
+            c->reply_len = len;
+            c->reply_sent = len;
+            c->out_job_sent = c->out_job->r.body_size;
+            if (verbose >= 2) {
+                printf(">%d job %"PRIu64"\n", c->sock.fd, c->out_job->r.id);
+            }
+            conn_want_command(c);
+            return;
+        }
+        if (r > 0) {
+            // Partial write: track progress, fall through to epoll.
+            c->reply = line;
+            c->reply_len = len;
+            c->reply_sent = 0;
+            c->out_job_sent = 0;
+            if (r >= len) {
+                c->reply_sent = len;
+                c->out_job_sent = r - len;
+            } else {
+                c->reply_sent = r;
+            }
+            c->state = STATE_SEND_JOB;
+            epollq_add(c, 'w');
+            return;
+        }
+        if (r == -1 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            c->state = STATE_CLOSE;
+            return;
+        }
+        // EAGAIN: fall through to epoll-based send.
     }
 
     epollq_add(c, 'w');
@@ -594,15 +618,76 @@ reply_line(Conn *c, int state, const char *fmt, ...)
     reply(c, c->reply_buf, r, state);
 }
 
-// reply_job tells the connection c which job to send,
-// and replies with this line: <msg> <job_id> <job_size>.
+// Fast uint64-to-decimal into buffer. Returns pointer to start.
+// buf must have at least 20 bytes. Writes right-to-left.
+static char *
+u64toa(char *end, uint64 v)
+{
+    do {
+        *--end = '0' + (v % 10);
+        v /= 10;
+    } while (v);
+    return end;
+}
+
+// Fast reply for "INSERTED <id>\r\n" — avoids vsnprintf overhead.
+static void
+reply_inserted(Conn *c, uint64 id)
+{
+    char *buf = c->reply_buf;
+    memcpy(buf, "INSERTED ", 9);
+    char numbuf[20];
+    char *numend = numbuf + 20;
+    char *numstart = u64toa(numend, id);
+    int nlen = (int)(numend - numstart);
+    memcpy(buf + 9, numstart, nlen);
+    buf[9 + nlen] = '\r';
+    buf[10 + nlen] = '\n';
+    reply(c, buf, 11 + nlen, STATE_SEND_WORD);
+}
+
+// Fast reply for "USING <name>\r\n" — avoids vsnprintf.
+static void
+reply_using(Conn *c, Tube *t)
+{
+    char *buf = c->reply_buf;
+    memcpy(buf, "USING ", 6);
+    memcpy(buf + 6, t->name, t->name_len);
+    buf[6 + t->name_len] = '\r';
+    buf[7 + t->name_len] = '\n';
+    reply(c, buf, 8 + t->name_len, STATE_SEND_WORD);
+}
+
+// reply_job tells the connection c which job to send.
+// Fast path builds "MSG ID SIZE\r\n" without vsnprintf.
 static void
 reply_job(Conn *c, Job *j, const char *msg)
 {
     c->out_job = j;
     c->out_job_sent = 0;
-    reply_line(c, STATE_SEND_JOB, "%s %"PRIu64" %u\r\n",
-               msg, j->r.id, j->r.body_size - 2);
+
+    char *buf = c->reply_buf;
+    int msglen = strlen(msg);
+    memcpy(buf, msg, msglen);
+    buf[msglen] = ' ';
+    buf += msglen + 1;
+
+    char numbuf[20];
+    char *end = numbuf + 20;
+    char *start = u64toa(end, j->r.id);
+    int nlen = (int)(end - start);
+    memcpy(buf, start, nlen);
+    buf += nlen;
+
+    *buf++ = ' ';
+    start = u64toa(end, j->r.body_size - 2);
+    nlen = (int)(end - start);
+    memcpy(buf, start, nlen);
+    buf += nlen;
+
+    *buf++ = '\r';
+    *buf++ = '\n';
+    reply(c, c->reply_buf, (int)(buf - c->reply_buf), STATE_SEND_JOB);
 }
 
 // remove_waiting_conn unsets CONN_TYPE_WAITING for the connection,
@@ -616,87 +701,39 @@ remove_waiting_conn(Conn *c)
 
     c->type &= ~CONN_TYPE_WAITING;
     global_stat.waiting_ct--;
-    size_t i;
-    for (i = 0; i < c->watch.len; i++) {
-        Tube *t = c->watch.items[i];
-        t->stat.waiting_ct--;
-        ms_remove_at(&t->waiting_conns, c->watch_idx[i], c);
-        matchable_update(t);
-    }
+    Tube *t = c->watch;
+    t->stat.waiting_ct--;
+    ms_remove_at(&t->waiting_conns, c->watch_idx, c);
 }
 
 // enqueue_waiting_conn sets CONN_TYPE_WAITING for the connection,
-// adds it to the waiting_conns set of every tube it's watching.
-// Records each position in c->watch_idx for O(1) removal later.
+// adds it to the waiting_conns of the single watched tube.
 static int
 enqueue_waiting_conn(Conn *c)
 {
-    size_t i;
-
-    // Ensure watch_idx has capacity for all watched tubes.
-    if (c->watch.len > c->watch_idx_cap) {
-        size_t ncap = c->watch_idx_cap ? c->watch_idx_cap * 2 : 4;
-        if (ncap < c->watch.len) ncap = c->watch.len;
-        size_t *p = realloc(c->watch_idx, ncap * sizeof(size_t));
-        if (!p)
-            return 0;
-        c->watch_idx = p;
-        c->watch_idx_cap = ncap;
-    }
-
-    for (i = 0; i < c->watch.len; i++) {
-        Tube *t = c->watch.items[i];
-        if (!ms_append(&t->waiting_conns, c)) {
-            size_t j;
-            for (j = 0; j < i; j++) {
-                Tube *u = c->watch.items[j];
-                ms_remove_at(&u->waiting_conns, c->watch_idx[j], c);
-                u->stat.waiting_ct--;
-                matchable_update(u);
-            }
-            return 0;
-        }
-        c->watch_idx[i] = t->waiting_conns.len - 1;
-        t->stat.waiting_ct++;
-        matchable_update(t);
-    }
+    Tube *t = c->watch;
+    if (!ms_append(&t->waiting_conns, c))
+        return 0;
+    c->watch_idx = t->waiting_conns.len - 1;
+    t->stat.waiting_ct++;
     c->type |= CONN_TYPE_WAITING;
     global_stat.waiting_ct++;
     return 1;
 }
 
-// next_awaited_job returns the highest-priority ready job among all tubes
-// that have both ready jobs and waiting connections. O(1) via matchable heap.
-static Job *
-next_awaited_job()
-{
-    if (matchable_heap.len == 0)
-        return NULL;
-    Tube *t = matchable_heap.data[0];
-    if (t->ready.len == 0 || t->waiting_conns.len == 0)
-        return NULL;
-    return t->ready.data[0];
-}
-
-// process_queue performs reservation for every jobs that is awaited for.
+// process_tube matches ready jobs with waiting connections in a single tube.
 static void
-process_queue()
+process_tube(Tube *t)
 {
-    Job *j = NULL;
-
-    while ((j = next_awaited_job())) {
-        j = remove_ready_job(j);
-        if (j == NULL) {
-            // Impossible: next_awaited_job found a ready job but remove
-            // failed. Break to avoid infinite loop (NASA rule 2).
+    while (t->ready.len > 0 && t->waiting_conns.len > 0 && !t->pause) {
+        Job *j = remove_ready_job(t->ready.data[0]);
+        if (!j) {
             twarnx("job not ready");
             break;
         }
-        Conn *c = ms_take(&j->tube->waiting_conns);
-        if (c == NULL) {
-            // Impossible: next_awaited_job checked waiting_conns.len > 0
-            // but ms_take returned NULL. Re-enqueue the job we just removed
-            // from the ready heap to avoid orphaning it, then break.
+        Conn *c = ms_take(&t->waiting_conns);
+        if (!c) {
+            // Re-enqueue the orphaned job.
             twarnx("waiting_conns is empty");
             heapinsert(&j->tube->ready, j);
             j->r.state = Ready;
@@ -705,12 +742,17 @@ process_queue()
                 global_stat.urgent_ct++;
                 j->tube->stat.urgent_ct++;
             }
-            matchable_update(j->tube);
             break;
         }
         global_stat.reserved_ct++;
 
-        remove_waiting_conn(c);
+        // Clear waiting state directly — ms_take already removed c
+        // from this tube's waiting_conns. Calling remove_waiting_conn()
+        // would try to remove c again (double-removal bug).
+        c->type &= ~CONN_TYPE_WAITING;
+        global_stat.waiting_ct--;
+        t->stat.waiting_ct--;
+
         conn_reserve_job(c, j);
         reply_job(c, j, MSG_RESERVED);
     }
@@ -757,7 +799,7 @@ enqueue_job(Server *s, Job *j, int64 delay, char update_store)
             global_stat.urgent_ct++;
             j->tube->stat.urgent_ct++;
         }
-        matchable_update(j->tube);
+        process_tube(j->tube);
     }
 
     if (update_store) {
@@ -775,7 +817,6 @@ enqueue_job(Server *s, Job *j, int64 delay, char update_store)
                     global_stat.urgent_ct--;
                     j->tube->stat.urgent_ct--;
                 }
-                matchable_update(j->tube);
             }
             return 0;
         }
@@ -965,7 +1006,6 @@ remove_ready_job(Job *j)
         global_stat.urgent_ct--;
         j->tube->stat.urgent_ct--;
     }
-    matchable_update(j->tube);
     return j;
 }
 
@@ -986,14 +1026,10 @@ touch_job(Conn *c, Job *j)
     return false;
 }
 
-static void
+static inline void
 check_err(Conn *c, const char *s)
 {
-    if (errno == EAGAIN)
-        return;
-    if (errno == EINTR)
-        return;
-    if (errno == EWOULDBLOCK)
+    if (likely(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
         return;
 
     twarn("%s", s);
@@ -1041,10 +1077,15 @@ which_cmd(Conn *c)
         TEST_CMD(c->cmd, CMD_PAUSE_TUBE, OP_PAUSE_TUBE);
         break;
     case 'r':
-        TEST_CMD(c->cmd, CMD_RESERVE_TIMEOUT, OP_RESERVE_TIMEOUT);
-        TEST_CMD(c->cmd, CMD_RESERVE_JOB, OP_RESERVE_JOB);
-        TEST_CMD(c->cmd, CMD_RESERVE, OP_RESERVE);
-        TEST_CMD(c->cmd, CMD_RELEASE, OP_RELEASE);
+        // Fast disambiguation: "reserve\r" vs "reserve-..." vs "release "
+        if (c->cmd[2] == 'l') { // reLease
+            TEST_CMD(c->cmd, CMD_RELEASE, OP_RELEASE);
+        } else if (c->cmd_len > 8 && c->cmd[7] == '-') { // reserve-...
+            TEST_CMD(c->cmd, CMD_RESERVE_TIMEOUT, OP_RESERVE_TIMEOUT);
+            TEST_CMD(c->cmd, CMD_RESERVE_JOB, OP_RESERVE_JOB);
+        } else { // bare "reserve\r\n"
+            TEST_CMD(c->cmd, CMD_RESERVE, OP_RESERVE);
+        }
         break;
     case 'd':
         TEST_CMD(c->cmd, CMD_DELETE, OP_DELETE);
@@ -1096,6 +1137,11 @@ fill_extra_data(Conn *c)
 
     /* how many extra bytes did we read? */
     int64 extra_bytes = c->cmd_read - c->cmd_len;
+    if (extra_bytes == 0 && !c->in_job && !c->in_job_read) {
+        c->cmd_read = 0;
+        c->cmd_len = 0;
+        return;
+    }
 
     int64 job_data_bytes = 0;
     /* how many bytes should we put into the job body? */
@@ -1182,8 +1228,7 @@ enqueue_incoming_job(Conn *c)
     if (r == 1) {
         global_stat.total_jobs_ct++;
         j->tube->stat.total_jobs_ct++;
-        process_queue();
-        reply_line(c, STATE_SEND_WORD, MSG_INSERTED_FMT, j->r.id);
+        reply_inserted(c, j->r.id);
         return;
     }
 
@@ -1222,44 +1267,92 @@ fmt_stats(char *buf, size_t size, void *x)
         total_nrec += s->shards[i].nrec;
     }
 
+    // In multi-worker mode, aggregate stats from all workers via shared memory.
+    uint64 agg_urgent = global_stat.urgent_ct;
+    uint64 agg_ready = ready_ct;
+    uint64 agg_reserved = global_stat.reserved_ct;
+    uint64 agg_delayed = delayed_ct;
+    uint64 agg_buried = global_stat.buried_ct;
+    uint64 agg_waiting = global_stat.waiting_ct;
+    uint64 agg_timeout = timeout_ct;
+    uint64 agg_total_jobs = global_stat.total_jobs_ct;
+    uint64 agg_op[TOTAL_OPS];
+    for (int i = 0; i < TOTAL_OPS; i++)
+        agg_op[i] = op_ct[i];
+    uint agg_conns = count_cur_conns();
+    uint agg_producers = count_cur_producers();
+    uint agg_workers = count_cur_workers();
+    uint agg_tot_conns = count_tot_conns();
+    size_t agg_tubes = tubes.len;
+
+    if (shared_stats && s->nworkers > 1) {
+        // Sum stats from ALL workers (including self via shared_stats).
+        agg_urgent = 0; agg_ready = 0; agg_reserved = 0;
+        agg_delayed = 0; agg_buried = 0; agg_waiting = 0;
+        agg_timeout = 0; agg_total_jobs = 0;
+        agg_conns = 0; agg_producers = 0; agg_workers = 0;
+        agg_tot_conns = 0; agg_tubes = 0;
+        for (int i = 0; i < TOTAL_OPS; i++)
+            agg_op[i] = 0;
+
+        for (int w = 0; w < s->nworkers; w++) {
+            struct SharedStats *ss = &shared_stats[w];
+            agg_urgent += ss->urgent_ct;
+            agg_ready += ss->ready_ct;
+            agg_reserved += ss->reserved_ct;
+            agg_delayed += ss->delayed_ct;
+            agg_buried += ss->buried_ct;
+            agg_waiting += ss->waiting_ct;
+            agg_timeout += ss->timeout_ct;
+            agg_total_jobs += ss->total_jobs_ct;
+            agg_conns += ss->cur_conn_ct;
+            agg_producers += ss->cur_producer_ct;
+            agg_workers += ss->cur_worker_ct;
+            agg_tot_conns += ss->tot_conn_ct;
+            agg_tubes += ss->tube_count;
+            for (int i = 0; i < TOTAL_OPS && i < SHARED_STATS_OPS; i++)
+                agg_op[i] += ss->op_ct[i];
+        }
+    }
+
     getrusage(RUSAGE_SELF, &ru); /* don't care if it fails */
     return snprintf(buf, size, STATS_FMT,
-                    global_stat.urgent_ct,
-                    ready_ct,
-                    global_stat.reserved_ct,
-                    delayed_ct,
-                    global_stat.buried_ct,
-                    op_ct[OP_PUT],
-                    op_ct[OP_PEEKJOB],
-                    op_ct[OP_PEEK_READY],
-                    op_ct[OP_PEEK_DELAYED],
-                    op_ct[OP_PEEK_BURIED],
-                    op_ct[OP_RESERVE],
-                    op_ct[OP_RESERVE_TIMEOUT],
-                    op_ct[OP_DELETE],
-                    op_ct[OP_RELEASE],
-                    op_ct[OP_USE],
-                    op_ct[OP_WATCH],
-                    op_ct[OP_IGNORE],
-                    op_ct[OP_BURY],
-                    op_ct[OP_KICK],
-                    op_ct[OP_TOUCH],
-                    op_ct[OP_STATS],
-                    op_ct[OP_STATSJOB],
-                    op_ct[OP_STATS_TUBE],
-                    op_ct[OP_LIST_TUBES],
-                    op_ct[OP_LIST_TUBE_USED],
-                    op_ct[OP_LIST_TUBES_WATCHED],
-                    op_ct[OP_PAUSE_TUBE],
-                    timeout_ct,
-                    global_stat.total_jobs_ct,
+                    agg_urgent,
+                    agg_ready,
+                    agg_reserved,
+                    agg_delayed,
+                    agg_buried,
+                    agg_op[OP_PUT],
+                    agg_op[OP_PEEKJOB],
+                    agg_op[OP_PEEK_READY],
+                    agg_op[OP_PEEK_DELAYED],
+                    agg_op[OP_PEEK_BURIED],
+                    agg_op[OP_RESERVE],
+                    agg_op[OP_RESERVE_TIMEOUT],
+                    agg_op[OP_DELETE],
+                    agg_op[OP_RELEASE],
+                    agg_op[OP_USE],
+                    agg_op[OP_WATCH],
+                    agg_op[OP_IGNORE],
+                    agg_op[OP_BURY],
+                    agg_op[OP_KICK],
+                    agg_op[OP_TOUCH],
+                    agg_op[OP_STATS],
+                    agg_op[OP_STATSJOB],
+                    agg_op[OP_STATS_TUBE],
+                    agg_op[OP_LIST_TUBES],
+                    agg_op[OP_LIST_TUBE_USED],
+                    agg_op[OP_LIST_TUBES_WATCHED],
+                    agg_op[OP_PAUSE_TUBE],
+                    agg_timeout,
+                    agg_total_jobs,
                     job_data_size_limit,
-                    tubes.len,
-                    count_cur_conns(),
-                    count_cur_producers(),
-                    count_cur_workers(),
-                    global_stat.waiting_ct,
-                    count_tot_conns(),
+                    agg_tubes,
+                    agg_conns,
+                    agg_producers,
+                    agg_workers,
+                    agg_waiting,
+                    agg_tot_conns,
                     (long) getpid(),
                     version,
                     (int) ru.ru_utime.tv_sec, (int) ru.ru_utime.tv_usec,
@@ -1283,26 +1376,31 @@ fmt_stats(char *buf, size_t size, void *x)
 static int
 read_uint(uintmax_t *out, uintmax_t max_val, const char *buf, char **end)
 {
-    uintmax_t tnum;
-    char *tend;
-
-    errno = 0;
     while (buf[0] == ' ')
         buf++;
     if (buf[0] < '0' || '9' < buf[0])
         return -1;
-    tnum = strtoumax(buf, &tend, 10);
-    if (tend == buf)
+
+    // Fast base-10 parse without strtoumax overhead (locale, errno).
+    uintmax_t tnum = 0;
+    const char *p = buf;
+    while (*p >= '0' && *p <= '9') {
+        uintmax_t d = *p - '0';
+        // Overflow check: tnum * 10 + d > UINTMAX_MAX
+        if (tnum > (UINTMAX_MAX - d) / 10)
+            return -1;
+        tnum = tnum * 10 + d;
+        p++;
+    }
+    if (p == buf)
         return -1;
-    if (errno)
-        return -1;
-    if (!end && tend[0] != '\0')
+    if (!end && *p != '\0')
         return -1;
     if (tnum > max_val)
         return -1;
 
     if (out) *out = tnum;
-    if (end) *end = tend;
+    if (end) *end = (char *)p;
     return 0;
 }
 
@@ -1348,7 +1446,9 @@ read_tube_name(char **tubename, char *buf, char **end)
 
     while (buf[0] == ' ')
         buf++;
-    len = strspn(buf, NAME_CHARS);
+    len = 0;
+    while (valid_name_char[(unsigned char)buf[len]])
+        len++;
     if (len == 0)
         return -1;
     if (tubename)
@@ -1552,18 +1652,21 @@ remove_reserved_job(Conn *c, Job *j)
 
 // is_valid_tube validates a tube name.
 // Returns the name length on success, 0 on failure.
+// Uses static lookup table instead of strspn for ~20ns savings.
 static size_t
 is_valid_tube(const char *name, size_t max)
 {
     if (name[0] == '\0' || name[0] == '-')
         return 0;
-    size_t len = strspn(name, NAME_CHARS);
+    size_t len = 0;
+    while (valid_name_char[(unsigned char)name[len]])
+        len++;
     if (len == 0 || len > max || name[len] != '\0')
         return 0;
     return len;
 }
 
-static void
+__attribute__((hot)) static void
 dispatch_cmd(Conn *c)
 {
     int r, timeout = -1;
@@ -1581,8 +1684,9 @@ dispatch_cmd(Conn *c)
     /* NUL-terminate this string so we can use strtol and friends */
     c->cmd[c->cmd_len - 2] = '\0';
 
-    /* check for possible maliciousness */
-    if (strlen(c->cmd) != c->cmd_len - 2) {
+    /* Check for embedded NUL bytes (injection attack).
+     * memchr is SIMD-optimized and short-circuits, faster than strlen. */
+    if (memchr(c->cmd, '\0', c->cmd_len - 2) != NULL) {
         reply_msg(c, MSG_BAD_FORMAT);
         return;
     }
@@ -1615,7 +1719,7 @@ dispatch_cmd(Conn *c)
             return;
         }
 
-        connsetproducer(c);
+        CONNSETPRODUCER(c);
 
         if (ttr < 1000000000) {
             ttr = 1000000000;
@@ -1731,7 +1835,7 @@ dispatch_cmd(Conn *c)
             return;
         }
         op_ct[type]++;
-        connsetworker(c);
+        CONNSETWORKER(c);
 
         if (conndeadlinesoon(c) && !conn_ready(c)) {
             reply_msg(c, MSG_DEADLINE_SOON);
@@ -1740,7 +1844,7 @@ dispatch_cmd(Conn *c)
 
         /* try to get a new job for this guy */
         wait_for_job(c, timeout);
-        process_queue();
+        process_tube(c->watch);
         return;
 
     case OP_RESERVE_JOB:
@@ -1778,7 +1882,7 @@ dispatch_cmd(Conn *c)
             return;
         }
 
-        connsetworker(c);
+        CONNSETWORKER(c);
         global_stat.reserved_ct++;
 
         conn_reserve_job(c, j);
@@ -1867,7 +1971,6 @@ dispatch_cmd(Conn *c)
 
         r = enqueue_job(c->srv, j, delay, !!delay);
         if (r == 1) {
-            process_queue();
             reply_msg(c, MSG_RELEASED);
             return;
         }
@@ -1930,7 +2033,6 @@ dispatch_cmd(Conn *c)
         op_ct[type]++;
 
         i = kick_jobs(c->srv, c->use, count);
-        process_queue();
         reply_line(c, STATE_SEND_WORD, "KICKED %u\r\n", i);
         return;
 
@@ -1950,7 +2052,6 @@ dispatch_cmd(Conn *c)
 
         if ((j->r.state == Buried && kick_buried_job(c->srv, j)) ||
             (j->r.state == Delayed && kick_delayed_job(c->srv, j))) {
-            process_queue();
             reply_msg(c, MSG_KICKED);
         } else {
             reply_msg(c, MSG_NOTFOUND);
@@ -2014,6 +2115,27 @@ dispatch_cmd(Conn *c)
 
         t = tube_find_name(name, namelen);
         if (!t) {
+            // In multi-worker mode, forward to the worker that owns this tube.
+            if (c->srv->nworkers > 1) {
+                char tname[MAX_TUBE_NAME_LEN];
+                memcpy(tname, name, namelen);
+                tname[namelen] = '\0';
+                int target = tube_name_hash(tname) % c->srv->nworkers;
+                if (target != c->srv->worker_id && c->srv->peer_fd[target] >= 0
+                    && !c->srv->pending_fwd_conn) {
+                    struct CmdFwdMsg fwd = {0};
+                    fwd.magic = CMD_FWD_MAGIC;
+                    fwd.from_worker = c->srv->worker_id;
+                    memcpy(fwd.cmd, c->cmd, c->cmd_len);
+                    fwd.cmd_len = c->cmd_len;
+                    ssize_t wr = write(c->srv->peer_fd[target], &fwd, sizeof(fwd));
+                    if (wr == (ssize_t)sizeof(fwd)) {
+                        c->srv->pending_fwd_conn = c;
+                        return;
+                    }
+                    // write failed — fall through to NOT_FOUND
+                }
+            }
             reply_msg(c, MSG_NOTFOUND);
             return;
         }
@@ -2029,7 +2151,51 @@ dispatch_cmd(Conn *c)
             return;
         }
         op_ct[type]++;
-        do_list_tubes(c, &tubes);
+
+        // In multi-worker mode, build YAML from all workers' tube names
+        // via shared memory. Avoids creating phantom tube objects.
+        if (shared_stats && c->srv->nworkers > 1) {
+            // Collect unique tube names.
+            char names[SHARED_MAX_TUBES][MAX_TUBE_NAME_LEN];
+            int count = 0;
+            for (int w = 0; w < c->srv->nworkers; w++) {
+                struct SharedStats *ss = &shared_stats[w];
+                for (uint32 ti = 0; ti < ss->tube_count && count < SHARED_MAX_TUBES; ti++) {
+                    // Dedup: linear scan (OK for admin command).
+                    int dup = 0;
+                    for (int k = 0; k < count; k++) {
+                        if (strcmp(names[k], ss->tube_names[ti]) == 0) { dup = 1; break; }
+                    }
+                    if (!dup) {
+                        memcpy(names[count], ss->tube_names[ti], MAX_TUBE_NAME_LEN);
+                        count++;
+                    }
+                }
+            }
+            // Format YAML manually.
+            size_t maxsz = 6 + count * (3 + MAX_TUBE_NAME_LEN);
+            c->out_job = allocate_job(maxsz);
+            if (!c->out_job) {
+                reply_serr(c, MSG_OUT_OF_MEMORY);
+                return;
+            }
+            c->out_job->r.state = Copy;
+            char *buf = c->out_job->body;
+            memcpy(buf, "---\n", 4); buf += 4;
+            for (int i = 0; i < count; i++) {
+                *buf++ = '-'; *buf++ = ' ';
+                size_t nl = strlen(names[i]);
+                memcpy(buf, names[i], nl); buf += nl;
+                *buf++ = '\n';
+            }
+            size_t body_z = buf - c->out_job->body;
+            memcpy(buf, "\r\n", 2);
+            c->out_job->r.body_size = body_z + 2;
+            c->out_job_sent = 0;
+            reply_line(c, STATE_SEND_JOB, "OK %zu\r\n", body_z);
+        } else {
+            do_list_tubes(c, &tubes);
+        }
         return;
 
     case OP_LIST_TUBE_USED:
@@ -2039,7 +2205,7 @@ dispatch_cmd(Conn *c)
             return;
         }
         op_ct[type]++;
-        reply_line(c, STATE_SEND_WORD, "USING %s\r\n", c->use->name);
+        reply_using(c, c->use);
         return;
 
     case OP_LIST_TUBES_WATCHED:
@@ -2049,7 +2215,24 @@ dispatch_cmd(Conn *c)
             return;
         }
         op_ct[type]++;
-        do_list_tubes(c, &c->watch);
+        {
+            // Format: "---\n- <name>\n\r\n"
+            size_t nl = c->watch->name_len;
+            size_t body_z = 4 + 2 + nl + 1; // "---\n" + "- " + name + "\n"
+            c->out_job = allocate_job(body_z + 2); // +2 for "\r\n"
+            if (!c->out_job) {
+                reply_serr(c, MSG_OUT_OF_MEMORY);
+                return;
+            }
+            c->out_job->r.state = Copy;
+            char *buf = c->out_job->body;
+            memcpy(buf, "---\n- ", 6); buf += 6;
+            memcpy(buf, c->watch->name, nl); buf += nl;
+            *buf++ = '\n';
+            memcpy(buf, "\r\n", 2);
+            c->out_job_sent = 0;
+            reply_line(c, STATE_SEND_JOB, "OK %zu\r\n", body_z);
+        }
         return;
 
     case OP_USE:
@@ -2060,6 +2243,44 @@ dispatch_cmd(Conn *c)
         }
         op_ct[type]++;
 
+        // In multi-worker mode, `use` also migrates the connection
+        // to the worker owning this tube (same as watch).
+        // This ensures put/kick/peek-* operate on the correct worker.
+        if (c->srv->nworkers > 1) {
+            int target = tube_name_hash(name) % c->srv->nworkers;
+            if (target != c->srv->worker_id && c->srv->peer_fd[target] >= 0) {
+                if (!job_list_is_empty(&c->reserved_jobs))
+                    goto use_local; // can't migrate with reserved jobs
+
+                struct MigMsg mm = {0};
+                mm.magic = MIG_MSG_MAGIC;
+                size_t nl = strlen(name);
+                memcpy(mm.watch_tube, name, nl);
+                memcpy(mm.use_tube, name, nl);
+                mm.type = c->type;
+
+                // Pending reply for the use command.
+                mm.pending_reply_len = snprintf(mm.pending_reply,
+                    sizeof(mm.pending_reply), "USING %s\r\n", name);
+
+                // Pipeline remainder.
+                size_t consumed = c->cmd_len;
+                size_t leftover = c->cmd_read > consumed ? c->cmd_read - consumed : 0;
+                if (leftover > 0 && leftover <= sizeof(mm.cmd)) {
+                    memcpy(mm.cmd, c->cmd + consumed, leftover);
+                    mm.cmd_len = leftover;
+                }
+
+                if (send_fd(c->srv->peer_fd[target], c->sock.fd, &mm, sizeof(mm)) == 0) {
+                    c->sock.fd = -1;
+                    remove_waiting_conn(c);
+                    c->state = STATE_CLOSE;
+                    return;
+                }
+            }
+        }
+
+use_local:
         TUBE_ASSIGN(t, tube_find_or_make(name));
         if (!t) {
             reply_serr(c, MSG_OUT_OF_MEMORY);
@@ -2071,7 +2292,17 @@ dispatch_cmd(Conn *c)
         TUBE_ASSIGN(t, NULL);
         c->use->using_ct++;
 
-        reply_line(c, STATE_SEND_WORD, "USING %s\r\n", c->use->name);
+        // In multi-worker mode, also update watch to keep use==watch on same worker.
+        if (c->srv->nworkers > 1 && c->watch != c->use) {
+            remove_waiting_conn(c);
+            c->watch->watching_ct--;
+            tube_dref(c->watch);
+            c->watch = c->use;
+            tube_iref(c->watch);
+            c->watch->watching_ct++;
+        }
+
+        reply_using(c, c->use);
         return;
 
     case OP_WATCH:
@@ -2082,21 +2313,71 @@ dispatch_cmd(Conn *c)
         }
         op_ct[type]++;
 
+        // In multi-worker mode, check if this tube belongs to another worker.
+        if (c->srv->nworkers > 1) {
+            int target = tube_name_hash(name) % c->srv->nworkers;
+            if (target != c->srv->worker_id && c->srv->peer_fd[target] >= 0) {
+                // Cannot migrate if connection has reserved jobs.
+                if (!job_list_is_empty(&c->reserved_jobs))
+                    goto watch_local;
+
+                // Prepare migration message with pending reply.
+                struct MigMsg mm = {0};
+                mm.magic = MIG_MSG_MAGIC;
+                size_t nl = strlen(name);
+                memcpy(mm.watch_tube, name, nl);
+                memcpy(mm.use_tube, name, nl); // use == watch in multi-worker
+                mm.type = c->type;
+
+                // Include pending reply so client sees WATCHING 1.
+                memcpy(mm.pending_reply, "WATCHING 1\r\n", 12);
+                mm.pending_reply_len = 12;
+
+                // Copy any pipelined data remaining in cmd buffer.
+                size_t consumed = c->cmd_len;
+                size_t leftover = c->cmd_read > consumed ? c->cmd_read - consumed : 0;
+                if (leftover > 0 && leftover <= sizeof(mm.cmd)) {
+                    memcpy(mm.cmd, c->cmd + consumed, leftover);
+                    mm.cmd_len = leftover;
+                }
+
+                if (send_fd(c->srv->peer_fd[target], c->sock.fd, &mm, sizeof(mm)) == 0) {
+                    // Detach fd without closing — the receiving worker owns it now.
+                    c->sock.fd = -1;
+                    remove_waiting_conn(c);
+                    c->state = STATE_CLOSE;
+                    return;
+                }
+                // send_fd failed — fall through to local handling.
+            }
+        }
+
+watch_local:
         TUBE_ASSIGN(t, tube_find_or_make(name));
         if (!t) {
             reply_serr(c, MSG_OUT_OF_MEMORY);
             return;
         }
 
-        r = 1;
-        if (!ms_contains(&c->watch, t))
-            r = ms_append(&c->watch, t);
-        TUBE_ASSIGN(t, NULL);
-        if (!r) {
-            reply_serr(c, MSG_OUT_OF_MEMORY);
-            return;
+        if (c->watch != t) {
+            // If currently waiting, unregister from old tube first.
+            remove_waiting_conn(c);
+            c->watch->watching_ct--;
+            tube_dref(c->watch);
+            c->watch = t;
+            tube_iref(t);
+            c->watch->watching_ct++;
         }
-        reply_line(c, STATE_SEND_WORD, "WATCHING %zu\r\n", c->watch.len);
+
+        // In multi-worker mode, keep use == watch on same worker.
+        if (c->srv->nworkers > 1 && c->use != c->watch) {
+            c->use->using_ct--;
+            TUBE_ASSIGN(c->use, c->watch);
+            c->use->using_ct++;
+        }
+
+        TUBE_ASSIGN(t, NULL);
+        reply_msg(c, MSG_WATCHING_1);
         return;
 
     case OP_IGNORE:
@@ -2107,16 +2388,13 @@ dispatch_cmd(Conn *c)
         }
         op_ct[type]++;
 
-        t = tube_find(&c->watch, name);
-        if (t && c->watch.len < 2) {
+        // Cannot ignore the only watched tube.
+        if (c->watch && strncmp(c->watch->name, name, MAX_TUBE_NAME_LEN) == 0) {
             reply_msg(c, MSG_NOT_IGNORED);
             return;
         }
-
-        if (t)
-            ms_remove(&c->watch, t); /* may free t if refcount => 0 */
-        t = NULL;
-        reply_line(c, STATE_SEND_WORD, "WATCHING %zu\r\n", c->watch.len);
+        // Tube not watched — no-op.
+        reply_msg(c, MSG_WATCHING_1);
         return;
 
     case OP_QUIT:
@@ -2140,6 +2418,27 @@ dispatch_cmd(Conn *c)
         }
         t = tube_find_name(name, namelen);
         if (!t) {
+            // In multi-worker mode, forward to the owner worker.
+            if (c->srv->nworkers > 1) {
+                char tname[MAX_TUBE_NAME_LEN];
+                memcpy(tname, name, namelen);
+                tname[namelen] = '\0';
+                int target = tube_name_hash(tname) % c->srv->nworkers;
+                if (target != c->srv->worker_id && c->srv->peer_fd[target] >= 0
+                    && !c->srv->pending_fwd_conn) {
+                    struct CmdFwdMsg fwd = {0};
+                    fwd.magic = CMD_FWD_MAGIC;
+                    fwd.from_worker = c->srv->worker_id;
+                    memcpy(fwd.cmd, c->cmd, c->cmd_len);
+                    fwd.cmd_len = c->cmd_len;
+                    ssize_t wr = write(c->srv->peer_fd[target], &fwd, sizeof(fwd));
+                    if (wr == (ssize_t)sizeof(fwd)) {
+                        c->srv->pending_fwd_conn = c;
+                        return;
+                    }
+                    // write failed — fall through to NOT_FOUND
+                }
+            }
             reply_msg(c, MSG_NOTFOUND);
             return;
         }
@@ -2155,10 +2454,9 @@ dispatch_cmd(Conn *c)
             paused_ct++;
         t->pause = delay;
         t->stat.pause_ct++;
-        matchable_update(t);
         pause_tube_update(t);
 
-        reply_line(c, STATE_SEND_WORD, "PAUSED\r\n");
+        reply_msg(c, "PAUSED\r\n");
         return;
     }
 
@@ -2242,7 +2540,7 @@ conn_want_command(Conn *c)
     c->state = STATE_WANT_COMMAND;
 }
 
-static void
+__attribute__((hot)) static void
 conn_process_io(Conn *c)
 {
     int r;
@@ -2250,14 +2548,9 @@ conn_process_io(Conn *c)
     Job *j;
     struct iovec iov[2];
 
-    // Disable delayed ACK for this connection's current exchange.
-    // Kernel resets this after each recv, so we set it every time.
-    // Eliminates up to 40ms delayed ACK penalty in request-response patterns.
-    int quickack = 1;
-    setsockopt(c->sock.fd, IPPROTO_TCP, TCP_QUICKACK, &quickack, sizeof quickack);
-
     switch (c->state) {
-    case STATE_WANT_COMMAND:
+    case STATE_WANT_COMMAND: {
+        // TCP_QUICKACK is now set once in h_conn before conn_process_io.
         r = read(c->sock.fd, c->cmd + c->cmd_read, LINE_BUF_SIZE - c->cmd_read);
         if (r == -1) {
             check_err(c, "read()");
@@ -2286,7 +2579,7 @@ conn_process_io(Conn *c)
         }
         // We have an incomplete line, so just keep waiting.
         return;
-
+    }
     case STATE_WANT_ENDLINE:
         r = read(c->sock.fd, c->cmd + c->cmd_read, LINE_BUF_SIZE - c->cmd_read);
         if (r == -1) {
@@ -2339,7 +2632,8 @@ conn_process_io(Conn *c)
         }
         return;
     }
-    case STATE_WANT_DATA:
+    case STATE_WANT_DATA: {
+        // TCP_QUICKACK is set once in h_conn before conn_process_io.
         j = c->in_job;
 
         r = read(c->sock.fd, j->body + c->in_job_read, j->r.body_size -c->in_job_read);
@@ -2358,6 +2652,7 @@ conn_process_io(Conn *c)
 
         maybe_enqueue_incoming_job(c);
         return;
+    }
     case STATE_SEND_WORD:
         r= write(c->sock.fd, c->reply + c->reply_sent, c->reply_len - c->reply_sent);
         if (r == -1) {
@@ -2432,7 +2727,7 @@ conn_process_io(Conn *c)
 #define want_command(c) ((c)->sock.fd && ((c)->state == STATE_WANT_COMMAND))
 #define cmd_data_ready(c) (want_command(c) && (c)->cmd_read)
 
-static void
+__attribute__((hot)) static void
 h_conn(const int fd, const short which, Conn *c)
 {
     if (fd != c->sock.fd) {
@@ -2447,21 +2742,35 @@ h_conn(const int fd, const short which, Conn *c)
         c->halfclosed = 1;
     }
 
-    conn_process_io(c);
-
-    // Cork the socket before dispatching commands: coalesce multiple
-    // replies into a single TCP segment when processing pipelined commands.
-    int cork = 1;
-    setsockopt(c->sock.fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof cork);
-
-    while (cmd_data_ready(c) && (c->cmd_len = scan_line_end(c->cmd, c->cmd_read))) {
-        dispatch_cmd(c);
-        fill_extra_data(c);
+    // Set TCP_QUICKACK once per epoll event (not per read in conn_process_io).
+    // Saves ~150ns per command by avoiding redundant setsockopt in the read loop.
+    if (which == 'r') {
+        int quickack = 1;
+        setsockopt(c->sock.fd, IPPROTO_TCP, TCP_QUICKACK, &quickack, sizeof quickack);
     }
 
-    // Uncork: flush all coalesced replies as one TCP segment.
-    cork = 0;
-    setsockopt(c->sock.fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof cork);
+    conn_process_io(c);
+
+    // Dispatch commands. Cork only if pipelining detected (multiple
+    // commands buffered), saving 2 setsockopt syscalls (~400ns) for the
+    // common non-pipelined case.
+    int corked = 0;
+    while (cmd_data_ready(c) && (c->cmd_len = scan_line_end(c->cmd, c->cmd_read))) {
+        // Cork before second command to coalesce replies.
+        if (!corked && c->cmd_read > c->cmd_len) {
+            int cork = 1;
+            setsockopt(c->sock.fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof cork);
+            corked = 1;
+        }
+        dispatch_cmd(c);
+        if (c->sock.fd < 0)
+            break;
+        fill_extra_data(c);
+    }
+    if (corked && c->sock.fd >= 0) {
+        int cork = 0;
+        setsockopt(c->sock.fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof cork);
+    }
 
     if (c->state == STATE_CLOSE) {
         epollq_rmconn(c);
@@ -2515,7 +2824,7 @@ prottick(Server *s)
         t->in_pause_heap = 0;
         t->pause = 0;
         paused_ct--;
-        matchable_update(t);
+        process_tube(t);
     }
 
     // Process connections with pending timeouts. Release jobs with expired ttr.
@@ -2532,15 +2841,9 @@ prottick(Server *s)
         conn_timeout(c);
     }
 
-    // Match ready jobs with waiting connections only if something
-    // changed above (delayed→ready, unpause, timeout). Skip when idle.
-    if (matchable_heap.len > 0)
-        process_queue();
-
     // Periodically return unused heap pages to the OS.
     // Addresses glibc not releasing memory after mass job deletion.
     // Controlled by -m flag; 0 disables.
-#ifdef __GLIBC__
     if (mem_trim_rate > 0) {
         static int64 last_trim;
         if (now - last_trim >= mem_trim_rate) {
@@ -2548,11 +2851,62 @@ prottick(Server *s)
             last_trim = now;
         }
     }
-#endif
+
+    // Update shared memory stats for cross-worker aggregation.
+    // Rate-limited to once per second to avoid cache line bouncing.
+    if (shared_stats && s->worker_id >= 0) {
+        static int64 last_stats_sync;
+        if (now - last_stats_sync >= 1000000000LL) { // 1 second
+            last_stats_sync = now;
+            struct SharedStats *ss = &shared_stats[s->worker_id];
+            ss->ready_ct = ready_ct;
+            ss->delayed_ct = delayed_ct;
+            ss->buried_ct = global_stat.buried_ct;
+            ss->reserved_ct = global_stat.reserved_ct;
+            ss->urgent_ct = global_stat.urgent_ct;
+            ss->waiting_ct = global_stat.waiting_ct;
+            ss->timeout_ct = timeout_ct;
+            ss->total_jobs_ct = global_stat.total_jobs_ct;
+            ss->cur_conn_ct = count_cur_conns();
+            ss->cur_producer_ct = count_cur_producers();
+            ss->cur_worker_ct = count_cur_workers();
+            ss->tot_conn_ct = count_tot_conns();
+            ss->tube_count = tubes.len < SHARED_MAX_TUBES ? tubes.len : SHARED_MAX_TUBES;
+            for (size_t ti = 0; ti < ss->tube_count; ti++) {
+                Tube *tt = tubes.items[ti];
+                memcpy(ss->tube_names[ti], tt->name, tt->name_len + 1);
+            }
+            for (int i = 0; i < TOTAL_OPS && i < SHARED_STATS_OPS; i++)
+                ss->op_ct[i] = op_ct[i];
+        }
+    }
 
     epollq_apply();
 
     return period;
+}
+
+// Try to extract tube name from a command buffer.
+// Returns pointer to tube name within buf (NUL-terminated in place), or NULL.
+static char *
+parse_tube_from_first_cmd(char *buf, size_t len)
+{
+    // Find \r\n to ensure we have a complete command.
+    size_t i;
+    for (i = 1; i < len; i++) {
+        if (buf[i-1] == '\r' && buf[i] == '\n')
+            break;
+    }
+    if (i >= len)
+        return NULL; // incomplete command
+
+    buf[i-1] = '\0'; // NUL-terminate command (overwrite \r)
+
+    if (strncmp(buf, CMD_WATCH, CMD_WATCH_LEN) == 0)
+        return buf + CMD_WATCH_LEN;
+    if (strncmp(buf, CMD_USE, CMD_USE_LEN) == 0)
+        return buf + CMD_USE_LEN;
+    return NULL;
 }
 
 void
@@ -2583,7 +2937,62 @@ h_accept(const int fd, const short which, Server *s)
         int flags = 1;
         setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &flags, sizeof flags);
 
-        Conn *c = make_conn(cfd, STATE_WANT_COMMAND, default_tube, default_tube);
+        // In multi-worker mode, speculatively read the first command
+        // to determine which worker should own this connection.
+        char first_buf[LINE_BUF_SIZE];
+        ssize_t nr = 0;
+        char *tube_name = NULL;
+
+        if (s->nworkers > 1) {
+            nr = read(cfd, first_buf, sizeof(first_buf) - 1);
+            if (nr > 0) {
+                first_buf[nr] = '\0';
+                // Make a copy for parsing (parse_tube_from_first_cmd modifies buf).
+                char parse_buf[LINE_BUF_SIZE];
+                memcpy(parse_buf, first_buf, nr + 1);
+                tube_name = parse_tube_from_first_cmd(parse_buf, nr);
+
+                if (tube_name && is_valid_tube(tube_name, MAX_TUBE_NAME_LEN - 1)) {
+                    size_t tnlen = strlen(tube_name);
+                    int target = tube_name_hash(tube_name) % s->nworkers;
+                    if (target != s->worker_id && s->peer_fd[target] >= 0) {
+                        // Migrate fd to the correct worker.
+                        struct MigMsg mm = {0};
+                        mm.magic = MIG_MSG_MAGIC;
+                        memcpy(mm.watch_tube, tube_name, tnlen);
+                        memcpy(mm.use_tube, tube_name, tnlen);
+                        memcpy(mm.cmd, first_buf, nr);
+                        mm.cmd_len = nr;
+                        if (send_fd(s->peer_fd[target], cfd, &mm, sizeof(mm)) == 0) {
+                            close(cfd);
+                            continue;
+                        }
+                        // send_fd failed — fall through to local handling.
+                    }
+                }
+            }
+            // nr <= 0 or tube not parsed or target == self: handle locally.
+        }
+
+        // Route "default" tube connections deterministically to one worker.
+        if (s->nworkers > 1 && nr <= 0) {
+            int dtarget = tube_name_hash("default") % s->nworkers;
+            if (dtarget != s->worker_id && s->peer_fd[dtarget] >= 0) {
+                struct MigMsg mm = {0};
+                mm.magic = MIG_MSG_MAGIC;
+                memcpy(mm.watch_tube, "default", 7);
+                memcpy(mm.use_tube, "default", 7);
+                if (send_fd(s->peer_fd[dtarget], cfd, &mm, sizeof(mm)) == 0) {
+                    close(cfd);
+                    continue;
+                }
+            }
+        }
+
+        Tube *use_tube = default_tube;
+        Tube *watch_tube = default_tube;
+
+        Conn *c = make_conn(cfd, STATE_WANT_COMMAND, use_tube, watch_tube);
         if (!c) {
             twarnx("make_conn() failed");
             close(cfd);
@@ -2597,11 +3006,167 @@ h_accept(const int fd, const short which, Server *s)
         c->sock.f = (Handle)prothandle;
         c->sock.fd = cfd;
 
+        // If we already read data, copy it into the connection's cmd buffer
+        // and dispatch any complete commands immediately. Without this,
+        // the data is stranded: the kernel buffer is drained, epoll won't
+        // fire, and pipelined commands never get processed.
+        if (nr > 0) {
+            size_t to_copy = (size_t)nr < sizeof(c->cmd) ? (size_t)nr : sizeof(c->cmd);
+            memcpy(c->cmd, first_buf, to_copy);
+            c->cmd_read = to_copy;
+
+            // Dispatch loop matching h_conn's pipeline processing.
+            while (c->state == STATE_WANT_COMMAND && c->cmd_read > 0
+                   && (c->cmd_len = scan_line_end(c->cmd, c->cmd_read))) {
+                dispatch_cmd(c);
+                if (c->sock.fd < 0) break; // migrated
+                fill_extra_data(c);
+            }
+            if (c->sock.fd < 0 || c->state == STATE_CLOSE) {
+                connclose(c);
+                continue;
+            }
+        }
+
         if (sockwant(&c->sock, 'r') == -1) {
             twarn("sockwant");
             connclose(c);
             continue;
         }
+    }
+    epollq_apply();
+}
+
+// Handle a forwarded command from a peer worker.
+// Executes stats-tube or pause-tube locally, sends reply back via peer socket.
+void
+prot_handle_forwarded_cmd(Server *s, struct CmdFwdMsg *fwd)
+{
+    struct CmdReplyMsg rpl = {0};
+    rpl.magic = CMD_REPLY_MAGIC;
+
+    // Parse the forwarded command.
+    char *cmd = fwd->cmd;
+    size_t len = fwd->cmd_len;
+
+    // NUL-terminate for string ops.
+    if (len >= LINE_BUF_SIZE) len = LINE_BUF_SIZE - 1;
+    cmd[len] = '\0';
+
+    if (strncmp(cmd, "stats-tube ", 11) == 0) {
+        char *name = cmd + 11;
+        // Strip \r\n
+        size_t nl = strlen(name);
+        if (nl >= 2 && name[nl-2] == '\r') name[nl-2] = '\0';
+
+        Tube *t = tube_find_name(name, strlen(name));
+        if (t) {
+            char buf[STATS_BUF_SIZE];
+            int n = fmt_stats_tube(buf, sizeof(buf), t);
+            if (n > 0 && n < CMD_FWD_REPLY_SIZE - 32) {
+                // fmt_stats_tube output already ends with \r\n.
+                rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE,
+                    "OK %d\r\n%s", n, buf);
+            }
+        } else {
+            rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE, "NOT_FOUND\r\n");
+        }
+    } else if (strncmp(cmd, "pause-tube ", 11) == 0) {
+        // Parse: pause-tube <name> <delay>\r\n
+        char *name = cmd + 11;
+        char *sp = strchr(name, ' ');
+        if (sp) {
+            *sp = '\0';
+            char *delay_str = sp + 1;
+            Tube *t = tube_find_name(name, strlen(name));
+            if (t) {
+                // Parse delay and apply pause.
+                int64 delay = 0;
+                errno = 0;
+                char *end = NULL;
+                unsigned long long v = strtoull(delay_str, &end, 10);
+                if (!errno && end != delay_str) {
+                    delay = (int64)v * 1000000000;
+                    if (delay == 0) delay = 1;
+                    t->unpause_at = nanoseconds() + delay;
+                    if (!t->pause) paused_ct++;
+                    t->pause = delay;
+                    t->stat.pause_ct++;
+                    pause_tube_update(t);
+                }
+                rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE, "PAUSED\r\n");
+            } else {
+                rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE, "NOT_FOUND\r\n");
+            }
+        } else {
+            rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE, "BAD_FORMAT\r\n");
+        }
+    } else {
+        rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE, "UNKNOWN_COMMAND\r\n");
+    }
+
+    // Send reply back to originating worker.
+    if (fwd->from_worker >= 0 && fwd->from_worker < s->nworkers
+        && s->peer_fd[fwd->from_worker] >= 0) {
+        write(s->peer_fd[fwd->from_worker], &rpl, sizeof(rpl));
+    }
+}
+
+// Accept a migrated connection from a peer worker.
+// Creates a Conn, sets up tubes from MigMsg, replays buffered command.
+void
+h_accept_migrated(int cfd, Server *s, struct MigMsg *mm)
+{
+    Tube *use = tube_find_or_make(mm->use_tube);
+    if (!use) use = default_tube;
+    Tube *watch = tube_find_or_make(mm->watch_tube);
+    if (!watch) watch = default_tube;
+
+    Conn *c = make_conn(cfd, STATE_WANT_COMMAND, use, watch);
+    if (!c) {
+        close(cfd);
+        return;
+    }
+    c->srv = s;
+    c->sock.x = c;
+    c->sock.f = (Handle)prothandle;
+    c->sock.fd = cfd;
+
+    // Send pending reply if present (e.g., "WATCHING 1\r\n" from watch cmd).
+    // Best-effort on nonblocking socket; reply is small, should succeed.
+    if (mm->pending_reply_len > 0) {
+        ssize_t wr = write(cfd, mm->pending_reply, mm->pending_reply_len);
+        if (wr == -1 && errno != EAGAIN) {
+            connclose(c);
+            return;
+        }
+    }
+
+    // Replay ALL buffered commands (not just the first one).
+    // Without a full dispatch loop, pipelined commands are stranded:
+    // the kernel buffer is empty (data forwarded in MigMsg), epoll
+    // won't fire, and remaining commands never get processed.
+    if (mm->cmd_len > 0 && mm->cmd_len <= sizeof(c->cmd)) {
+        memcpy(c->cmd, mm->cmd, mm->cmd_len);
+        c->cmd_read = mm->cmd_len;
+        while (c->state == STATE_WANT_COMMAND && c->cmd_read > 0
+               && (c->cmd_len = scan_line_end(c->cmd, c->cmd_read))) {
+            dispatch_cmd(c);
+            if (c->sock.fd < 0) break; // re-migrated
+            fill_extra_data(c);
+        }
+        if (c->sock.fd < 0) return; // connection migrated away
+    }
+
+    if (c->state == STATE_CLOSE) {
+        connclose(c);
+        epollq_apply();
+        return;
+    }
+
+    if (sockwant(&c->sock, 'r') == -1) {
+        twarn("sockwant migrated fd");
+        connclose(c);
     }
     epollq_apply();
 }
@@ -2640,8 +3205,6 @@ prot_init()
 
     delay_tube_heap.less = tube_delay_less;
     delay_tube_heap.setpos = tube_delay_setpos;
-    matchable_heap.less = tube_match_less;
-    matchable_heap.setpos = tube_match_setpos;
     pause_tube_heap.less = tube_pause_less;
     pause_tube_heap.setpos = tube_pause_setpos;
 
@@ -2699,6 +3262,5 @@ prot_replay(Server *s, Job *list)
             }
         }
     }
-    process_queue();
     return ok;
 }

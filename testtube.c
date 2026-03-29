@@ -158,7 +158,7 @@ cttest_tube_name_truncation()
 void
 cttest_tube_find_in_watch_set()
 {
-    /* tube_find with Ms (per-connection watch set) must use linear scan */
+    /* tube_find with Ms must use linear scan */
     Ms watch;
     ms_init(&watch, NULL, NULL);
 

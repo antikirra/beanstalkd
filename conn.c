@@ -13,39 +13,31 @@ static uint cur_conn_ct = 0, cur_worker_ct = 0, cur_producer_ct = 0;
 static uint tot_conn_ct = 0;
 int verbose = 0;
 
-static void
-on_watch(Ms *a, Tube *t, size_t i)
-{
-    UNUSED_PARAMETER(a);
-    UNUSED_PARAMETER(i);
-    tube_iref(t);
-    t->watching_ct++;
-}
-
-static void
-on_ignore(Ms *a, Tube *t, size_t i)
-{
-    UNUSED_PARAMETER(a);
-    UNUSED_PARAMETER(i);
-    t->watching_ct--;
-    tube_dref(t);
-}
+// Conn slab pool: reuse freed Conn structs to avoid malloc/free per connection.
+// Uses ht_next-style linking via the 'next' pointer (safe: conn removed from epollq).
+#define CONN_POOL_MAX 256
+static Conn *conn_pool = NULL;
+static int conn_pool_len = 0;
 
 Conn *
 make_conn(int fd, char start_state, Tube *use, Tube *watch)
 {
-    Conn *c = new(Conn);
+    Conn *c;
+    if (conn_pool) {
+        c = conn_pool;
+        conn_pool = c->next;
+        conn_pool_len--;
+        memset(c, 0, sizeof(Conn));
+    } else {
+        c = new(Conn);
+    }
     if (!c) {
         twarn("OOM");
         return NULL;
     }
 
-    ms_init(&c->watch, (ms_event_fn) on_watch, (ms_event_fn) on_ignore);
-    if (!ms_append(&c->watch, watch)) {
-        free(c);
-        twarn("OOM");
-        return NULL;
-    }
+    TUBE_ASSIGN(c->watch, watch);
+    c->watch->watching_ct++;
 
     TUBE_ASSIGN(c->use, use);
     use->using_ct++;
@@ -156,9 +148,9 @@ connsched(Conn *c)
 
 // conn_set_soonestjob updates c->soonest_job with j
 // if j should be handled sooner than c->soonest_job.
-static void
+static inline void
 conn_set_soonestjob(Conn *c, Job *j) {
-    if (!c->soonest_job || j->r.deadline_at < c->soonest_job->r.deadline_at) {
+    if (likely(!c->soonest_job) || j->r.deadline_at < c->soonest_job->r.deadline_at) {
         c->soonest_job = j;
     }
 }
@@ -206,14 +198,7 @@ conndeadlinesoon(Conn *c)
 int
 conn_ready(Conn *c)
 {
-    size_t i;
-
-    for (i = 0; i < c->watch.len; i++) {
-        Tube *t = c->watch.items[i];
-        if (t->ready.len && !t->pause)
-            return 1;
-    }
-    return 0;
+    return c->watch && c->watch->ready.len && !c->watch->pause;
 }
 
 
@@ -236,11 +221,17 @@ conn_setpos(void *c, size_t i)
 void
 connclose(Conn *c)
 {
-    sockwant(&c->sock, 0);
-    close(c->sock.fd);
-    if (verbose) {
-        printf("close %d\n", c->sock.fd);
+    if (c->sock.fd >= 0) {
+        sockwant(&c->sock, 0);
+        close(c->sock.fd);
+        if (verbose) {
+            printf("close %d\n", c->sock.fd);
+        }
     }
+
+    // Clear dangling reference if this conn was waiting for a forwarded reply.
+    if (c->srv && c->srv->pending_fwd_conn == c)
+        c->srv->pending_fwd_conn = NULL;
 
     job_free(c->in_job);
 
@@ -260,8 +251,8 @@ connclose(Conn *c)
     if (has_reserved_job(c))
         enqueue_reserved_jobs(c);
 
-    ms_clear(&c->watch);
-    free(c->watch_idx);
+    c->watch->watching_ct--;
+    TUBE_ASSIGN(c->watch, NULL);
     c->use->using_ct--;
     TUBE_ASSIGN(c->use, NULL);
 
@@ -274,5 +265,12 @@ connclose(Conn *c)
         sockwant(&c->srv->sock, 'r');
     }
 
-    free(c);
+    // Return to pool for reuse, or free if pool is full.
+    if (conn_pool_len < CONN_POOL_MAX) {
+        c->next = conn_pool;
+        conn_pool = c;
+        conn_pool_len++;
+    } else {
+        free(c);
+    }
 }

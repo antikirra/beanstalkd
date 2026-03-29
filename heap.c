@@ -12,70 +12,68 @@ set(Heap *h, size_t k, void *x)
 }
 
 
-static void
-swap(Heap *h, size_t a, size_t b)
-{
-    void *tmp;
-
-    tmp = h->data[a];
-    set(h, a, h->data[b]);
-    set(h, b, tmp);
-}
-
-
-static int
-less(Heap *h, size_t a, size_t b)
-{
-    return h->less(h->data[a], h->data[b]);
-}
-
-
+// Siftdown using "hole" technique: save element, shift parents down,
+// place once at final position. Halves the number of setpos calls
+// vs the naive swap approach (N setpos instead of 2N for N levels).
 static void
 siftdown(Heap *h, size_t k)
 {
-    for (;;) {
-        size_t p = (k-1) / 2; /* parent */
+    if (k == 0) return;
 
-        if (k == 0 || less(h, p, k)) {
-            return;
-        }
-
-        swap(h, k, p);
+    void *x = h->data[k];
+    while (k > 0) {
+        size_t p = (k - 1) / 2;
+        if (h->less(h->data[p], x))
+            break;
+        // Shift parent down into hole.
+        h->data[k] = h->data[p];
+        h->setpos(h->data[p], k);
         k = p;
     }
+    // Place element at final position.
+    set(h, k, x);
 }
 
 
+// Siftup using "hole" technique: same optimization as siftdown.
 static void
 siftup(Heap *h, size_t k)
 {
+    void *x = h->data[k];
     for (;;) {
-        size_t l = k*2 + 1; /* left child */
-        size_t r = k*2 + 2; /* right child */
+        size_t l = k * 2 + 1;
+        size_t r = k * 2 + 2;
 
-        /* find the smallest of the three */
+        // Find the smallest child, comparing against saved element x.
         size_t s = k;
-        if (l < h->len && less(h, l, s)) s = l;
-        if (r < h->len && less(h, r, s)) s = r;
-
-        if (s == k) {
-            return; /* satisfies the heap property */
+        if (l < h->len && h->less(h->data[l], x)) s = l;
+        // Right child must beat the current best (which is either x or data[l]).
+        if (r < h->len) {
+            void *best = (s == k) ? x : h->data[s];
+            if (h->less(h->data[r], best)) s = r;
         }
 
-        swap(h, k, s);
+        if (s == k)
+            break;
+
+        // Shift child up into hole.
+        h->data[k] = h->data[s];
+        h->setpos(h->data[s], k);
         k = s;
     }
+    // Place element at final position.
+    set(h, k, x);
 }
 
 
 // Heapinsert inserts x into heap h according to h->less.
 // It returns 1 on success, otherwise 0.
-int
+__attribute__((hot)) int
 heapinsert(Heap *h, void *x)
 {
     if (unlikely(h->len == h->cap)) {
-        size_t ncap = (h->len+1) * 2; /* allocate twice what we need */
-        void **ndata = realloc(h->data, sizeof(void*) * ncap);
+        size_t ncap = (h->len + 1) * 2;
+        void **ndata = realloc(h->data, sizeof(void *) * ncap);
         if (!ndata) {
             return 0;
         }
@@ -86,7 +84,8 @@ heapinsert(Heap *h, void *x)
     size_t k = h->len;
     h->len++;
     set(h, k, x);
-    siftdown(h, k);
+    if (likely(k > 0))
+        siftdown(h, k);
     return 1;
 }
 
@@ -101,9 +100,28 @@ heapremove(Heap *h, size_t k)
     void *x = h->data[k];
     h->len--;
     if (k < h->len) {
-        set(h, k, h->data[h->len]);
-        siftdown(h, k);
-        siftup(h, k);
+        h->data[k] = h->data[h->len];
+        h->setpos(h->data[k], k);
+        // Only one direction needed: compare with parent to decide.
+        if (k > 0 && h->less(h->data[k], h->data[(k - 1) / 2])) {
+            siftdown(h, k);
+        } else {
+            siftup(h, k);
+        }
     }
     return x;
+}
+
+
+// Reposition element at index k after its sort key changed.
+void
+heapresift(Heap *h, size_t k)
+{
+    if (k >= h->len)
+        return;
+    if (k > 0 && h->less(h->data[k], h->data[(k - 1) / 2])) {
+        siftdown(h, k);
+    } else {
+        siftup(h, k);
+    }
 }

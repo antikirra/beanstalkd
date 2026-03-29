@@ -75,14 +75,7 @@ on_waiting_swap(Ms *a, void *removed_item, size_t i)
     Conn *moved = a->items[i];
     if (!conn_waiting(moved))
         return;
-    // Find which entry in moved->watch corresponds to this tube.
-    Tube *t = (Tube *)((char *)a - offsetof(Tube, waiting_conns));
-    for (size_t k = 0; k < moved->watch.len; k++) {
-        if (moved->watch.items[k] == t) {
-            moved->watch_idx[k] = i;
-            return;
-        }
-    }
+    moved->watch_idx = i;
 }
 
 Tube *
@@ -100,6 +93,7 @@ make_tube(const char *name)
     memcpy(t->name, name, nlen);
     t->name[nlen] = '\0';
     t->name_len = nlen;
+    t->name_hash = tube_name_hash(t->name);
 
     t->ready.less = job_pri_less;
     t->delay.less = job_delay_less;
@@ -114,7 +108,7 @@ make_tube(const char *name)
     return t;
 }
 
-static void
+void
 tube_free(Tube *t)
 {
     prot_remove_tube(t);
@@ -126,26 +120,9 @@ tube_free(Tube *t)
     free(t);
 }
 
-void
-tube_dref(Tube *t)
-{
-    if (!t) return;
-    if (t->refs < 1) {
-        twarnx("refs is zero for tube: %s", t->name);
-        return;
-    }
-
-    --t->refs;
-    if (t->refs < 1)
-        tube_free(t);
-}
-
-void
-tube_iref(Tube *t)
-{
-    if (!t) return;
-    ++t->refs;
-}
+// tube_dref is now static inline in dat.h
+// tube_free is called from inline tube_dref when refs reaches 0.
+// tube_iref is now static inline in dat.h
 
 static Tube *
 make_and_insert_tube(const char *name)

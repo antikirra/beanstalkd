@@ -4,9 +4,11 @@ High-performance work queue. Pure C, Linux-native, single binary.
 
 Drop-in replacement for [upstream beanstalkd](https://github.com/beanstalkd/beanstalkd): **100% wire protocol and WAL format compatible**. Every existing client library works unmodified.
 
+**Key difference from upstream:** this fork trades multi-tube watching for multi-core parallelism. Each connection watches exactly one tube (the `watch` command switches rather than accumulates). This eliminates the cross-tube scheduling bottleneck and enables nginx-style multi-process architecture where each worker owns a subset of tubes, scaling linearly with CPU cores.
+
 ## Platform
 
-This fork targets **Linux 6.1+** exclusively. No cross-platform abstractions, no trade-offs. The codebase uses Linux-specific APIs directly: `epoll_create1`, `accept4`, `fallocate`, `fdatasync`, `CLOCK_MONOTONIC_COARSE`, `SOCK_NONBLOCK`, `SOCK_CLOEXEC`, `O_CLOEXEC`, `TCP_FASTOPEN`, `TCP_CORK`, `TCP_QUICKACK`, `SO_INCOMING_CPU`, `SO_TXREHASH`, `sched_setaffinity`, `posix_fadvise`, `malloc_trim`.
+This fork targets **Linux 6.1+** exclusively. No cross-platform abstractions, no trade-offs. The codebase uses Linux-specific APIs directly: `epoll_create1`, `accept4`, `fallocate`, `fdatasync`, `CLOCK_MONOTONIC_COARSE`, `SOCK_NONBLOCK`, `SOCK_CLOEXEC`, `O_CLOEXEC`, `TCP_FASTOPEN`, `TCP_CORK`, `TCP_QUICKACK`, `SO_INCOMING_CPU`, `SO_TXREHASH`, `SO_REUSEPORT`, `sched_setaffinity`, `posix_fadvise`, `malloc_trim`, `SCM_RIGHTS`.
 
 Three ways to run:
 
@@ -36,7 +38,7 @@ docker run --rm beanstalkd-test
 1. **Build + 205 unit tests** under UndefinedBehaviorSanitizer (traps on first UB)
 2. **cppcheck** static analysis (zero false-positive policy)
 
-**Production image** (`Dockerfile`): LTO-optimized, stripped binary (~68KB), multi-stage build on bookworm-slim.
+**Production image** (`Dockerfile`): LTO-optimized, stripped binary, multi-stage build on bookworm-slim. Compiler flags: `-Os -flto -march=native -fno-plt -fvisibility=hidden -DNDEBUG`, linker: `-Wl,-z,now` (full RELRO).
 
 ## Benchmark
 
@@ -97,8 +99,52 @@ Same benchmark inside `docker run` (bookworm-slim, ARM64 host):
 | Syscalls per command | ~4 (read + epoll + write + epoll) | ~2 (read + write, inline flush) |
 | Job hash table rehash | Stop-the-world O(n) | Incremental, 16 buckets/op |
 | Job pool reuse | Exact size match only | 11 size classes, O(1) hit rate |
-| WAL disk I/O | Single file, 1 fsync thread | Per-CPU sharded, N fsync threads |
+| WAL disk I/O | Single file, 1 fsync thread | Per-worker sharded, async fsync |
+| Multi-core scaling | Single-threaded | Multi-process, per-CPU workers |
 | Unit tests | 100 | 205 |
+
+## Single-tube watch: design rationale
+
+Upstream beanstalkd allows a connection to `watch` multiple tubes simultaneously. This creates a fundamental bottleneck: the `reserve` command must scan all watched tubes to find the highest-priority ready job, and job delivery requires a global matchable heap across all tubes — an inherently serialized operation.
+
+This fork restricts each connection to watching exactly one tube at a time. The `watch` command **switches** the watched tube (replacing the previous one) rather than accumulating a set. `WATCHING` always returns `1`. The `ignore` command is a no-op (cannot ignore the only tube).
+
+This trade-off unlocks multi-process parallelism:
+
+- **No cross-tube scheduling** — `process_tube()` matches jobs with waiting connections within a single tube, O(1) per match
+- **Tube-based sharding** — each tube is deterministically owned by one worker process (`tube_name_hash % nworkers`), eliminating inter-process coordination
+- **Connection migration** — when a client issues `watch` or `use` for a tube on another worker, the connection fd is transparently migrated via `SCM_RIGHTS` (Unix domain socket fd passing)
+- **No matchable heap** — the global matchable heap (tracking tubes with both ready jobs and waiting connections) is eliminated entirely. Jobs are matched to connections directly when enqueued
+
+**Migration for existing clients:** most beanstalkd clients use a single tube per connection (one producer tube via `use`, one consumer tube via `watch`). Clients that watch multiple tubes should open separate connections per tube.
+
+## Multi-process architecture
+
+When multiple CPU cores are available, beanstalkd automatically forks N worker processes (one per core). Each worker:
+
+- Has its own `SO_REUSEPORT` listening socket on port 11300
+- Owns a deterministic subset of tubes (by `tube_name_hash % nworkers`)
+- Runs an independent event loop with its own epoll, heaps, and job hash table
+- Has its own WAL directory (`<wal_dir>/wN/`) for crash recovery
+- Uses interleaved job IDs to guarantee no collisions (worker K gets IDs K+1, K+N+1, K+2N+1, ...)
+
+A master process monitors workers and restarts any that crash.
+
+### Connection routing
+
+1. **Accept-time routing:** when a new connection arrives, the worker speculatively reads the first command. If it's `use` or `watch` targeting a tube owned by another worker, the fd is migrated immediately via `SCM_RIGHTS`
+2. **Runtime migration:** if a connected client issues `use`/`watch` for a remote tube, the connection is migrated mid-session (buffered pipeline data travels with the fd)
+3. **Command forwarding:** `stats-tube` and `pause-tube` for remote tubes are forwarded to the owning worker via Unix socket IPC, with the reply relayed back to the client
+4. **Stats aggregation:** each worker publishes counters to a `mmap`'d shared memory region; the `stats` command sums all workers' counters
+
+### Fallback modes
+
+| Condition | Behavior |
+|-----------|----------|
+| `-t CPU` (CPU pinning) | Single-process mode (pinning implies one core) |
+| `-w 0` or `-w 1` | Explicit single-process mode |
+| 1 CPU core detected | Auto single-process mode |
+| `-w N` (N > 1) | Force N workers regardless of core count |
 
 ## What changed
 
@@ -118,22 +164,34 @@ Directory fsync after binlog ops, `fdatasync()` for data-only durability, EINTR/
 
 ### Performance
 
-**O(1) scheduling** — five heaps replace linear scans:
+**Multi-process scaling** — nginx-style master/worker architecture:
+
+| Component | How it works |
+|-----------|-------------|
+| Worker forking | N processes, one per CPU core, `SO_REUSEPORT` |
+| Tube sharding | `tube_name_hash % nworkers` for deterministic ownership |
+| Connection migration | `SCM_RIGHTS` fd passing with buffered pipeline data |
+| Job ID allocation | Interleaved IDs: worker K → K+1, K+N+1, K+2N+1, ... |
+| WAL per worker | Independent WAL directory, async fsync thread |
+| Stats aggregation | `mmap` shared memory, rate-limited (1Hz) publish |
+| Cross-worker commands | `stats-tube`/`pause-tube` forwarded via Unix socket IPC |
+
+**O(1) scheduling** — heaps replace linear scans:
 
 | Structure | Lookup | Was |
 |-----------|--------|-----|
-| Matchable tube heap | Next job-to-connection match | O(tubes) |
 | Delay tube heap | Nearest delayed deadline | O(tubes) |
 | Pause tube heap | Soonest tube to unpause | O(tubes) |
 | Waiting conn index | Remove conn from tube | O(conns) |
 | Tube hash table | Find tube by name | O(tubes) |
+| Direct `process_tube()` | Match jobs ↔ conns in one tube | O(tubes) matchable heap |
 
 **Syscall reduction:**
 
 | Optimization | Effect |
 |-------------|--------|
 | Inline reply flush | -50% epoll_wait, -99% epoll_ctl |
-| Batch epoll (64 events) | ~64x fewer kernel transitions under load |
+| Batch epoll (64 events, drain loop) | ~64x fewer kernel transitions under load |
 | `accept4(SOCK_NONBLOCK\|SOCK_CLOEXEC)` | Atomic, no fcntl |
 | `CLOCK_MONOTONIC_COARSE` | ~5ns vs ~25ns per call |
 | Vectorized WAL writes (`writev`) | 1 syscall instead of 2-4 per record |
@@ -141,11 +199,25 @@ Directory fsync after binlog ops, `fdatasync()` for data-only durability, EINTR/
 | Async fsync pthread | Event loop never blocks on disk |
 | `fdatasync()` | Skips metadata flush |
 | `TCP_NODELAY` + `TCP_FASTOPEN` | No Nagle delay, -1 RTT for new connections |
-| `TCP_CORK` reply coalescing | Pipelined replies merged into single TCP segment |
-| `TCP_QUICKACK` | Disables delayed ACK (-40ms per request-response) |
+| `TCP_CORK` reply coalescing | Conditional: only when pipelining detected |
+| `TCP_QUICKACK` | Per-event (not per-read), -40ms per request-response |
 | `SO_INCOMING_CPU` | Bind RX path to pinned CPU core |
+| `SO_REUSEPORT` | Kernel-level load balancing across workers |
 | CPU pinning (`-t` flag) | `sched_setaffinity` eliminates L1/L2 cache migration |
 | `MALLOC_ARENA_MAX=1` | Single malloc arena for single-threaded server (-39% RSS) |
+| `epoll_ctl` caching | Skip redundant epoll_ctl when mode unchanged |
+
+**Fast paths (vsnprintf elimination):**
+
+| Reply | Method |
+|-------|--------|
+| `INSERTED <id>` | `u64toa` + memcpy |
+| `USING <name>` | Direct memcpy |
+| `RESERVED/FOUND <id> <size>` | `u64toa` + memcpy |
+| `STATE_SEND_JOB` | `writev` immediate (header + body in one syscall) |
+| Integer parsing (`read_uint`) | Manual base-10, no strtoumax/locale overhead |
+| Tube name validation | Static 256-byte lookup table, no strspn |
+| NUL injection check | `memchr` instead of `strlen` |
 
 **Memory:**
 
@@ -155,10 +227,19 @@ Directory fsync after binlog ops, `fdatasync()` for data-only durability, EINTR/
 | Incremental rehash | 16 buckets/op instead of stop-the-world O(n) |
 | Periodic `malloc_trim` | Returns unused glibc pages to OS (`-m` flag) |
 | Cache-friendly Job struct | Hot fields grouped; sizeof(Job) 176 -> 168 bytes |
+| Conn slab pool | Reuse up to 256 freed Conn structs (no malloc/free per connect) |
+| Inline tube refcounting | `tube_dref`/`tube_iref` in dat.h, no function call overhead |
+| Heap hole-based sift | Halves setpos calls vs naive swap approach |
+| Conditional rehash step | Skip `rehash_step()` when no migration in progress |
 
-**WAL sharding** — parallel disk I/O across CPU cores:
+**WAL optimizations:**
 
-When WAL is enabled (`-b`), jobs are distributed across N independent WAL instances (one per CPU core) by tube name hash. Each shard has its own directory, file chain, compaction, and async fsync thread. Shard count is detected on first run and persisted to `<wal_dir>/shards`.
+| Optimization | Effect |
+|-------------|--------|
+| Per-worker WAL | Independent file chain per worker process |
+| Rate-limited compaction | 1ms throttle avoids redundant compaction during pipelining |
+| Async dirsync | Hand off `fdatasync(dir)` to sync thread when available |
+| Lock-free error check | `__atomic_load_n` avoids mutex on every walmaint call |
 
 ### Stability
 
@@ -168,6 +249,7 @@ When WAL is enabled (`-b`), jobs are distributed across N independent WAL instan
 - **Incremental rehash** — dual-table lookup during migration, no job invisible mid-rehash
 - **EMFILE backpressure** — fd exhaustion deregisters the listen socket, re-registers on close
 - **Robust line scanning** — `scan_line_end` handles bare `\r` bytes
+- **Worker crash recovery** — master restarts crashed workers automatically
 
 ## Configuration
 
@@ -177,7 +259,7 @@ When WAL is enabled (`-b`), jobs are distributed across N independent WAL instan
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-b DIR` | disabled | Enable WAL persistence (auto-sharded across CPU cores) |
+| `-b DIR` | disabled | Enable WAL persistence (per-worker sharded in multi-process mode) |
 | `-f MS` | 50 | fsync interval in milliseconds (0 = every write) |
 | `-F` | | Never fsync |
 | `-l ADDR` | 0.0.0.0 | Listen address (prefix `unix:` for Unix socket) |
@@ -186,10 +268,24 @@ When WAL is enabled (`-b`), jobs are distributed across N independent WAL instan
 | `-s BYTES` | 10MB | WAL file size |
 | `-u USER` | | Drop privileges to user |
 | `-m SEC` | 60 | Return unused memory to OS interval (0 = disable) |
-| `-t CPU` | disabled | Pin main thread to CPU core (eliminates cache migration) |
+| `-t CPU` | disabled | Pin to CPU core (forces single-process mode) |
+| `-w N` | auto | Number of worker processes (0 or 1 = single-process, auto = one per CPU core) |
 | `-V` | | Increase verbosity (repeatable) |
 
-## WAL sharding layout
+## WAL layout
+
+### Multi-process mode (default)
+
+```
+DIR/
+  lock            # directory lock
+  w0/binlog.*     # worker 0 WAL
+  w1/binlog.*     # worker 1 WAL
+  ...
+  wN/binlog.*     # worker N-1 WAL
+```
+
+### Single-process mode (`-w 1` or `-t CPU`)
 
 ```
 DIR/
@@ -202,33 +298,32 @@ DIR/
   sN/binlog.*     # shard N-1
 ```
 
-To reshard after hardware change: stop beanstalkd, delete `DIR/shards`, restart. Existing WALs are replayed into the new layout automatically.
-
 ## Project structure
 
 ```
 .
-├── dat.h                   # All types, macros, declarations
-├── main.c                  # Entry point, signals, privilege drop, CPU pinning
-├── prot.c                  # Protocol: commands, scheduling, stats, TCP_CORK/QUICKACK
-├── serv.c                  # Event loop
-├── conn.c                  # Connection state machine
-├── job.c                   # Job alloc/free, hash table, memory pool
-├── tube.c                  # Tube CRUD, hash map, refcounting
-├── heap.c                  # Generic min-heap
+├── dat.h                   # All types, macros, declarations (inline tube_dref/iref, job_list)
+├── main.c                  # Entry point, master/worker forking, CPU pinning, signal handling
+├── prot.c                  # Protocol: commands, scheduling, stats, fast reply paths, migration
+├── serv.c                  # Event loop (drain-all), peer socket handling, shared stats
+├── conn.c                  # Connection state machine, slab pool
+├── job.c                   # Job alloc/free, hash table, memory pool, interleaved IDs
+├── tube.c                  # Tube CRUD, hash map, refcounting, cached name_hash
+├── heap.c                  # Generic min-heap (hole-based sift, heapresift)
 ├── ms.c                    # Dynamic array
-├── walg.c                  # WAL lifecycle, async fsync, sharding
+├── walg.c                  # WAL lifecycle, async fsync/dirsync, rate-limited compaction
 ├── file.c                  # WAL file I/O, writev, fallocate
-├── linux.c                 # epoll backend
-├── net.c                   # Socket creation, TCP_FASTOPEN, SO_INCOMING_CPU, SO_TXREHASH
+├── linux.c                 # epoll backend (epoll_ctl caching)
+├── net.c                   # Socket creation, SO_REUSEPORT, SCM_RIGHTS fd passing
 ├── time.c                  # CLOCK_MONOTONIC_COARSE
-├── util.c                  # Logging, options, zalloc
+├── util.c                  # Logging, options (-w flag), zalloc
 ├── primes.c                # Hash table prime sizes
 ├── test*.c                 # 205 unit tests (14 files)
+├── test/bench.c            # C benchmark client
 ├── ct/                     # Vendored test framework
 ├── doc/protocol.txt        # Wire protocol specification (frozen)
 ├── adm/systemd/            # systemd service + socket units
-├── Dockerfile              # Production image (multi-stage, bookworm-slim)
+├── Dockerfile              # Production image (multi-stage, hardened compiler flags)
 ├── Dockerfile.build        # CI pipeline: UBSan + cppcheck
 ├── Dockerfile.benchmark    # A/B comparison vs upstream (5 scenarios)
 └── test/                   # Integration tests (ASan, Valgrind, WAL recovery)
