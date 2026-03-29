@@ -25,13 +25,9 @@ durable_fsync(int fd)
 
 // --- Per-Wal async fsync thread ---
 //
-// Moves the blocking fsync() call off the main event loop thread.
-// The main thread passes a dup()'d fd to the fsync thread; the thread
-// owns that fd and closes it after fsync. This avoids fd lifetime races:
-// the main thread can close/rotate the original fd freely.
-//
-// All fsync state lives inside the Wal struct (not static globals),
-// allowing multiple Wal instances to run independent fsync threads.
+// Moves fsync() off the event loop thread. Main thread passes a dup()'d fd;
+// the thread owns and closes it after fsync. Per-Wal state (not static globals)
+// allows multiple independent fsync threads for WAL sharding.
 //
 // Thread safety contract:
 //   w->sync_fd, w->sync_stop, w->sync_err — shared, protected by w->sync_mu
@@ -138,8 +134,7 @@ dirsync(Wal *w)
     int fd = open(w->dir, O_RDONLY|O_CLOEXEC);
     if (fd < 0) return;
 
-    // If async fsync thread is running, hand off dirsync to it.
-    // This avoids a 1-10ms hard block on the hot path.
+    // Hand off to async fsync thread if running.
     if (w->sync_on) {
         pthread_mutex_lock(&w->sync_mu);
         if (w->sync_fd >= 0) {

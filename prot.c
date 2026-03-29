@@ -45,8 +45,7 @@ shard_wal(Server *s, Job *j)
     "abcdefghijklmnopqrstuvwxyz" \
     "0123456789-+/;.$_()"
 
-// Static lookup table for valid tube name characters.
-// Avoids strspn's per-call bitmap construction (~20ns savings).
+// Valid tube name characters (lookup table replaces strspn).
 static const char valid_name_char[256] = {
     ['A']=1,['B']=1,['C']=1,['D']=1,['E']=1,['F']=1,['G']=1,['H']=1,
     ['I']=1,['J']=1,['K']=1,['L']=1,['M']=1,['N']=1,['O']=1,['P']=1,
@@ -503,10 +502,7 @@ reply(Conn *c, char *line, int len, int state)
         printf(">%d reply %.*s\n", c->sock.fd, len-2, line);
     }
 
-    // Fast path: try immediate write for short text replies.
-    // Saves 2 syscalls per command (epoll_ctl MOD + epoll_wait)
-    // by skipping the read→epoll→write→epoll round-trip.
-    // Falls through to normal epoll-based send on EAGAIN or partial write.
+    // Try immediate write; fall through to epoll on EAGAIN/partial.
     if (likely(state == STATE_SEND_WORD)) {
         int r = write(c->sock.fd, line, len);
         if (likely(r == len)) {
@@ -539,8 +535,7 @@ reply(Conn *c, char *line, int len, int state)
         }
     }
 
-    // Fast path for STATE_SEND_JOB: immediate writev of header + body.
-    // Eliminates 2 syscalls (epoll_ctl MOD + epoll_wait) per reserve/peek.
+    // Immediate writev of header + body.
     if (state == STATE_SEND_JOB && c->out_job) {
         struct iovec iov[2];
         iov[0].iov_base = line;
@@ -618,8 +613,7 @@ reply_line(Conn *c, int state, const char *fmt, ...)
     reply(c, c->reply_buf, r, state);
 }
 
-// Fast uint64-to-decimal into buffer. Returns pointer to start.
-// buf must have at least 20 bytes. Writes right-to-left.
+// uint64 to decimal, right-to-left. buf must have 20 bytes.
 static char *
 u64toa(char *end, uint64 v)
 {
@@ -630,7 +624,7 @@ u64toa(char *end, uint64 v)
     return end;
 }
 
-// Fast reply for "INSERTED <id>\r\n" — avoids vsnprintf overhead.
+// reply "INSERTED <id>\r\n" without vsnprintf.
 static void
 reply_inserted(Conn *c, uint64 id)
 {
@@ -646,7 +640,7 @@ reply_inserted(Conn *c, uint64 id)
     reply(c, buf, 11 + nlen, STATE_SEND_WORD);
 }
 
-// Fast reply for "USING <name>\r\n" — avoids vsnprintf.
+// reply "USING <name>\r\n" without vsnprintf.
 static void
 reply_using(Conn *c, Tube *t)
 {
@@ -659,7 +653,7 @@ reply_using(Conn *c, Tube *t)
 }
 
 // reply_job tells the connection c which job to send.
-// Fast path builds "MSG ID SIZE\r\n" without vsnprintf.
+// Build "MSG ID SIZE\r\n" without vsnprintf.
 static void
 reply_job(Conn *c, Job *j, const char *msg)
 {
@@ -1077,7 +1071,7 @@ which_cmd(Conn *c)
         TEST_CMD(c->cmd, CMD_PAUSE_TUBE, OP_PAUSE_TUBE);
         break;
     case 'r':
-        // Fast disambiguation: "reserve\r" vs "reserve-..." vs "release "
+        // Disambiguate: "release " vs "reserve-..." vs bare "reserve\r"
         if (c->cmd[2] == 'l') { // reLease
             TEST_CMD(c->cmd, CMD_RELEASE, OP_RELEASE);
         } else if (c->cmd_len > 8 && c->cmd[7] == '-') { // reserve-...
@@ -1381,7 +1375,7 @@ read_uint(uintmax_t *out, uintmax_t max_val, const char *buf, char **end)
     if (buf[0] < '0' || '9' < buf[0])
         return -1;
 
-    // Fast base-10 parse without strtoumax overhead (locale, errno).
+    // Inline base-10 parse (no locale/errno).
     uintmax_t tnum = 0;
     const char *p = buf;
     while (*p >= '0' && *p <= '9') {
@@ -1652,7 +1646,7 @@ remove_reserved_job(Conn *c, Job *j)
 
 // is_valid_tube validates a tube name.
 // Returns the name length on success, 0 on failure.
-// Uses static lookup table instead of strspn for ~20ns savings.
+// Uses valid_name_char[] lookup table.
 static size_t
 is_valid_tube(const char *name, size_t max)
 {
@@ -1685,7 +1679,7 @@ dispatch_cmd(Conn *c)
     c->cmd[c->cmd_len - 2] = '\0';
 
     /* Check for embedded NUL bytes (injection attack).
-     * memchr is SIMD-optimized and short-circuits, faster than strlen. */
+     * Use memchr instead of strlen to detect embedded NUL. */
     if (memchr(c->cmd, '\0', c->cmd_len - 2) != NULL) {
         reply_msg(c, MSG_BAD_FORMAT);
         return;
@@ -2245,7 +2239,7 @@ dispatch_cmd(Conn *c)
 
         // In multi-worker mode, `use` also migrates the connection
         // to the worker owning this tube (same as watch).
-        // This ensures put/kick/peek-* operate on the correct worker.
+        // Migrate connection to the worker owning this tube.
         if (c->srv->nworkers > 1) {
             int target = tube_name_hash(name) % c->srv->nworkers;
             if (target != c->srv->worker_id && c->srv->peer_fd[target] >= 0) {
@@ -2742,8 +2736,7 @@ h_conn(const int fd, const short which, Conn *c)
         c->halfclosed = 1;
     }
 
-    // Set TCP_QUICKACK once per epoll event (not per read in conn_process_io).
-    // Saves ~150ns per command by avoiding redundant setsockopt in the read loop.
+    // TCP_QUICKACK: once per epoll event, not per read.
     if (which == 'r') {
         int quickack = 1;
         setsockopt(c->sock.fd, IPPROTO_TCP, TCP_QUICKACK, &quickack, sizeof quickack);
@@ -2852,8 +2845,7 @@ prottick(Server *s)
         }
     }
 
-    // Update shared memory stats for cross-worker aggregation.
-    // Rate-limited to once per second to avoid cache line bouncing.
+    // Publish stats to shared memory (1Hz).
     if (shared_stats && s->worker_id >= 0) {
         static int64 last_stats_sync;
         if (now - last_stats_sync >= 1000000000LL) { // 1 second
@@ -3007,9 +2999,7 @@ h_accept(const int fd, const short which, Server *s)
         c->sock.fd = cfd;
 
         // If we already read data, copy it into the connection's cmd buffer
-        // and dispatch any complete commands immediately. Without this,
-        // the data is stranded: the kernel buffer is drained, epoll won't
-        // fire, and pipelined commands never get processed.
+        // Replay pre-read data — kernel buffer is already drained.
         if (nr > 0) {
             size_t to_copy = (size_t)nr < sizeof(c->cmd) ? (size_t)nr : sizeof(c->cmd);
             memcpy(c->cmd, first_buf, to_copy);
@@ -3132,8 +3122,7 @@ h_accept_migrated(int cfd, Server *s, struct MigMsg *mm)
     c->sock.f = (Handle)prothandle;
     c->sock.fd = cfd;
 
-    // Send pending reply if present (e.g., "WATCHING 1\r\n" from watch cmd).
-    // Best-effort on nonblocking socket; reply is small, should succeed.
+    // Flush pending reply (e.g. "WATCHING 1\r\n").
     if (mm->pending_reply_len > 0) {
         ssize_t wr = write(cfd, mm->pending_reply, mm->pending_reply_len);
         if (wr == -1 && errno != EAGAIN) {

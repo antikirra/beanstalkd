@@ -307,8 +307,7 @@ main(int argc, char **argv)
     progname = argv[0];
     setlinebuf(stdout);
 
-    // Single-threaded: one malloc arena is optimal.
-    // glibc defaults to 8×CPU arenas — pure overhead for us.
+    // Single arena; workers are single-threaded.
     setenv("MALLOC_ARENA_MAX", "1", 0);
 
     optparse(&srv, argv+1);

@@ -59,7 +59,7 @@ typedef int(*FAlloc)(int, int);
 // Use this macro to designate unused parameters in functions.
 #define UNUSED_PARAMETER(x) (void)(x)
 
-// Branch prediction hints for hot paths.
+// Branch prediction hints.
 #define likely(x)   __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
 
@@ -298,10 +298,7 @@ extern const char *progname;
 
 int64 nanoseconds(void);
 
-// Cached value of nanoseconds() for the current event loop tick.
-// MAIN THREAD ONLY — never read or write from the async fsync thread.
-// Updated at: prottick() entry, srvserve() before each handler,
-// prot_init(), prot_replay(). Use instead of nanoseconds() in hot paths.
+// Cached nanoseconds() for the current tick. Main thread only.
 extern int64 now;
 
 // Interval in nanoseconds between malloc_trim() calls.
@@ -351,7 +348,7 @@ extern struct Ms tubes;
 
 Tube *make_tube(const char *name);
 void  tube_free(Tube *t);
-// Inline fast path: decrement refs, only call tube_free on the rare free path.
+// Inline refcount; tube_free called when refs drops to 0.
 static inline void tube_dref(Tube *t) {
     if (!t) return;
     if (t->refs < 1) return; // safety: already zero
@@ -488,7 +485,7 @@ void connsched(Conn *c);
 void connclose(Conn *c);
 void connsetproducer(Conn *c);
 void connsetworker(Conn *c);
-// Fast-path macros: skip function call when type already set (branch always taken after first call).
+// Skip function call when type flag already set.
 #define CONNSETPRODUCER(c) do { if (likely((c)->type & CONN_TYPE_PRODUCER)) {} else connsetproducer(c); } while(0)
 #define CONNSETWORKER(c) do { if (likely((c)->type & CONN_TYPE_WORKER)) {} else connsetworker(c); } while(0)
 Job *connsoonestjob(Conn *c);

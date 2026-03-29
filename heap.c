@@ -12,9 +12,7 @@ set(Heap *h, size_t k, void *x)
 }
 
 
-// Siftdown using "hole" technique: save element, shift parents down,
-// place once at final position. Halves the number of setpos calls
-// vs the naive swap approach (N setpos instead of 2N for N levels).
+// Siftdown using hole technique (half the setpos calls vs swap).
 static void
 siftdown(Heap *h, size_t k)
 {
@@ -35,7 +33,7 @@ siftdown(Heap *h, size_t k)
 }
 
 
-// Siftup using "hole" technique: same optimization as siftdown.
+// Siftup using hole technique.
 static void
 siftup(Heap *h, size_t k)
 {

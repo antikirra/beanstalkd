@@ -176,8 +176,7 @@ allocate_job(int body_size)
         }
     }
 
-    // Bulk-zero the struct, then set the few non-zero fields.
-    // memset is SIMD-optimized in glibc, faster than 18 individual stores.
+    // Zero struct, then set non-zero fields.
     memset(j, 0, sizeof(Job));
     j->r.created_at = now ? now : nanoseconds();
     j->r.body_size = body_size;
@@ -212,8 +211,7 @@ make_job_with_id(uint32 pri, int64 delay, int64 ttr,
         if (!next_id) next_id = (srv.worker_id >= 0 ? srv.worker_id : 0) + 1;
     } else {
         j->r.id = next_id;
-        // In multi-worker mode, IDs are interleaved: worker 0 gets 1,N+1,2N+1,...
-        // worker 1 gets 2,N+2,2N+2,... This guarantees no collisions.
+        // Interleaved IDs: worker K gets K+1, K+N+1, K+2N+1, ...
         int step = srv.nworkers > 1 ? srv.nworkers : 1;
         next_id += step;
         if (!next_id) next_id = (srv.worker_id >= 0 ? srv.worker_id : 0) + 1;

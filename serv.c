@@ -230,10 +230,7 @@ srvserve(Server *s)
     for (;;) {
         int64 period = prottick(s);
 
-        // Drain ALL ready events from the epoll batch before calling
-        // prottick again. Reduces prottick overhead from once-per-event
-        // to once-per-batch (~64 events). Timer accuracy unaffected:
-        // TTR/delay are second-scale, batch processing adds <100us jitter.
+        // Drain all ready events before next prottick.
         int rw;
         while ((rw = socknext(&sock, period)) > 0) {
             now = nanoseconds();
