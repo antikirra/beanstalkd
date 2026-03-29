@@ -169,23 +169,23 @@ A/B comparison, identical compiler flags (`gcc -O2 -DNDEBUG`), WAL enabled:
 docker build -f Dockerfile.benchmark -t bench . && docker run --rm bench
 ```
 
-### Bare metal (Debian 12, 8 vCPU AMD, SSD)
+### Bare metal results
 
-| Scenario | Metric | Upstream | Fork (`-t 0`) | Delta |
+Server: Debian 12 (bookworm), kernel 6.1.0, 8 vCPU QEMU, 12GB RAM, SSD.
+Both binaries: `gcc -O2 -DNDEBUG`. Fork: `-w 1` (single-process mode).
+
+| Scenario | Metric | Upstream | Fork (`-w 1`) | Delta |
 |----------|--------|----------|---------------|-------|
-| 8 clients × 10K jobs | ops/s | 4,582 | 5,012 | **+9.4%** |
-| 8 clients × 10K jobs | RSS | 4,608 KB | 2,828 KB | **-39%** |
-| 500 tubes × 100 jobs | ops/s | 17,996 | 19,718 | **+9.6%** |
-| Single client latency | P99 | 1,966µs | 1,091µs | **1.8x lower** |
-| Single client latency | P99.9 | 14,764µs | 4,236µs | **3.5x lower** |
-
-### Docker (bookworm-slim, ARM64)
-
-| Scenario | Metric | Upstream | Fork | Delta |
-|----------|--------|----------|------|-------|
-| Throughput | ops/s | 11,270 | 12,785 | +13% |
-| 500 tubes | ops/s | 38,652 | 50,268 | **+30%** |
-| Latency | P99.9 | 714µs | 305µs | **2.3x lower** |
+| Throughput (8 clients) | ops/s | 8,282 | 9,477 | **+14.4%** |
+| Throughput (8 clients) | PUT ops/s | 2,666 | 3,618 | **+35.7%** |
+| Multi-tube (20 tubes) | ops/s | 6,624 | 11,500 | **+73.6%** |
+| 500 tubes × 100 jobs | ops/s | 27,203 | 42,961 | **+57.9%** |
+| 500 tubes × 100 jobs | CPU time | 2.36s | 1.68s | **+28.8%** |
+| Latency (single client) | Avg | 245µs | 102µs | **+58% faster** |
+| Latency (single client) | P50 | 164µs | 95µs | **+42% faster** |
+| Latency (single client) | P99 | 1,969µs | 187µs | **10.5x lower** |
+| Latency (single client) | P99.9 | 11,721µs | 252µs | **46.5x lower** |
+| Connection storm | conn/s | 7,381 | 8,873 | **+20.2%** |
 
 ## License
 
