@@ -1,8 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-UPSTREAM=/usr/local/bin/beanstalkd-upstream
-FORK=/usr/local/bin/beanstalkd-fork
+UPSTREAM=${UPSTREAM:-/usr/local/bin/beanstalkd-upstream}
+FORK=${FORK:-/usr/local/bin/beanstalkd-fork}
 
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║              beanstalkd A/B Benchmark                       ║"
@@ -10,6 +10,18 @@ echo "║    upstream vs fork — identical flags, isolated runs         ║"
 echo "║    Both compiled: gcc -O2 -DNDEBUG (no LTO, no strip)       ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo ""
+
+stop_server() {
+    local pid=$1 port=$2
+    kill $pid 2>/dev/null; wait $pid 2>/dev/null || true
+    # Ensure all children (multi-worker) are dead and port is free.
+    local tries=0
+    while fuser $port/tcp >/dev/null 2>&1 && [ $tries -lt 20 ]; do
+        fuser -k $port/tcp >/dev/null 2>&1 || true
+        sleep 0.1
+        tries=$((tries+1))
+    done
+}
 
 get_proc_stats() {
     local pid=$1
@@ -274,33 +286,33 @@ run_full() {
     "$bin" $extra -p "$port" -b "$w" -f 50 & local pid=$!; sleep 1
     local s1=$(run_throughput "$port")
     local st1=$(get_proc_stats $pid)
-    kill $pid 2>/dev/null; wait $pid 2>/dev/null || true
+    stop_server $pid $port
 
     # S2: Multi-tube
     w="/tmp/wal-$$-$label-s2"; rm -rf "$w"; mkdir -p "$w"
     "$bin" $extra -p "$port" -b "$w" -f 50 & pid=$!; sleep 1
     local s2=$(run_multitube "$port")
     local st2=$(get_proc_stats $pid)
-    kill $pid 2>/dev/null; wait $pid 2>/dev/null || true
+    stop_server $pid $port
 
     # S3: Many tubes (500)
     w="/tmp/wal-$$-$label-s3"; rm -rf "$w"; mkdir -p "$w"
     "$bin" $extra -p "$port" -b "$w" -f 50 & pid=$!; sleep 1
     local s3=$(run_many_tubes "$port")
     local st3=$(get_proc_stats $pid)
-    kill $pid 2>/dev/null; wait $pid 2>/dev/null || true
+    stop_server $pid $port
 
     # S4: Latency
     w="/tmp/wal-$$-$label-s4"; rm -rf "$w"; mkdir -p "$w"
     "$bin" $extra -p "$port" -b "$w" -f 50 & pid=$!; sleep 1
     local s4=$(run_latency "$port")
-    kill $pid 2>/dev/null; wait $pid 2>/dev/null || true
+    stop_server $pid $port
 
     # S5: Connection storm
     w="/tmp/wal-$$-$label-s5"; rm -rf "$w"; mkdir -p "$w"
     "$bin" $extra -p "$port" -b "$w" -f 50 & pid=$!; sleep 1
     local s5=$(run_conn_storm "$port")
-    kill $pid 2>/dev/null; wait $pid 2>/dev/null || true
+    stop_server $pid $port
     rm -rf /tmp/wal-$$-$label-*
 
     # Export
