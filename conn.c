@@ -128,26 +128,21 @@ has_reserved_job(Conn *c)
 static inline int64
 conntickat(Conn *c)
 {
-    int margin = 0, should_timeout = 0;
-    int64 t = INT64_MAX;
+    // Fast path: no pending timeout and no reserved jobs → no tick needed.
+    // Covers the common case after a simple put/delete/stats reply.
+    if (likely(c->pending_timeout < 0 && job_list_is_empty(&c->reserved_jobs)))
+        return 0;
 
-    if (conn_waiting(c)) {
-        margin = SAFETY_MARGIN;
-    }
+    int margin = conn_waiting(c) ? SAFETY_MARGIN : 0;
+    int64 t = INT64_MAX;
 
     if (has_reserved_job(c)) {
         t = connsoonestjob(c)->r.deadline_at - now - margin;
-        should_timeout = 1;
     }
     if (c->pending_timeout >= 0) {
         t = min(t, ((int64)c->pending_timeout) * 1000000000);
-        should_timeout = 1;
     }
-
-    if (should_timeout) {
-        return now + t;
-    }
-    return 0;
+    return now + t;
 }
 
 

@@ -114,10 +114,10 @@ store_job(Job *j)
     all_jobs[index] = j;
     all_jobs_used++;
 
-    if (rehash_old) rehash_step();
+    if (unlikely(rehash_old)) rehash_step();
 
     /* accept a load factor of 4 */
-    if (!rehash_old && all_jobs_used > (all_jobs_cap << 1))
+    if (unlikely(!rehash_old && all_jobs_used > (all_jobs_cap << 1)))
         rehash_start(1);
 }
 
@@ -133,7 +133,7 @@ job_find(uint64 job_id)
     }
 
     // Check old table if rehash in progress and not found in new.
-    if (!jh && rehash_old) {
+    if (unlikely(!jh && rehash_old)) {
         index = job_id % rehash_old_cap;
         jh = rehash_old[index];
         while (jh && jh->r.id != job_id) {
@@ -142,7 +142,7 @@ job_find(uint64 job_id)
         }
     }
 
-    if (rehash_old) rehash_step();
+    if (unlikely(rehash_old)) rehash_step();
     return jh;
 }
 
@@ -193,7 +193,7 @@ make_job_with_id(uint32 pri, int64 delay, int64 ttr,
         return (Job *) 0;
     }
 
-    if (id) {
+    if (unlikely(id)) {
         j->r.id = id;
         // Advance next_id past recovered ID, maintaining interleaving stride.
         int step = srv.nworkers > 1 ? srv.nworkers : 1;
@@ -237,7 +237,7 @@ job_hash_free(Job *j)
     }
 
     // Search old table if rehash in progress.
-    if (rehash_old) {
+    if (unlikely(rehash_old)) {
         slot = &rehash_old[j->r.id % rehash_old_cap];
         while (*slot && *slot != j) slot = &(*slot)->ht_next;
         if (*slot) {
@@ -247,11 +247,11 @@ job_hash_free(Job *j)
     }
 
 done:
-    if (rehash_old) rehash_step();
+    if (unlikely(rehash_old)) rehash_step();
 
     // Downscale when the hashmap is too sparse, but never below initial size.
     // Only when no rehash in progress.
-    if (!rehash_old && cur_prime > 0 && all_jobs_used < (all_jobs_cap >> 3))
+    if (unlikely(!rehash_old && cur_prime > 0 && all_jobs_used < (all_jobs_cap >> 3)))
         rehash_start(0);
 }
 

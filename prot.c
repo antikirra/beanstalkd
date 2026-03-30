@@ -905,7 +905,8 @@ enqueue_job(Server *s, Job *j, int64 delay, char update_store)
     int r;
     Wal *w = shard_wal(s, j);
 
-    j->reserver = NULL;
+    // j->reserver is already NULL: new jobs from memset(0) in allocate_job,
+    // re-enqueued jobs from remove_this_reserved_job.
     if (unlikely(delay)) {
         j->r.deadline_at = now + delay;
         r = heapinsert(&j->tube->delay, j);
