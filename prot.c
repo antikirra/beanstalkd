@@ -2944,7 +2944,8 @@ prottick(Server *s)
         if (s->pending_fwd[i].conn && now - s->pending_fwd[i].at > 5000000000LL) {
             Conn *pc = s->pending_fwd[i].conn;
             if (pc->gen == s->pending_fwd[i].gen && pc->sock.fd >= 0) {
-                write(pc->sock.fd, "NOT_FOUND\r\n", 11);
+                ssize_t r_ = write(pc->sock.fd, "NOT_FOUND\r\n", 11);
+                (void)r_;
                 pc->fwd_pending = 0;
                 sockwant(&pc->sock, 'r');
                 if (pc->cmd_read > 0)
@@ -3334,7 +3335,8 @@ prot_handle_forwarded_cmd(Server *s, struct CmdFwdMsg *fwd)
     // Send reply back to originating worker.
     if (fwd->from_worker >= 0 && fwd->from_worker < s->nworkers
         && s->peer_fd[fwd->from_worker] >= 0) {
-        write(s->peer_fd[fwd->from_worker], &rpl, sizeof(rpl));
+        ssize_t r_ = write(s->peer_fd[fwd->from_worker], &rpl, sizeof(rpl));
+        (void)r_;
     }
 }
 
@@ -3403,7 +3405,8 @@ prot_handle_forwarded_put(Server *s, struct PutFwdMsg *pm)
 reply:
     if (pm->from_worker >= 0 && pm->from_worker < s->nworkers
         && s->peer_fd[pm->from_worker] >= 0) {
-        write(s->peer_fd[pm->from_worker], &rpl, sizeof(rpl));
+        ssize_t r_ = write(s->peer_fd[pm->from_worker], &rpl, sizeof(rpl));
+        (void)r_;
     }
 }
 

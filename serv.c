@@ -170,7 +170,8 @@ handle_peer(struct PeerCtx *ctx, int ev)
             if (s->pending_fwd[i].conn) {
                 Conn *pc = s->pending_fwd[i].conn;
                 if (pc->gen == s->pending_fwd[i].gen && pc->sock.fd >= 0) {
-                    write(pc->sock.fd, "NOT_FOUND\r\n", 11);
+                    ssize_t r_ = write(pc->sock.fd, "NOT_FOUND\r\n", 11);
+                    (void)r_;
                     pc->fwd_pending = 0;
                     sockwant(&pc->sock, 'r');
                     if (pc->cmd_read > 0)
@@ -222,7 +223,8 @@ handle_peer(struct PeerCtx *ctx, int ev)
                 if (s->pending_fwd[i].seq == rpl.seq && s->pending_fwd[i].conn) {
                     Conn *pc = s->pending_fwd[i].conn;
                     if (pc->gen == s->pending_fwd[i].gen && pc->sock.fd >= 0) {
-                        write(pc->sock.fd, rpl.data, rpl.data_len);
+                        ssize_t r_ = write(pc->sock.fd, rpl.data, rpl.data_len);
+                        (void)r_;
                         pc->fwd_pending = 0;
                         // Re-register for read + resume pipelined commands.
                         sockwant(&pc->sock, 'r');
@@ -238,7 +240,8 @@ handle_peer(struct PeerCtx *ctx, int ev)
     } else {
         // Unknown magic — drain the data.
         char drain[4096];
-        read(fd, drain, sizeof(drain));
+        ssize_t r_ = read(fd, drain, sizeof(drain));
+        (void)r_;
     }
 }
 
