@@ -125,7 +125,7 @@ has_reserved_job(Conn *c)
 
 
 // Returns positive nanoseconds when c should tick, 0 otherwise.
-static int64
+static inline int64
 conntickat(Conn *c)
 {
     int margin = 0, should_timeout = 0;

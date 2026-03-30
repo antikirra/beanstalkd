@@ -94,6 +94,8 @@ make_tube(const char *name)
     t->name[nlen] = '\0';
     t->name_len = nlen;
     t->name_hash = tube_name_hash(t->name);
+    t->owner = srv.nworkers > 1 ? (int)(t->name_hash % srv.nworkers) : -1;
+    t->shard = srv.nshards > 0 ? (int)(t->name_hash % srv.nshards) : -1;
 
     t->ready.less = job_pri_less;
     t->delay.less = job_delay_less;
@@ -163,10 +165,16 @@ tube_find(Ms *tubeset, const char *name)
 }
 
 Tube *
-tube_find_or_make(const char *name)
+tube_find_or_make_n(const char *name, size_t len)
 {
-    Tube *t = tube_find_name(name, strlen(name));
+    Tube *t = tube_find_name(name, len);
     if (t)
         return t;
     return make_and_insert_tube(name);
+}
+
+Tube *
+tube_find_or_make(const char *name)
+{
+    return tube_find_or_make_n(name, strlen(name));
 }

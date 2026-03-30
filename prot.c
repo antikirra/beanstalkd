@@ -31,12 +31,11 @@ int64 mem_trim_rate = 60000000000LL; /* 60 seconds in nanoseconds */
 // With sharding enabled, jobs are distributed across per-CPU WAL instances
 // by tube name hash, parallelizing disk I/O (writes + fsync).
 // Falls back to the single legacy WAL when sharding is not active.
-static Wal *
+static inline Wal *
 shard_wal(Server *s, Job *j)
 {
     if (s->nshards > 0 && s->shards && j->tube) {
-        uint h = j->tube->name_hash;
-        return &s->shards[h % s->nshards];
+        return &s->shards[j->tube->shard];
     }
     return &s->wal;
 }
@@ -100,10 +99,12 @@ try_forward_job_cmd(Conn *c, uint64 job_id)
     fwd.magic = CMD_FWD_MAGIC;
     fwd.from_worker = s->worker_id;
     fwd.seq = seq;
-    memcpy(fwd.cmd, c->cmd, c->cmd_len);
     fwd.cmd_len = c->cmd_len;
-    ssize_t wr = write(s->peer_fd[target], &fwd, sizeof(fwd));
-    if (wr != (ssize_t)sizeof(fwd)) {
+    memcpy(fwd.cmd, c->cmd, c->cmd_len);
+    // Variable-length send: header + actual cmd bytes only.
+    size_t msg_len = offsetof(struct CmdFwdMsg, cmd) + c->cmd_len;
+    ssize_t wr = write(s->peer_fd[target], &fwd, msg_len);
+    if (wr != (ssize_t)msg_len) {
         int idx = pending_fwd_find(s, seq);
         if (idx >= 0) {
             s->pending_fwd[idx].conn = NULL;
@@ -134,10 +135,11 @@ try_forward_tube_cmd(Conn *c, uint32 name_hash)
     fwd.magic = CMD_FWD_MAGIC;
     fwd.from_worker = s->worker_id;
     fwd.seq = seq;
-    memcpy(fwd.cmd, c->cmd, c->cmd_len);
     fwd.cmd_len = c->cmd_len;
-    ssize_t wr = write(s->peer_fd[target], &fwd, sizeof(fwd));
-    if (wr != (ssize_t)sizeof(fwd)) {
+    memcpy(fwd.cmd, c->cmd, c->cmd_len);
+    size_t msg_len = offsetof(struct CmdFwdMsg, cmd) + c->cmd_len;
+    ssize_t wr = write(s->peer_fd[target], &fwd, msg_len);
+    if (wr != (ssize_t)msg_len) {
         int idx = pending_fwd_find(s, seq);
         if (idx >= 0) {
             s->pending_fwd[idx].conn = NULL;
@@ -152,7 +154,7 @@ try_forward_tube_cmd(Conn *c, uint32 name_hash)
 }
 
 // Valid tube name characters (lookup table replaces strspn).
-static const char valid_name_char[256] = {
+static const char valid_name_char[256] __attribute__((aligned(64))) = {
     ['A']=1,['B']=1,['C']=1,['D']=1,['E']=1,['F']=1,['G']=1,['H']=1,
     ['I']=1,['J']=1,['K']=1,['L']=1,['M']=1,['N']=1,['O']=1,['P']=1,
     ['Q']=1,['R']=1,['S']=1,['T']=1,['U']=1,['V']=1,['W']=1,['X']=1,
@@ -548,7 +550,7 @@ static Job *remove_delayed_job(Job *j);
 // epollq_add schedules connection c in the s->conns heap, adds c
 // to the epollq list to change expected operation in event notifications.
 // rw='w' means to notify when socket is writeable, 'r' - readable, 'h' - closed.
-static void
+__attribute__((hot)) static inline void
 epollq_add(Conn *c, char rw) {
     c->rw = rw;
     connsched(c);
@@ -621,12 +623,12 @@ reply(Conn *c, char *line, int len, int state)
                     job_free(c->out_job);
                 c->out_job = NULL;
             }
-            if (c->in_conns || c->pending_timeout >= 0)
+            if (unlikely(c->in_conns || c->pending_timeout >= 0))
                 connsched(c);
             return;
         }
         // Partial write: record progress for retry via epoll.
-        if (r > 0) {
+        if (unlikely(r > 0)) {
             c->reply = line;
             c->reply_len = len;
             c->reply_sent = r;
@@ -715,19 +717,43 @@ reply_line(Conn *c, int state, const char *fmt, ...)
     reply(c, c->reply_buf, r, state);
 }
 
+// Two-digit lookup table: "00", "01", ..., "99".
+// Halves the number of divisions in decimal conversion.
+static const char digits[200] __attribute__((aligned(64))) = {
+    '0','0','0','1','0','2','0','3','0','4','0','5','0','6','0','7','0','8','0','9',
+    '1','0','1','1','1','2','1','3','1','4','1','5','1','6','1','7','1','8','1','9',
+    '2','0','2','1','2','2','2','3','2','4','2','5','2','6','2','7','2','8','2','9',
+    '3','0','3','1','3','2','3','3','3','4','3','5','3','6','3','7','3','8','3','9',
+    '4','0','4','1','4','2','4','3','4','4','4','5','4','6','4','7','4','8','4','9',
+    '5','0','5','1','5','2','5','3','5','4','5','5','5','6','5','7','5','8','5','9',
+    '6','0','6','1','6','2','6','3','6','4','6','5','6','6','6','7','6','8','6','9',
+    '7','0','7','1','7','2','7','3','7','4','7','5','7','6','7','7','7','8','7','9',
+    '8','0','8','1','8','2','8','3','8','4','8','5','8','6','8','7','8','8','8','9',
+    '9','0','9','1','9','2','9','3','9','4','9','5','9','6','9','7','9','8','9','9',
+};
+
 // uint64 to decimal, right-to-left. buf must have 20 bytes.
-static char *
+// Uses 2-digit pairs to halve the number of div/mod operations.
+__attribute__((hot)) static char *
 u64toa(char *end, uint64 v)
 {
-    do {
-        *--end = '0' + (v % 10);
-        v /= 10;
-    } while (v);
+    while (v >= 100) {
+        int r = (int)(v % 100);
+        v /= 100;
+        *--end = digits[r * 2 + 1];
+        *--end = digits[r * 2];
+    }
+    if (v >= 10) {
+        *--end = digits[v * 2 + 1];
+        *--end = digits[v * 2];
+    } else {
+        *--end = '0' + (char)v;
+    }
     return end;
 }
 
 // reply "INSERTED <id>\r\n" without vsnprintf.
-static void
+__attribute__((hot)) static void
 reply_inserted(Conn *c, uint64 id)
 {
     char *buf = c->reply_buf;
@@ -757,7 +783,7 @@ reply_using(Conn *c, Tube *t)
 // reply_job tells the connection c which job to send.
 // Build "MSG ID SIZE\r\n" without vsnprintf.
 // Use the reply_job macro to compute msg length at compile time.
-static void
+__attribute__((hot)) static void
 reply_job_n(Conn *c, Job *j, const char *msg, int msglen)
 {
     c->out_job = j;
@@ -823,7 +849,8 @@ enqueue_waiting_conn(Conn *c)
 __attribute__((hot)) static void
 process_tube(Tube *t)
 {
-    while (t->ready.len > 0 && t->waiting_conns.len > 0 && !t->pause) {
+    if (t->pause) return;  // hoisted: pause can't change during the loop
+    while (t->ready.len > 0 && t->waiting_conns.len > 0) {
         Job *j = remove_ready_job(t->ready.data[0]);
         if (!j) {
             twarnx("job not ready");
@@ -879,7 +906,7 @@ enqueue_job(Server *s, Job *j, int64 delay, char update_store)
     Wal *w = shard_wal(s, j);
 
     j->reserver = NULL;
-    if (delay) {
+    if (unlikely(delay)) {
         j->r.deadline_at = now + delay;
         r = heapinsert(&j->tube->delay, j);
         if (unlikely(!r))
@@ -927,7 +954,7 @@ enqueue_job(Server *s, Job *j, int64 delay, char update_store)
     return 1;
 }
 
-static int
+__attribute__((cold)) static int
 bury_job(Server *s, Job *j, char update_store)
 {
     Wal *w = shard_wal(s, j);
@@ -960,6 +987,7 @@ bury_job(Server *s, Job *j, char update_store)
 void
 enqueue_reserved_jobs(Conn *c)
 {
+    c->soonest_job = NULL;
     while (!job_list_is_empty(&c->reserved_jobs)) {
         Job *j = job_list_remove(c->reserved_jobs.next);
         int r = enqueue_job(c->srv, j, 0, 0);
@@ -967,7 +995,6 @@ enqueue_reserved_jobs(Conn *c)
             bury_job(c->srv, j, 0);
         global_stat.reserved_ct--;
         j->tube->stat.reserved_ct--;
-        c->soonest_job = NULL;
     }
 }
 
@@ -1055,7 +1082,7 @@ kick_delayed_jobs(Server *s, Tube *t, uint n)
     return i;
 }
 
-static uint
+static inline uint
 kick_jobs(Server *s, Tube *t, uint n)
 {
     if (!job_list_is_empty(&t->buried))
@@ -1111,7 +1138,7 @@ remove_ready_job(Job *j)
 static bool
 is_job_reserved_by_conn(Conn *c, Job *j)
 {
-    return j && j->reserver == c && j->r.state == Reserved;
+    return likely(j != NULL) && j->reserver == c && j->r.state == Reserved;
 }
 
 static bool
@@ -1284,7 +1311,7 @@ _skip(Conn *c, int64 n, char *msg, int msglen)
     c->state = STATE_BITBUCKET;
 }
 
-static void
+__attribute__((hot)) static void
 enqueue_incoming_job(Conn *c)
 {
     int r;
@@ -1324,7 +1351,7 @@ enqueue_incoming_job(Conn *c)
 
     // In multi-worker mode, forward put to the tube's owner worker.
     if (c->srv->nworkers > 1) {
-        int target = j->tube->name_hash % c->srv->nworkers;
+        int target = j->tube->owner;
         if (target != c->srv->worker_id && c->srv->peer_fd[target] >= 0) {
           if (j->r.body_size > PUT_FWD_MAX_BODY + 2) {
             twarnx("put forwarding: body %d exceeds %d, enqueue local",
@@ -1378,18 +1405,16 @@ enqueue_incoming_job(Conn *c)
     }
 
     /* we have a complete job, so let's stick it in the pqueue */
+    global_stat.total_jobs_ct++;
+    j->tube->stat.total_jobs_ct++;
     r = enqueue_job(c->srv, j, j->r.delay, 1);
 
-    if (r == 1) {
-        global_stat.total_jobs_ct++;
-        j->tube->stat.total_jobs_ct++;
+    if (likely(r == 1)) {
         reply_inserted(c, j->r.id);
         return;
     }
 
     /* out of memory trying to grow the queue, so it gets buried */
-    global_stat.total_jobs_ct++;
-    j->tube->stat.total_jobs_ct++;
     bury_job(c->srv, j, 0);
     reply_line(c, STATE_SEND_WORD, MSG_BURIED_FMT, j->r.id);
 }
@@ -1452,47 +1477,56 @@ fmt_stats(char *buf, size_t size, void *x)
 
         for (int w = 0; w < s->nworkers; w++) {
             struct SharedStats *ss = &shared_stats[w];
-            agg_urgent += ss->urgent_ct;
-            agg_ready += ss->ready_ct;
-            agg_reserved += ss->reserved_ct;
-            agg_delayed += ss->delayed_ct;
-            agg_buried += ss->buried_ct;
-            agg_waiting += ss->waiting_ct;
-            agg_timeout += ss->timeout_ct;
-            agg_total_jobs += ss->total_jobs_ct;
-            agg_conns += ss->cur_conn_ct;
-            agg_producers += ss->cur_producer_ct;
-            agg_workers += ss->cur_worker_ct;
-            agg_tot_conns += ss->tot_conn_ct;
+            // Seqlock read: snapshot counters, retry if writer was active.
+            uint32 v1, v2;
+            uint64 su, sr, sres, sd, sb, sw2, sto, stj;
+            uint32 scc, scp, scw, stc;
+            uint64 sop[SHARED_STATS_OPS];
+            do {
+                v1 = __atomic_load_n(&ss->version, __ATOMIC_ACQUIRE);
+                su = ss->urgent_ct; sr = ss->ready_ct;
+                sres = ss->reserved_ct; sd = ss->delayed_ct;
+                sb = ss->buried_ct; sw2 = ss->waiting_ct;
+                sto = ss->timeout_ct; stj = ss->total_jobs_ct;
+                scc = ss->cur_conn_ct; scp = ss->cur_producer_ct;
+                scw = ss->cur_worker_ct; stc = ss->tot_conn_ct;
+                for (int i = 0; i < TOTAL_OPS && i < SHARED_STATS_OPS; i++)
+                    sop[i] = ss->op_ct[i];
+                v2 = __atomic_load_n(&ss->version, __ATOMIC_ACQUIRE);
+            } while ((v1 & 1) || v1 != v2);
+            agg_urgent += su; agg_ready += sr;
+            agg_reserved += sres; agg_delayed += sd;
+            agg_buried += sb; agg_waiting += sw2;
+            agg_timeout += sto; agg_total_jobs += stj;
+            agg_conns += scc; agg_producers += scp;
+            agg_workers += scw; agg_tot_conns += stc;
             for (int i = 0; i < TOTAL_OPS && i < SHARED_STATS_OPS; i++)
-                agg_op[i] += ss->op_ct[i];
+                agg_op[i] += sop[i];
         }
         // Deduplicate tube count across workers using open-addressed hash set.
-        // O(W*T) expected with O(1) per probe instead of O(nseen) linear scan.
+        // O(W*T) expected with O(1) per probe. Hash-first filter skips strcmp.
         #define SEEN_CAP 2048  // power of 2, > SHARED_MAX_TUBES
         #define SEEN_MASK (SEEN_CAP - 1)
-        static const char *seen_set[SEEN_CAP]; // open-addressed by name_hash
-        memset(seen_set, 0, sizeof(seen_set));
+        static const char *seen_name[SEEN_CAP];
+        static uint32 seen_hash[SEEN_CAP];
+        memset(seen_name, 0, sizeof(seen_name));
         int nseen = 0;
         for (int w = 0; w < s->nworkers; w++) {
             struct SharedStats *ss2 = &shared_stats[w];
             for (uint32 ti = 0; ti < ss2->tube_count; ti++) {
-                const char *name = ss2->tube_names[ti];
-                uint32 h = tube_name_hash(name);
-                int dup = 0;
+                const char *tname = ss2->tube_names[ti];
+                uint32 h = tube_name_hash(tname);
                 for (int probe = 0; probe < SEEN_CAP; probe++) {
                     int idx = (h + probe) & SEEN_MASK;
-                    if (!seen_set[idx]) {
-                        seen_set[idx] = name;
+                    if (!seen_name[idx]) {
+                        seen_name[idx] = tname;
+                        seen_hash[idx] = h;
                         nseen++;
                         break;
                     }
-                    if (strcmp(seen_set[idx], name) == 0) {
-                        dup = 1;
+                    if (seen_hash[idx] == h && strcmp(seen_name[idx], tname) == 0)
                         break;
-                    }
                 }
-                (void)dup;
             }
         }
         #undef SEEN_CAP
@@ -1708,10 +1742,10 @@ do_list_tubes(Conn *c, Ms *l)
     Tube *t;
     size_t i;
 
-    /* Upper bound: "---\n" (4) + N × ("- " + name + "\n") + "\r\n" (2).
-     * Over-allocates by (MAX_TUBE_NAME_LEN - actual_len) per tube,
-     * but avoids a measurement pass over the tube list. */
-    size_t maxsz = 6 + l->len * (3 + MAX_TUBE_NAME_LEN);
+    /* Exact size: "---\n" (4) + N × ("- " + name + "\n") + "\r\n" (2). */
+    size_t maxsz = 6;
+    for (i = 0; i < l->len; i++)
+        maxsz += 3 + ((Tube *)l->items[i])->name_len;
     if (maxsz > INT_MAX) {
         reply_serr(c, MSG_OUT_OF_MEMORY);
         return;
@@ -1807,13 +1841,13 @@ fmt_stats_tube(char *buf, size_t size, void *x)
             time_left);
 }
 
-static void
+__attribute__((hot)) static void
 maybe_enqueue_incoming_job(Conn *c)
 {
     Job *j = c->in_job;
 
-    /* do we have a complete job? */
-    if (c->in_job_read == j->r.body_size) {
+    /* do we have a complete job? (common for small bodies) */
+    if (likely(c->in_job_read == j->r.body_size)) {
         enqueue_incoming_job(c);
         return;
     }
@@ -2146,9 +2180,10 @@ dispatch_cmd(Conn *c)
         /* We want to update the delay deadline on disk, so reserve space for
          * that. */
         int z = 0;
+        Wal *release_wal = NULL;
         if (delay) {
-            Wal *w = shard_wal(c->srv, j);
-            z = walresvupdate(w);
+            release_wal = shard_wal(c->srv, j);
+            z = walresvupdate(release_wal);
             if (!z) {
                 /* Undo remove_reserved_job: restore counters and re-link. */
                 global_stat.reserved_ct++;
@@ -2173,7 +2208,7 @@ dispatch_cmd(Conn *c)
 
         /* out of memory trying to grow the queue, so it gets buried */
         if (z) {
-            walresvreturn(shard_wal(c->srv, j), z);
+            walresvreturn(release_wal, z);
             j->walresv -= z;
         }
         bury_job(c->srv, j, 0);
@@ -2341,28 +2376,36 @@ dispatch_cmd(Conn *c)
         // In multi-worker mode, build YAML from all workers' tube names
         // via shared memory. Avoids creating phantom tube objects.
         if (shared_stats && c->srv->nworkers > 1) {
-            // Collect unique tube names using hash-based dedup.
+            // Collect unique tube names using open-addressed hash dedup.
+            #define LT_CAP 2048
+            #define LT_MASK (LT_CAP - 1)
+            static const char *lt_set[LT_CAP];
+            memset(lt_set, 0, sizeof(lt_set));
             const char *names[SHARED_MAX_TUBES];
-            uint32 hashes[SHARED_MAX_TUBES];
             int count = 0;
             for (int w = 0; w < c->srv->nworkers; w++) {
                 struct SharedStats *ss = &shared_stats[w];
                 for (uint32 ti = 0; ti < ss->tube_count && count < SHARED_MAX_TUBES; ti++) {
-                    uint32 h = tube_name_hash(ss->tube_names[ti]);
+                    const char *name = ss->tube_names[ti];
+                    uint32 h = tube_name_hash(name);
                     int dup = 0;
-                    for (int k = 0; k < count; k++) {
-                        if (hashes[k] == h &&
-                            strcmp(names[k], ss->tube_names[ti]) == 0) {
-                            dup = 1; break;
+                    for (int probe = 0; probe < LT_CAP; probe++) {
+                        int idx = (h + probe) & LT_MASK;
+                        if (!lt_set[idx]) {
+                            lt_set[idx] = name;
+                            names[count++] = name;
+                            break;
+                        }
+                        if (strcmp(lt_set[idx], name) == 0) {
+                            dup = 1;
+                            break;
                         }
                     }
-                    if (!dup) {
-                        hashes[count] = h;
-                        names[count] = ss->tube_names[ti];
-                        count++;
-                    }
+                    (void)dup;
                 }
             }
+            #undef LT_CAP
+            #undef LT_MASK
             // Format YAML manually.
             size_t maxsz = 6 + count * (3 + MAX_TUBE_NAME_LEN);
             c->out_job = allocate_job(maxsz);
@@ -2426,16 +2469,17 @@ dispatch_cmd(Conn *c)
         }
         return;
 
-    case OP_USE:
+    case OP_USE: {
         name = c->cmd + CMD_USE_LEN;
-        if (!is_valid_tube(name, MAX_TUBE_NAME_LEN - 1)) {
+        size_t use_namelen = is_valid_tube(name, MAX_TUBE_NAME_LEN - 1);
+        if (!use_namelen) {
             reply_msg(c, MSG_BAD_FORMAT);
             return;
         }
         op_ct[type]++;
 
         // use is always local — no migration. Put forwarding handles remote tubes.
-        TUBE_ASSIGN(t, tube_find_or_make(name));
+        TUBE_ASSIGN(t, tube_find_or_make_n(name, use_namelen));
         if (!t) {
             reply_serr(c, MSG_OUT_OF_MEMORY);
             return;
@@ -2449,10 +2493,12 @@ dispatch_cmd(Conn *c)
 
         reply_using(c, c->use);
         return;
+    }
 
-    case OP_WATCH:
+    case OP_WATCH: {
         name = c->cmd + CMD_WATCH_LEN;
-        if (!is_valid_tube(name, MAX_TUBE_NAME_LEN - 1)) {
+        size_t watch_namelen = is_valid_tube(name, MAX_TUBE_NAME_LEN - 1);
+        if (!watch_namelen) {
             reply_msg(c, MSG_BAD_FORMAT);
             return;
         }
@@ -2469,8 +2515,7 @@ dispatch_cmd(Conn *c)
                 // Prepare migration message with pending reply.
                 struct MigMsg mm = {0};
                 mm.magic = MIG_MSG_MAGIC;
-                size_t nl = strlen(name);
-                memcpy(mm.watch_tube, name, nl);
+                memcpy(mm.watch_tube, name, watch_namelen);
                 memcpy(mm.use_tube, c->use->name, c->use->name_len);
                 mm.type = c->type;
 
@@ -2498,7 +2543,7 @@ dispatch_cmd(Conn *c)
         }
 
 watch_local:
-        TUBE_ASSIGN(t, tube_find_or_make(name));
+        TUBE_ASSIGN(t, tube_find_or_make_n(name, watch_namelen));
         if (!t) {
             reply_serr(c, MSG_OUT_OF_MEMORY);
             return;
@@ -2517,6 +2562,7 @@ watch_local:
         TUBE_ASSIGN(t, NULL);
         reply_msg(c, MSG_WATCHING_1);
         return;
+    }
 
     case OP_IGNORE:
         name = c->cmd + CMD_IGNORE_LEN;
@@ -2651,15 +2697,17 @@ enter_drain_mode(int sig)
     drain_mode = 1;
 }
 
-static void
+__attribute__((hot)) static void
 conn_want_command(Conn *c)
 {
     epollq_add(c, 'r');
 
     /* was this a peek or stats command? */
-    if (c->out_job && c->out_job->r.state == Copy)
-        job_free(c->out_job);
-    c->out_job = NULL;
+    if (unlikely(c->out_job)) {
+        if (c->out_job->r.state == Copy)
+            job_free(c->out_job);
+        c->out_job = NULL;
+    }
 
     c->reply_sent = 0; /* now that we're done, reset this */
     c->state = STATE_WANT_COMMAND;
@@ -2676,14 +2724,14 @@ conn_process_io(Conn *c)
     switch (c->state) {
     case STATE_WANT_COMMAND: {
         // Don't read more data while waiting for forwarded reply.
-        if (c->fwd_pending)
+        if (unlikely(c->fwd_pending))
             return;
         r = read(c->sock.fd, c->cmd + c->cmd_read, LINE_BUF_SIZE - c->cmd_read);
-        if (r == -1) {
+        if (unlikely(r == -1)) {
             check_err(c, "read()");
             return;
         }
-        if (r == 0) {
+        if (unlikely(r == 0)) {
             c->state = STATE_CLOSE;
             return;
         }
@@ -2760,15 +2808,14 @@ conn_process_io(Conn *c)
         return;
     }
     case STATE_WANT_DATA: {
-        // TCP_QUICKACK is set once in h_conn before conn_process_io.
         j = c->in_job;
 
         r = read(c->sock.fd, j->body + c->in_job_read, j->r.body_size -c->in_job_read);
-        if (r == -1) {
+        if (unlikely(r == -1)) {
             check_err(c, "read()");
             return;
         }
-        if (r == 0) {
+        if (unlikely(r == 0)) {
             c->state = STATE_CLOSE;
             return;
         }
@@ -2782,11 +2829,11 @@ conn_process_io(Conn *c)
     }
     case STATE_SEND_WORD:
         r= write(c->sock.fd, c->reply + c->reply_sent, c->reply_len - c->reply_sent);
-        if (r == -1) {
+        if (unlikely(r == -1)) {
             check_err(c, "write()");
             return;
         }
-        if (r == 0) {
+        if (unlikely(r == 0)) {
             c->state = STATE_CLOSE;
             return;
         }
@@ -2811,11 +2858,11 @@ conn_process_io(Conn *c)
         iov[1].iov_len = j->r.body_size - c->out_job_sent;
 
         r = writev(c->sock.fd, iov, 2);
-        if (r == -1) {
+        if (unlikely(r == -1)) {
             check_err(c, "writev()");
             return;
         }
-        if (r == 0) {
+        if (unlikely(r == 0)) {
             c->state = STATE_CLOSE;
             return;
         }
@@ -2869,11 +2916,10 @@ h_conn(const int fd, const short which, Conn *c)
         c->halfclosed = 1;
     }
 
-    // TCP_QUICKACK: once per epoll event, not per read.
-    if (which == 'r') {
-        int quickack = 1;
-        setsockopt(c->sock.fd, IPPROTO_TCP, TCP_QUICKACK, &quickack, sizeof quickack);
-    }
+    // TCP_QUICKACK removed: with TCP_NODELAY enabled, replies carry
+    // piggybacked ACKs. The extra setsockopt syscall per read event
+    // (~400ns) provides no benefit — delayed ACK only matters when
+    // no reply is sent, which doesn't affect hot-path throughput.
 
     conn_process_io(c);
 
@@ -3004,12 +3050,13 @@ prottick(Server *s)
         }
     }
 
-    // Publish stats to shared memory (1Hz).
+    // Publish stats to shared memory (1Hz) with seqlock for torn-read protection.
     if (shared_stats && s->worker_id >= 0) {
         static int64 last_stats_sync;
         if (now - last_stats_sync >= 1000000000LL) { // 1 second
             last_stats_sync = now;
             struct SharedStats *ss = &shared_stats[s->worker_id];
+            __atomic_add_fetch(&ss->version, 1, __ATOMIC_RELEASE); // odd = writing
             ss->ready_ct = ready_ct;
             ss->delayed_ct = delayed_ct;
             ss->buried_ct = global_stat.buried_ct;
@@ -3032,6 +3079,7 @@ prottick(Server *s)
             }
             for (int i = 0; i < TOTAL_OPS && i < SHARED_STATS_OPS; i++)
                 ss->op_ct[i] = op_ct[i];
+            __atomic_add_fetch(&ss->version, 1, __ATOMIC_RELEASE); // even = done
         }
     }
 
@@ -3090,6 +3138,7 @@ h_accept(const int fd, const short which, Server *s)
 
         int flags = 1;
         setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &flags, sizeof flags);
+        setsockopt(cfd, IPPROTO_TCP, TCP_QUICKACK, &flags, sizeof flags);
 
         // In multi-worker mode, speculatively read the first command
         // to determine which worker should own this connection.
@@ -3351,15 +3400,19 @@ prot_handle_forwarded_cmd(Server *s, struct CmdFwdMsg *fwd)
                 rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE, "BAD_FORMAT\r\n");
             }
         } else {
-            // peek-ready/delayed/buried: search all local tubes.
+            // peek-ready/delayed/buried: determine variant once, then search.
+            int peek_type = 0; // 1=ready, 2=delayed, 3=buried
+            if (strncmp(cmd, "peek-ready", 10) == 0) peek_type = 1;
+            else if (strncmp(cmd, "peek-delayed", 12) == 0) peek_type = 2;
+            else if (strncmp(cmd, "peek-buried", 11) == 0) peek_type = 3;
             Job *found = NULL;
             for (size_t ti = 0; ti < tubes.len && !found; ti++) {
                 Tube *t = tubes.items[ti];
-                if (strncmp(cmd, "peek-ready", 10) == 0 && t->ready.len)
+                if (peek_type == 1 && t->ready.len)
                     found = job_copy(t->ready.data[0]);
-                else if (strncmp(cmd, "peek-delayed", 12) == 0 && t->delay.len)
+                else if (peek_type == 2 && t->delay.len)
                     found = job_copy(t->delay.data[0]);
-                else if (strncmp(cmd, "peek-buried", 11) == 0 && !job_list_is_empty(&t->buried))
+                else if (peek_type == 3 && !job_list_is_empty(&t->buried))
                     found = job_copy(t->buried.next);
             }
             if (found) {
@@ -3380,10 +3433,11 @@ prot_handle_forwarded_cmd(Server *s, struct CmdFwdMsg *fwd)
         rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE, "UNKNOWN_COMMAND\r\n");
     }
 
-    // Send reply back to originating worker.
+    // Send reply back to originating worker (variable-length: header + data).
     if (fwd->from_worker >= 0 && fwd->from_worker < s->nworkers
         && s->peer_fd[fwd->from_worker] >= 0) {
-        if (write(s->peer_fd[fwd->from_worker], &rpl, sizeof(rpl)) <= 0) {
+        size_t rpl_len = offsetof(struct CmdReplyMsg, data) + rpl.data_len;
+        if (write(s->peer_fd[fwd->from_worker], &rpl, rpl_len) <= 0) {
             twarnx("fwd_cmd reply write to peer %d failed", fwd->from_worker);
         }
     }
@@ -3454,7 +3508,8 @@ prot_handle_forwarded_put(Server *s, struct PutFwdMsg *pm)
 reply:
     if (pm->from_worker >= 0 && pm->from_worker < s->nworkers
         && s->peer_fd[pm->from_worker] >= 0) {
-        if (write(s->peer_fd[pm->from_worker], &rpl, sizeof(rpl)) <= 0) {
+        size_t rpl_len = offsetof(struct CmdReplyMsg, data) + rpl.data_len;
+        if (write(s->peer_fd[pm->from_worker], &rpl, rpl_len) <= 0) {
             twarnx("fwd_put reply write to peer %d failed", pm->from_worker);
         }
     }

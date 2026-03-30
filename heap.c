@@ -34,6 +34,7 @@ siftdown(Heap *h, size_t k)
 
 
 // Siftup using hole technique.
+// Prefetches grandchildren to hide memory latency in large heaps.
 __attribute__((hot)) static void
 siftup(Heap *h, size_t k)
 {
@@ -41,6 +42,11 @@ siftup(Heap *h, size_t k)
     for (;;) {
         size_t l = k * 2 + 1;
         size_t r = k * 2 + 2;
+
+        // Prefetch grandchildren (next iteration's comparison targets).
+        size_t gl = l * 2 + 1;
+        if (gl < h->len) __builtin_prefetch(h->data[gl], 0, 1);
+        if (gl + 2 < h->len) __builtin_prefetch(h->data[gl + 2], 0, 1);
 
         // Find the smallest child, comparing against saved element x.
         size_t s = k;

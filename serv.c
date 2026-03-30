@@ -231,9 +231,15 @@ handle_peer(struct PeerCtx *ctx, int ev)
     }
 
     if (buf.magic == CMD_FWD_MAGIC) {
-        if (r < (ssize_t)sizeof(struct CmdFwdMsg)) {
-            twarnx("handle_peer: short CmdFwdMsg read %zd/%zu from peer %d",
-                   r, sizeof(struct CmdFwdMsg), ctx->peer_idx);
+        // Variable-length: header + cmd_len bytes.
+        if (r < (ssize_t)offsetof(struct CmdFwdMsg, cmd)) {
+            twarnx("handle_peer: short CmdFwdMsg read %zd from peer %d",
+                   r, ctx->peer_idx);
+            return;
+        }
+        if (buf.cmd.cmd_len > LINE_BUF_SIZE ||
+            r < (ssize_t)(offsetof(struct CmdFwdMsg, cmd) + buf.cmd.cmd_len)) {
+            twarnx("handle_peer: truncated CmdFwdMsg cmd from peer %d", ctx->peer_idx);
             return;
         }
         prot_handle_forwarded_cmd(s, &buf.cmd);
@@ -250,9 +256,10 @@ handle_peer(struct PeerCtx *ctx, int ev)
         }
         prot_handle_forwarded_put(s, &buf.put);
     } else if (buf.magic == CMD_REPLY_MAGIC) {
-        if (r < (ssize_t)sizeof(struct CmdReplyMsg)) {
-            twarnx("handle_peer: short CmdReplyMsg read %zd/%zu from peer %d",
-                   r, sizeof(struct CmdReplyMsg), ctx->peer_idx);
+        // Variable-length: header + data_len bytes.
+        if (r < (ssize_t)offsetof(struct CmdReplyMsg, data)) {
+            twarnx("handle_peer: short CmdReplyMsg read %zd from peer %d",
+                   r, ctx->peer_idx);
             return;
         }
         // Match reply to pending slot by sequence number (hash lookup).

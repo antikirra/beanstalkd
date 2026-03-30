@@ -578,37 +578,54 @@ __attribute__((hot)) static int
 filewritev(File *f, Job *j, struct iovec *iov, int iovcnt)
 {
     int total = 0;
-    int i;
-    for (i = 0; i < iovcnt; i++)
+    for (int i = 0; i < iovcnt; i++)
         total += iov[i].iov_len;
 
-    int written = 0;
-    while (written < total) {
-        ssize_t r = writev(f->fd, iov, iovcnt);
-        if (r == -1 && errno == EINTR)
-            continue;
-        if (unlikely(r <= 0)) {
-            twarn("writev");
-            return 0;
-        }
-        written += r;
-        // Advance iov past fully written segments.
+    // Fast path: single writev completes everything (common case).
+    ssize_t r = writev(f->fd, iov, iovcnt);
+    if (likely(r == total))
+        goto done;
+
+    // EINTR before any bytes written: retry from scratch.
+    if (r == -1) {
+        if (errno != EINTR) { twarn("writev"); return 0; }
+        r = 0;
+    } else if (unlikely(r <= 0)) {
+        twarn("writev");
+        return 0;
+    }
+
+    // Slow path: partial write, advance iov and retry.
+    {
+        int written = (int)r;
         while (iovcnt > 0 && (size_t)r >= iov[0].iov_len) {
-            r -= iov[0].iov_len;
-            iov++;
-            iovcnt--;
+            r -= iov[0].iov_len; iov++; iovcnt--;
         }
         if (iovcnt > 0 && r > 0) {
             iov[0].iov_base = (char *)iov[0].iov_base + r;
             iov[0].iov_len -= r;
         }
+        while (written < total) {
+            r = writev(f->fd, iov, iovcnt);
+            if (r == -1 && errno == EINTR) continue;
+            if (unlikely(r <= 0)) { twarn("writev"); return 0; }
+            written += r;
+            while (iovcnt > 0 && (size_t)r >= iov[0].iov_len) {
+                r -= iov[0].iov_len; iov++; iovcnt--;
+            }
+            if (iovcnt > 0 && r > 0) {
+                iov[0].iov_base = (char *)iov[0].iov_base + r;
+                iov[0].iov_len -= r;
+            }
+        }
     }
 
-    f->w->resv -= written;
-    f->resv -= written;
-    j->walresv -= written;
-    j->walused += written;
-    f->w->alive += written;
+done:
+    f->w->resv -= total;
+    f->resv -= total;
+    j->walresv -= total;
+    j->walused += total;
+    f->w->alive += total;
     return 1;
 }
 

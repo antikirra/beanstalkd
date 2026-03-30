@@ -247,6 +247,8 @@ struct Tube {
     char name[MAX_TUBE_NAME_LEN];
     size_t name_len;                    // cached strlen(name)
     uint   name_hash;                   // cached tube_name_hash(name)
+    int    owner;                       // name_hash % nworkers, or -1 if single-process
+    int    shard;                       // name_hash % nshards, or -1 if no sharding
     Tube *ht_next; // hash table chain for global tube lookup
     Heap ready;
     Heap delay;
@@ -360,6 +362,7 @@ Tube *tube_find(Ms *tubeset, const char *name);
 Tube *tube_find_name(const char *name, size_t len);
 uint  tube_name_hash(const char *name);
 Tube *tube_find_or_make(const char *name);
+Tube *tube_find_or_make_n(const char *name, size_t len);
 #define TUBE_ASSIGN(a,b) do { \
     Tube *_tb = (b); \
     if ((a) != _tb) { tube_dref(a); (a) = _tb; tube_iref(a); } \
@@ -412,18 +415,18 @@ void h_accept_migrated(int cfd, Server *s, struct MigMsg *mm);
 
 struct CmdFwdMsg {
     uint32 magic;
-    char   cmd[LINE_BUF_SIZE];
-    size_t cmd_len;
     int    from_worker;           // who to send reply back to
     uint32 seq;                   // sequence number for reply routing
+    size_t cmd_len;
+    char   cmd[LINE_BUF_SIZE];   // variable-length: only cmd_len bytes sent
 };
 
 #define CMD_FWD_REPLY_SIZE 4096
 struct CmdReplyMsg {
     uint32 magic;
-    char   data[CMD_FWD_REPLY_SIZE];
-    int    data_len;
     uint32 seq;                   // echo back sequence from CmdFwdMsg
+    int    data_len;
+    char   data[CMD_FWD_REPLY_SIZE]; // variable-length: only data_len bytes sent
 };
 // Put forwarding: forward a put command + body to the tube's owner worker.
 // Uses a flexible array member for the body.
@@ -466,49 +469,47 @@ int make_nonblocking(int fd);
 #define CONN_TYPE_WORKER   2
 #define CONN_TYPE_WAITING  4
 
+// Conn struct layout: hot fields packed in first 3 cache lines (192 bytes),
+// large buffers (cmd[], reply_buf[]) at end to avoid cache pollution.
 struct Conn {
+    // --- cache line 1 (0-63): core state, accessed on every event ---
     Server *srv;
     Socket sock;
     char   state;       // see the STATE_* description
     char   type;        // combination of CONN_TYPE_* values
-    Conn   *next;       // only used in epollq functions
+    byte   in_conns;    // 1 if the conn is in srv->conns heap, 0 otherwise
+    byte   fwd_pending; // 1 if waiting for forwarded command reply
+    int    rw;          // currently want: 'r', 'w', or 'h'
+    int    pending_timeout; // -1 = forever
     Tube   *use;        // tube currently in use
+
+    // --- cache line 2 (64-127): scheduling, job I/O ---
+    Conn   *next;       // only used in epollq functions
     uint64 gen;         // generation counter, incremented on pool reuse
     int64  tickat;      // time at which to do more work; determines pos in heap
     size_t tickpos;     // position in srv->conns, stale when in_conns=0
-    byte   in_conns;    // 1 if the conn is in srv->conns heap, 0 otherwise
-    byte   fwd_pending; // 1 if waiting for forwarded command reply
     Job    *soonest_job;// memoization of the soonest job
-    int    rw;          // currently want: 'r', 'w', or 'h'
-
-    // How long client should "wait" for the next job; -1 means forever.
-    int    pending_timeout;
-
-    // Used to inform state machine that client no longer waits for the data.
+    Job    *out_job;    // a job to be sent to the client
+    int    out_job_sent;// how many bytes of *out_job were sent already
     char   halfclosed;
 
-    char   cmd[LINE_BUF_SIZE];     // this string is NOT NUL-terminated
-    size_t cmd_len;
-    size_t cmd_read;
-
+    // --- cache line 3 (128-191): reply, command metadata ---
     char *reply;
     int  reply_len;
     int  reply_sent;
-    char reply_buf[LINE_BUF_SIZE]; // this string IS NUL-terminated
-
-    // How many bytes of in_job->body have been read so far. If in_job is NULL
-    // while in_job_read is nonzero, we are in bit bucket mode and
-    // in_job_read's meaning is inverted -- then it counts the bytes that
-    // remain to be thrown away.
+    size_t cmd_len;
+    size_t cmd_read;
     int64 in_job_read;
     Job   *in_job;              // a job to be read from the client
 
-    Job *out_job;               // a job to be sent to the client
-    int out_job_sent;           // how many bytes of *out_job were sent already
-
+    // --- cache line 4+: watch, reserved jobs ---
     Tube   *watch;              // the single watched tube
     size_t  watch_idx;          // position in watch->waiting_conns for O(1) removal
     Job reserved_jobs;          // linked list header
+
+    // --- large buffers at end to avoid cache pollution ---
+    char   cmd[LINE_BUF_SIZE];     // this string is NOT NUL-terminated
+    char   reply_buf[LINE_BUF_SIZE]; // this string IS NUL-terminated
 };
 int  conn_less(void *ca, void *cb);
 void conn_setpos(void *c, size_t i);
@@ -666,6 +667,7 @@ int  recv_fd(int sock, void *buf, size_t buflen);
 #define SHARED_STATS_OPS 26
 #define SHARED_MAX_TUBES 1024
 struct SharedStats {
+    uint32 version;               // seqlock: odd = write in progress
     uint64 ready_ct;
     uint64 delayed_ct;
     uint64 buried_ct;

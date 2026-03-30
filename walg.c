@@ -325,8 +325,8 @@ walwrite(Wal *w, Job *j)
     int r = 0;
 
     if (!w->use) return 1;
-    if (w->cur->resv > 0 || usenext(w)) {
-        if (j->file) {
+    if (likely(w->cur->resv > 0) || usenext(w)) {
+        if (likely(j->file)) {
             r = filewrjobshort(w->cur, j);
         } else {
             r = filewrjobfull(w->cur, j);
@@ -487,7 +487,7 @@ reserve(Wal *w, int n)
     // return value must be nonzero but is otherwise ignored
     if (!w->use) return 1;
 
-    if (w->cur->free >= n) {
+    if (likely(w->cur->free >= n)) {
         w->cur->free -= n;
         w->cur->resv += n;
         w->resv += n;
