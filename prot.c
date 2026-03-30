@@ -801,6 +801,34 @@ reply_job_n(Conn *c, Job *j, const char *msg, int msglen)
 }
 #define reply_job(c, j, msg) reply_job_n(c, j, msg, sizeof(msg) - 1)
 
+// reply "KICKED <count>\r\n" without vsnprintf.
+static void
+reply_kicked(Conn *c, uint64 count)
+{
+    char *end = c->reply_buf + LINE_BUF_SIZE;
+    *--end = '\n';
+    *--end = '\r';
+    char *p = u64toa(end, count);
+    *--p = ' ';
+    p -= 6;
+    memcpy(p, "KICKED", 6);
+    reply(c, p, (int)(c->reply_buf + LINE_BUF_SIZE - p), STATE_SEND_WORD);
+}
+
+// reply "BURIED <id>\r\n" without vsnprintf.
+static void
+reply_buried(Conn *c, uint64 id)
+{
+    char *end = c->reply_buf + LINE_BUF_SIZE;
+    *--end = '\n';
+    *--end = '\r';
+    char *p = u64toa(end, id);
+    *--p = ' ';
+    p -= 6;
+    memcpy(p, "BURIED", 6);
+    reply(c, p, (int)(c->reply_buf + LINE_BUF_SIZE - p), STATE_SEND_WORD);
+}
+
 // remove_waiting_conn unsets CONN_TYPE_WAITING for the connection,
 // removes it from the waiting_conns set of every tube it's watching.
 // Noop if connection is not waiting.
@@ -1437,7 +1465,7 @@ enqueue_incoming_job(Conn *c)
 
     /* out of memory trying to grow the queue, so it gets buried */
     bury_job(c->srv, j, 0);
-    reply_line(c, STATE_SEND_WORD, MSG_BURIED_FMT, j->r.id);
+    reply_buried(c, j->r.id);
 }
 
 static uint
@@ -2332,7 +2360,7 @@ dispatch_cmd(Conn *c)
 
         i = kick_jobs(c->srv, c->use, count);
         if (i == 0 && try_forward_tube_cmd(c, c->use->name_hash)) return;
-        reply_line(c, STATE_SEND_WORD, "KICKED %u\r\n", i);
+        reply_kicked(c, (uint64)i);
         return;
 
     case OP_KICKJOB:
@@ -3219,10 +3247,15 @@ h_accept(const int fd, const short which, Server *s)
             nr = read(cfd, first_buf, sizeof(first_buf) - 1);
             if (nr > 0) {
                 first_buf[nr] = '\0';
-                // Make a copy for parsing (parse_tube_from_first_cmd modifies buf).
-                char parse_buf[LINE_BUF_SIZE];
-                memcpy(parse_buf, first_buf, nr + 1);
-                tube_name = parse_tube_from_first_cmd(parse_buf, nr);
+                // Parse in-place, then restore the \r that was overwritten.
+                tube_name = parse_tube_from_first_cmd(first_buf, nr);
+                // Restore \r: parse_tube_from_first_cmd replaced \r with \0.
+                for (ssize_t ri = 0; ri < nr - 1; ri++) {
+                    if (first_buf[ri] == '\0' && first_buf[ri+1] == '\n') {
+                        first_buf[ri] = '\r';
+                        break;
+                    }
+                }
 
                 if (tube_name && is_valid_tube(tube_name, MAX_TUBE_NAME_LEN - 1)) {
                     size_t tnlen = strlen(tube_name);

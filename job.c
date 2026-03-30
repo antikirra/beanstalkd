@@ -169,15 +169,23 @@ allocate_job(int body_size)
         }
     }
 
-    // Zero the entire Job (Jobrec + pointers + counters) in one pass,
-    // then set only the non-zero fields.  Eliminates 8 redundant NULL
-    // assignments that were individually written after memset(&j->r,0).
-    memset(j, 0, sizeof(Job));
+    // Zero only Jobrec (80B), not entire Job (240B+).
+    // Pointer and counter fields set explicitly below.
+    memset(&j->r, 0, sizeof(Jobrec));
     j->r.created_at = now ? now : nanoseconds();
     j->r.body_size = body_size;
+    j->heap_index = 0;
+    j->tube = NULL;
+    j->reserver = NULL;
     j->body = (char *)j + sizeof(Job);
     j->prev = j;
     j->next = j;
+    j->ht_next = NULL;
+    j->file = NULL;
+    j->fnext = NULL;
+    j->fprev = NULL;
+    j->walresv = 0;
+    j->walused = 0;
     return j;
 }
 

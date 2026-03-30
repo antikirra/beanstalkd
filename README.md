@@ -20,26 +20,21 @@ Requires **Linux 6.1+**, glibc, gcc. Uses Linux APIs directly: `epoll`, `accept4
 
 Server: Debian 12, kernel 6.1.0-44, 8 vCPU, 12GB RAM, SSD. Both binaries: `gcc -O2 -DNDEBUG`, WAL enabled, fsync 50ms. C bench client (epoll, pipelined). All values are ops/s (put + reserve + delete cycles).
 
-| Scenario | Upstream | Fork (`-w 1`) | Fork (8 workers) |
-|----------|----------|---------------|-------------------|
-| **S1** Throughput 8 conn, pipe=64 | 49,486 | **124,126** (+151%) | **203,054** (+310%) |
-| **S2** Latency 1 conn, pipe=1 | 24,858 | **62,264** (+150%) | 50,435 (+103%) |
-| **S3** Large body 16KB, 8 conn | 27,026 | **38,224** (+41%) | **81,772** (+203%) |
-| **S4** High concurrency 32 conn | 34,762 | **97,191** (+180%) | **194,889** (+461%) |
-| **S5** Deep pipeline 1 conn, pipe=256 | 67,859 | **123,429** (+82%) | **139,191** (+105%) |
-| **S6** 500 tubes, 4 clients | 20,742 | 20,198 | **37,229** (+80%) |
+| Scenario | Upstream | Fork (`-w 1`) | 1W vs Up | Fork (`-w 8`) | 8W vs Up |
+|----------|----------|---------------|----------|----------------|----------|
+| **S1** Throughput 8 conn, pipe=64 | 34,803 | **106,335** | **+206%** | **214,739** | **+517%** |
+| **S2** Latency 1 conn, pipe=1 | 27,815 | **39,138** | **+41%** | **45,044** | **+62%** |
+| **S3** Large body 16KB, 8 conn | 27,419 | **45,341** | **+65%** | **116,185** | **+324%** |
+| **S4** High concurrency 32 conn | 32,046 | **104,057** | **+225%** | **176,380** | **+450%** |
+| **S5** Deep pipeline 1 conn, pipe=256 | 59,630 | **115,198** | **+93%** | **112,460** | **+89%** |
+| **S6** 500 tubes, 4 clients | 15,851 | **19,894** | **+26%** | **35,017** | **+121%** |
 
-<details>
-<summary>Latency breakdown</summary>
-
-| | Upstream | Fork (`-w 1`) | Fork (8W) |
-|---|---|---|---|
-| S1 P50 | 5,173 µs | 2,742 µs | **1,796 µs** |
-| S1 P99.9 | 51,598 µs | **10,118 µs** | 38,728 µs |
-| S2 P50 | 34.0 µs | **26.2 µs** | 28.7 µs |
-| S2 P99.9 | 16,708 µs | **7,571 µs** | 11,128 µs |
-
-</details>
+| Latency | Upstream | Fork (`-w 1`) | Fork (`-w 8`) |
+|---------|----------|---------------|---------------|
+| S1 P50 | 5,733 µs | 3,196 µs | **1,891 µs** |
+| S1 P99.9 | 167,918 µs | **13,921 µs** (12x) | 26,215 µs |
+| S2 P50 | 31.0 µs | 33.0 µs | **29.3 µs** |
+| S2 P99.9 | 11,208 µs | **9,819 µs** | **8,758 µs** |
 
 ```sh
 docker build -f Dockerfile.benchmark . && docker run --rm <image>  # reproducible A/B

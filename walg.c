@@ -257,14 +257,17 @@ moveone(Wal *w)
 
 
 // walcompact migrates jobs from old wal files. Returns 0 if WAL was disabled.
+// Batches up to 8 migrations per ratio step to amortize reservation overhead.
 static int
 walcompact(Wal *w)
 {
     int r;
 
     for (r=ratio(w); r>=2; r--) {
-        if (!moveone(w))
-            return 0;
+        for (int batch = 0; batch < 8; batch++) {
+            if (!moveone(w))
+                return batch > 0; // partial batch is not a failure
+        }
     }
     return 1;
 }
