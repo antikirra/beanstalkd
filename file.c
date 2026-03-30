@@ -630,7 +630,7 @@ done:
 }
 
 
-int
+__attribute__((hot)) int
 filewrjobshort(File *f, Job *j)
 {
     int nl = 0; // name len 0 indicates short record

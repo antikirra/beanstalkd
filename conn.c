@@ -210,16 +210,14 @@ conn_reserve_job(Conn *c, Job *j) {
 
 // Return true if c has a reserved job with less than one second until its
 // deadline.
-int
+inline int
 conndeadlinesoon(Conn *c)
 {
-    int64 t = now;
     Job *j = connsoonestjob(c);
-
-    return j && t >= j->r.deadline_at - SAFETY_MARGIN;
+    return j && now >= j->r.deadline_at - SAFETY_MARGIN;
 }
 
-int
+inline int
 conn_ready(Conn *c)
 {
     return c->watch && c->watch->ready.len && !c->watch->pause;

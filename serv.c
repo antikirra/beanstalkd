@@ -370,11 +370,15 @@ srvserve(Server *s)
         int64 period = prottick(s);
 
         // Drain all ready events before next prottick.
+        // Update `now` once per batch — events within a batch are
+        // effectively simultaneous, saves ~5ns vDSO call per event.
         int rw;
         while ((rw = socknext(&sock, period)) > 0) {
-            now = nanoseconds();
+            if (period) {
+                now = nanoseconds();
+                period = 0; // subsequent calls: non-blocking drain, reuse `now`
+            }
             sock->f(sock->x, rw);
-            period = 0; // subsequent calls use zero timeout (non-blocking drain)
         }
         if (rw == -1) {
             twarnx("socknext");

@@ -753,16 +753,19 @@ u64toa(char *end, uint64 v)
 }
 
 // reply "INSERTED <id>\r\n" without vsnprintf.
+// Writes number directly into reply_buf tail to avoid intermediate buffer.
 __attribute__((hot)) static void
 reply_inserted(Conn *c, uint64 id)
 {
     char *buf = c->reply_buf;
     memcpy(buf, "INSERTED ", 9);
-    char numbuf[20];
-    char *numend = numbuf + 20;
+    // u64toa writes right-to-left into buf[9..28], then we close the gap.
+    char *numend = buf + 29; // 9 + 20 (max digits)
     char *numstart = u64toa(numend, id);
     int nlen = (int)(numend - numstart);
-    memcpy(buf + 9, numstart, nlen);
+    // Shift number left to abut "INSERTED " — typically 1-4 byte memmove.
+    if (numstart != buf + 9)
+        memmove(buf + 9, numstart, nlen);
     buf[9 + nlen] = '\r';
     buf[10 + nlen] = '\n';
     reply(c, buf, 11 + nlen, STATE_SEND_WORD);
@@ -2096,7 +2099,19 @@ dispatch_cmd(Conn *c)
             return;
         }
 
-        /* try to get a new job for this guy */
+        /* Fast path: if tube has a ready job, reserve directly without
+         * enqueueing into waiting_conns (saves ms_append+ms_take round-trip). */
+        if (likely(c->watch->ready.len > 0) && !c->watch->pause) {
+            j = remove_ready_job(c->watch->ready.data[0]);
+            if (likely(j)) {
+                global_stat.reserved_ct++;
+                conn_reserve_job(c, j);
+                reply_job(c, j, MSG_RESERVED);
+                return;
+            }
+        }
+
+        /* Slow path: no ready job, enqueue and wait. */
         wait_for_job(c, timeout);
         process_tube(c->watch);
         return;
@@ -2954,7 +2969,7 @@ h_conn(const int fd, const short which, Conn *c)
     // commands buffered), saving 2 setsockopt syscalls for non-pipelined case.
     int corked = 0;
     while (cmd_data_ready(c) && !c->fwd_pending
-           && (c->cmd_len = scan_line_end(c->cmd, c->cmd_read, 0))) {
+           && (c->cmd_len || (c->cmd_len = scan_line_end(c->cmd, c->cmd_read, 0)))) {
         if (!corked && c->cmd_read > c->cmd_len) {
             int cork = 1;
             setsockopt(c->sock.fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof cork);
