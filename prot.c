@@ -1951,14 +1951,14 @@ dispatch_cmd(Conn *c)
         }
         op_ct[type]++;
 
-        if (body_size > job_data_size_limit) {
+        if (unlikely(body_size > job_data_size_limit)) {
             /* throw away the job body and respond with JOB_TOO_BIG */
             skip(c, (int64)body_size + 2, MSG_JOB_TOO_BIG);
             return;
         }
 
         /* don't allow trailing garbage */
-        if (end_buf[0] != '\0') {
+        if (unlikely(end_buf[0] != '\0')) {
             reply_msg(c, MSG_BAD_FORMAT);
             return;
         }

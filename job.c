@@ -169,21 +169,15 @@ allocate_job(int body_size)
         }
     }
 
-    memset(&j->r, 0, sizeof(Jobrec));
+    // Zero the entire Job (Jobrec + pointers + counters) in one pass,
+    // then set only the non-zero fields.  Eliminates 8 redundant NULL
+    // assignments that were individually written after memset(&j->r,0).
+    memset(j, 0, sizeof(Job));
     j->r.created_at = now ? now : nanoseconds();
     j->r.body_size = body_size;
-    j->heap_index = 0;
-    j->tube = NULL;
-    j->reserver = NULL;
     j->body = (char *)j + sizeof(Job);
     j->prev = j;
     j->next = j;
-    j->ht_next = NULL;
-    j->file = NULL;
-    j->fnext = NULL;
-    j->fprev = NULL;
-    j->walresv = 0;
-    j->walused = 0;
     return j;
 }
 
@@ -326,14 +320,20 @@ job_copy(Job *j)
         return (Job *) 0;
     }
 
-    memcpy(n, j, sizeof(Job) + j->r.body_size);
+    // Copy Jobrec (the value fields) and body only.
+    // Skip Job's pointer fields (tube, file, ht_next, etc.) which are
+    // reset below — avoids copying ~80 bytes that get overwritten.
+    n->r = j->r;
     n->body = (char *)n + sizeof(Job);
+    memcpy(n->body, j->body, j->r.body_size);
+    n->heap_index = 0;
     job_list_reset(n);
-
-    n->file = NULL; /* copies do not have refcnt on the wal */
     n->ht_next = NULL;
+    n->file = NULL;
     n->fnext = NULL;
     n->fprev = NULL;
+    n->walresv = 0;
+    n->walused = 0;
 
     n->tube = 0; /* Don't use memcpy for the tube, which we must refcount. */
     TUBE_ASSIGN(n->tube, j->tube);

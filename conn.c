@@ -157,15 +157,20 @@ conntickat(Conn *c)
 __attribute__((hot)) void
 connsched(Conn *c)
 {
-    c->tickat = conntickat(c);
+    int64 newtickat = conntickat(c);
     if (c->in_conns) {
-        if (c->tickat) {
-            heapresift(&c->srv->conns, c->tickpos);
+        if (newtickat) {
+            if (newtickat != c->tickat) {
+                c->tickat = newtickat;
+                heapresift(&c->srv->conns, c->tickpos);
+            }
         } else {
+            c->tickat = 0;
             heapremove(&c->srv->conns, c->tickpos);
             c->in_conns = 0;
         }
-    } else if (c->tickat) {
+    } else if (newtickat) {
+        c->tickat = newtickat;
         c->in_conns = heapinsert(&c->srv->conns, c);
     }
 }
