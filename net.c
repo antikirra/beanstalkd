@@ -163,8 +163,16 @@ make_inet_socket(char *host, char *port)
         }
 
         {
-            int qlen = 256;
+            int qlen = 1024;
             setsockopt(fd, IPPROTO_TCP, TCP_FASTOPEN, &qlen, sizeof qlen);
+        }
+
+        // Defer accept until client sends data. Reduces empty accept
+        // events — kernel holds the connection until data arrives.
+        // Synergizes with h_accept speculative read in multi-worker mode.
+        {
+            int val = 1;
+            setsockopt(fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &val, sizeof val);
         }
 
         break;
