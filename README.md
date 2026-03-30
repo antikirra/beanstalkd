@@ -10,7 +10,7 @@ Fork of [upstream beanstalkd](https://github.com/beanstalkd/beanstalkd) with 35 
 
 **Linux kernel 6.1+**, glibc, gcc. No cross-platform support — the codebase uses Linux APIs directly without abstractions or `#ifdef` guards.
 
-Linux APIs used: `epoll_create1`, `accept4`, `fallocate`, `fdatasync`, `CLOCK_MONOTONIC_COARSE`, `SOCK_NONBLOCK|SOCK_CLOEXEC`, `O_CLOEXEC`, `TCP_FASTOPEN`, `TCP_CORK`, `TCP_QUICKACK`, `SO_INCOMING_CPU`, `SO_TXREHASH`, `SO_REUSEPORT`, `sched_setaffinity`, `posix_fadvise`, `malloc_trim`, `SCM_RIGHTS`.
+Linux APIs used: `epoll_create1`, `accept4`, `fallocate`, `fdatasync`, `CLOCK_MONOTONIC_COARSE`, `SOCK_NONBLOCK|SOCK_CLOEXEC`, `O_CLOEXEC`, `TCP_FASTOPEN`, `TCP_CORK`, `SO_INCOMING_CPU`, `SO_TXREHASH`, `SO_REUSEPORT`, `sched_setaffinity`, `posix_fadvise`, `malloc_trim`, `SCM_RIGHTS`.
 
 ## Quick start
 
@@ -29,14 +29,14 @@ make && ./beanstalkd
 
 ```sh
 make                                    # build
-make check                              # 205 unit tests
-make check-mw                           # 9 multi-worker integration tests
+make check                              # 203 unit tests
+make check-mw                           # 12 multi-worker integration tests
 make bench                              # benchmarks
 docker build -f Dockerfile.build .      # CI: UBSan + cppcheck
 docker build -f Dockerfile.benchmark .  # A/B comparison vs upstream
 ```
 
-CI pipeline (`Dockerfile.build`): 205 unit tests (UBSan) + 9 multi-worker integration tests + cppcheck.
+CI pipeline (`Dockerfile.build`): 203 unit tests (UBSan) + 12 multi-worker integration tests + cppcheck.
 
 Production image (`Dockerfile`): multi-stage build on bookworm-slim, LTO, `-Os -march=native -fvisibility=hidden`, full RELRO.
 
@@ -53,7 +53,7 @@ Production image (`Dockerfile`): multi-stage build on bookworm-slim, LTO, `-Os -
 | Job pool | Exact size match | 11 size classes, O(1) reuse |
 | WAL | Single file, 1 fsync thread | Per-worker, async fsync |
 | Known crash/data bugs | 22 open | 35 fixed |
-| Tests | 100 unit | 205 unit + 13 multi-worker integration |
+| Tests | 100 unit | 203 unit + 12 multi-worker integration |
 
 ## Single-tube watch
 
@@ -97,7 +97,8 @@ By default, beanstalkd forks N worker processes (one per CPU core). Override wit
 - `use` is local — does not migrate. `put` commands are forwarded to the tube's owner worker via `PutFwdMsg` (up to 32KB body, larger jobs enqueue locally)
 - `peek <id>`, `stats-job <id>`, `kick-job <id>` are forwarded to the job's owner worker by ID routing (`(id-1) % nworkers`)
 - `stats-tube`, `pause-tube`, `peek-ready/delayed/buried`, `kick` are forwarded to the tube's owner worker
-- `stats` aggregates all workers' counters via `mmap`'d shared memory (1Hz publish)
+- `stats` aggregates all workers' counters via `mmap`'d shared memory (1Hz publish, seqlock for torn-read protection)
+- IPC messages: variable-length send (header + actual data bytes, not full struct)
 - On accept, worker speculatively reads the first command; if `watch` targets a remote tube, the fd is migrated before creating a `Conn`
 - Master monitors workers and restarts crashed ones with full mesh recovery (new socketpairs distributed via control pipe + `SCM_RIGHTS`)
 
@@ -126,22 +127,29 @@ By default, beanstalkd forks N worker processes (one per CPU core). Override wit
 - Batch epoll: 64 events per `epoll_wait`, drain loop before next `prottick`
 - `epoll_ctl` caching: skip when registered mode unchanged
 - `TCP_CORK` only when pipelining detected (was unconditional)
-- `TCP_QUICKACK` once per epoll event (was per-read)
+- `TCP_QUICKACK` once at accept time (removed per-read-event setsockopt)
 - `accept4(SOCK_NONBLOCK|SOCK_CLOEXEC)` — atomic, no fcntl
 - `CLOCK_MONOTONIC_COARSE` — ~5ns vs ~25ns, cached per tick
 
 **Parsing and formatting:**
 - `reply_inserted`/`reply_using`/`reply_job` via `u64toa`+memcpy (no vsnprintf)
+- `u64toa`: two-digit pair lookup table halves div/mod count
 - `read_uint` manual base-10 (no strtoumax/locale)
 - Tube name validation via 256-byte lookup table (no strspn)
 - NUL injection check via `memchr` (no strlen)
-- Command dispatch: first-byte switch, then branch by character (was linear TEST_CMD chain)
+- Command dispatch: two-level byte dispatch (cmd[0] then cmd[1]/cmd[4-9]) resolves most commands without strncmp
 
-**Memory:**
+**Memory and data structures:**
 - Size-classed job pool: 11 buckets (64B–64KB), O(1) reuse
+- Conn struct: cache-line layout — hot fields in first 2 lines, large buffers at end
 - Conn slab pool: up to 256 recycled structs
 - Incremental rehash: 16 buckets/op, dual-table lookup during migration
-- Job struct: hot fields grouped, 176→168 bytes
+- Job alloc: single `memset` of entire struct (was partial memset + 8 field assignments)
+- Job copy: selective field copy (was `memcpy` of entire struct including overwritten pointers)
+- Tube hash: DJB2 + finalizer for better power-of-2 distribution; hash-first filter skips strcmp on chain probes
+- Tube owner/shard: cached at creation (eliminates modulo per put/delete/WAL write)
+- Heap siftup: prefetches all 4 grandchildren for cache-friendly traversal
+- `connsched`: skips heapresift when tickat unchanged
 - `MALLOC_ARENA_MAX=1` — single glibc arena (-39% RSS)
 - Periodic `malloc_trim` returns pages to OS
 - Inline `tube_dref`/`tube_iref`/`job_list_reset`/`job_list_is_empty`
@@ -149,6 +157,7 @@ By default, beanstalkd forks N worker processes (one per CPU core). Override wit
 **WAL:**
 - Per-worker WAL directories with independent async fsync threads
 - `writev` for WAL records (was 2-4 separate writes)
+- `filewritev` fast path: single writev check before entering retry loop
 - `fallocate()` for O(1) preallocation
 - Rate-limited compaction (1ms throttle)
 - Async dirsync handoff to fsync thread
