@@ -41,20 +41,21 @@ sockwant(Socket *s, int rw)
 {
     int op;
 
-    if (!s->added && !rw) {
-        return 0;
-    } else if (!s->added && rw) {
+    // Hot path: already added, same mode → skip syscall.
+    if (likely(s->added)) {
+        if (likely(rw)) {
+            if (likely(s->rw_cached == rw))
+                return 0;
+            op = EPOLL_CTL_MOD;
+        } else {
+            s->added = 0;
+            s->rw_cached = 0;
+            op = EPOLL_CTL_DEL;
+        }
+    } else {
+        if (!rw) return 0;
         s->added = 1;
         op = EPOLL_CTL_ADD;
-    } else if (!rw) {
-        s->added = 0;
-        s->rw_cached = 0;
-        op = EPOLL_CTL_DEL;
-    } else if (s->rw_cached == rw) {
-        // Already registered for this mode — skip the syscall.
-        return 0;
-    } else {
-        op = EPOLL_CTL_MOD;
     }
 
     struct epoll_event ev = {.events=0};

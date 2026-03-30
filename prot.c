@@ -1139,7 +1139,7 @@ remove_ready_job(Job *j)
     return j;
 }
 
-static bool
+static inline bool
 is_job_reserved_by_conn(Conn *c, Job *j)
 {
     return likely(j != NULL) && j->reserver == c && j->r.state == Reserved;
@@ -1348,7 +1348,7 @@ enqueue_incoming_job(Conn *c)
     c->in_job_read = 0;
 
     /* check if the trailer is present and correct */
-    if (memcmp(j->body + j->r.body_size - 2, "\r\n", 2)) {
+    if (unlikely(memcmp(j->body + j->r.body_size - 2, "\r\n", 2))) {
         job_free(j);
         reply_msg(c, MSG_EXPECTED_CRLF);
         return;
@@ -1358,18 +1358,19 @@ enqueue_incoming_job(Conn *c)
         printf("<%d job %"PRIu64"\n", c->sock.fd, j->r.id);
     }
 
-    if (drain_mode) {
+    if (unlikely(drain_mode)) {
         job_free(j);
         reply_serr(c, MSG_DRAINING);
         return;
     }
 
-    if (j->walresv) {
+    if (unlikely(j->walresv)) {
         job_free(j);
         reply_serr(c, MSG_INTERNAL_ERROR);
         return;
     }
-    j->walresv = walresvput(shard_wal(c->srv, j), j);
+    Wal *put_wal = shard_wal(c->srv, j);
+    j->walresv = walresvput(put_wal, j);
     if (!j->walresv) {
         job_free(j);
         reply_serr(c, MSG_OUT_OF_MEMORY);
@@ -1407,11 +1408,8 @@ enqueue_incoming_job(Conn *c)
                 ssize_t wr = sendmsg(c->srv->peer_fd[target], &msg, MSG_NOSIGNAL);
                 size_t msg_size = hdr_size + j->r.body_size;
                 if (wr == (ssize_t)msg_size) {
-                    if (j->walresv) {
-                        Wal *w = shard_wal(c->srv, j);
-                        walresvreturn(w, j->walresv);
-                        j->walresv = 0;
-                    }
+                    walresvreturn(put_wal, j->walresv);
+                    j->walresv = 0;
                     job_free(j);
                     c->fwd_pending = 1;
                     epollq_add(c, 0);
@@ -1868,7 +1866,7 @@ fmt_stats_tube(char *buf, size_t size, void *x)
             time_left);
 }
 
-__attribute__((hot)) static void
+__attribute__((hot)) static inline void
 maybe_enqueue_incoming_job(Conn *c)
 {
     Job *j = c->in_job;
@@ -1884,7 +1882,7 @@ maybe_enqueue_incoming_job(Conn *c)
 }
 
 /* j can be NULL */
-__attribute__((hot)) static Job *
+__attribute__((hot)) static inline Job *
 remove_this_reserved_job(Conn *c, Job *j)
 {
     j = job_list_remove(j);

@@ -1,6 +1,7 @@
 #include "dat.h"
 #include <errno.h>
 #include <limits.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,29 +24,14 @@ Conn *
 make_conn(int fd, char start_state, Tube *use, Tube *watch)
 {
     Conn *c;
-    if (conn_pool) {
+    if (likely(conn_pool)) {
         c = conn_pool;
         conn_pool = c->next;
         conn_pool_len--;
-        c->gen++;
-        c->srv = NULL;
-        c->type = 0;
-        c->next = NULL;
-        c->tickat = 0;
-        c->fwd_pending = 0;
-        c->soonest_job = NULL;
-        c->rw = 0;
-        c->halfclosed = 0;
-        c->cmd_len = 0;
-        c->cmd_read = 0;
-        c->reply = NULL;
-        c->reply_len = 0;
-        c->reply_sent = 0;
-        c->in_job_read = 0;
-        c->in_job = NULL;
-        c->out_job = NULL;
-        c->out_job_sent = 0;
-        c->watch_idx = 0;
+        // Preserve gen (generation counter), zero the rest of the hot fields.
+        uint64 gen = c->gen + 1;
+        memset(c, 0, offsetof(Conn, cmd));  // zero up to large buffers
+        c->gen = gen;
     } else {
         c = new(Conn);
     }

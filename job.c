@@ -263,11 +263,11 @@ job_free(Job *j)
     int is_copy = (j->r.state == Copy);
 
     TUBE_ASSIGN(j->tube, NULL);
-    if (!is_copy) job_hash_free(j);
+    if (likely(!is_copy)) job_hash_free(j);
 
     // Pool regular jobs for reuse; copies, oversized, and excess go to free().
     int cls = pool_class(j->r.body_size);
-    if (!is_copy && cls >= 0) {
+    if (likely(!is_copy) && likely(cls >= 0)) {
         size_t entry_bytes = sizeof(Job) + (size_t)(64 << cls);
         if (pool_len[cls] < POOL_PER_CLASS
             && pool_mem + entry_bytes <= POOL_MEM_MAX) {

@@ -519,19 +519,11 @@ reserve(Wal *w, int n)
 int
 walresvput(Wal *w, Job *j)
 {
-    int64 z = 0;
-
-    // reserve space for the initial job record
-    z += sizeof(int);
-    z += j->tube->name_len;
-    z += sizeof(Jobrec);
-    z += j->r.body_size;
-
-    // plus space for a delete to come later
-    z += sizeof(int);
-    z += sizeof(Jobrec);
-
-    if (z > INT_MAX) return 0;
+    // Full record: int + name + Jobrec + body.
+    // Delete record: int + Jobrec. Precompute constant part.
+    int64 z = (2 * sizeof(int)) + (2 * sizeof(Jobrec))
+            + j->tube->name_len + j->r.body_size;
+    if (unlikely(z > INT_MAX)) return 0;
     return reserve(w, (int)z);
 }
 
