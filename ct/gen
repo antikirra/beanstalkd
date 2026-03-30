@@ -7,7 +7,7 @@ syms() {
     shift
     for f in "$@"
     do nm $f
-    done | cut -d ' ' -f 3 | egrep ^$prefix
+    done | cut -d ' ' -f 3 | egrep ^$prefix | grep -v '\.'
 }
 
 ts=`syms cttest "$@" || true`

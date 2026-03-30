@@ -92,6 +92,14 @@ make_inet_socket(char *host, char *port)
             continue;
         }
 
+        // Tune socket buffers for high-throughput pipelined workloads.
+        {
+            int sndbuf = 256 * 1024;
+            int rcvbuf = 128 * 1024;
+            setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof sndbuf);
+            setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf);
+        }
+
         // Hint kernel to deliver incoming packets on the CPU where
         // the listening socket is pinned. Improves cache locality
         // when combined with -t (CPU pinning).
@@ -255,6 +263,10 @@ send_fd(int sock, int fd, void *buf, size_t buflen)
     } while (r == -1 && errno == EINTR);
     if (r == -1) {
         twarn("send_fd");
+        return -1;
+    }
+    if ((size_t)r != buflen) {
+        twarnx("send_fd: short write %zd/%zu", r, buflen);
         return -1;
     }
     return 0;

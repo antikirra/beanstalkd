@@ -153,6 +153,7 @@ static Socket peer_socks[MAX_WORKERS];
 // Handler for incoming data on a peer worker socket.
 // Dispatches migration (MigMsg), command forwarding (CmdFwdMsg),
 // and command replies (CmdReplyMsg) based on message magic.
+// Uses a single recvmsg() instead of recv(MSG_PEEK) + read() to halve syscalls.
 static void
 handle_peer(struct PeerCtx *ctx, int ev)
 {
@@ -160,25 +161,48 @@ handle_peer(struct PeerCtx *ctx, int ev)
     Server *s = ctx->srv;
     int fd = s->peer_fd[ctx->peer_idx];
 
-    // Peek at the magic to determine message type.
-    uint32 magic = 0;
-    ssize_t r = recv(fd, &magic, sizeof(magic), MSG_PEEK);
-    if (r == 0 || (r == -1 && errno != EAGAIN && errno != EINTR)) {
+    // Unified read: single recvmsg for all message types.
+    // PutFwdMsg is largest (~66KB) and already static.
+    static union {
+        uint32              magic;
+        struct MigMsg       mig;
+        struct CmdFwdMsg    cmd;
+        struct PutFwdMsg    put;
+        struct CmdReplyMsg  rpl;
+    } buf;
+    char cmsgbuf[CMSG_SPACE(sizeof(int))];
+
+    struct iovec iov = { .iov_base = &buf, .iov_len = sizeof(buf) };
+    struct msghdr msg = {0};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsgbuf;
+    msg.msg_controllen = sizeof(cmsgbuf);
+
+    ssize_t r;
+    do {
+        r = recvmsg(fd, &msg, 0);
+    } while (r == -1 && errno == EINTR);
+
+    if (r == 0 || (r == -1 && errno != EAGAIN)) {
         // Peer closed or broken — deregister to prevent busy loop.
         // Release all clients waiting for forwarded replies.
         for (int i = 0; i < PENDING_FWD_SLOTS; i++) {
             if (s->pending_fwd[i].conn) {
                 Conn *pc = s->pending_fwd[i].conn;
                 if (pc->gen == s->pending_fwd[i].gen && pc->sock.fd >= 0) {
-                    ssize_t r_ = write(pc->sock.fd, "NOT_FOUND\r\n", 11);
-                    (void)r_;
                     pc->fwd_pending = 0;
-                    sockwant(&pc->sock, 'r');
-                    if (pc->cmd_read > 0)
-                        pc->sock.f(pc->sock.x, 'r');
+                    if (write(pc->sock.fd, "NOT_FOUND\r\n", 11) <= 0) {
+                        sockwant(&pc->sock, 0);
+                    } else {
+                        sockwant(&pc->sock, 'r');
+                        if (pc->cmd_read > 0)
+                            pc->sock.f(pc->sock.x, 'r');
+                    }
                 }
                 s->pending_fwd[i].conn = NULL;
                 s->pending_fwd[i].seq = 0;
+                s->pending_fwd_used--;
             }
         }
         sockwant(&peer_socks[ctx->peer_idx], 0);
@@ -187,62 +211,70 @@ handle_peer(struct PeerCtx *ctx, int ev)
         twarnx("peer %d disconnected", ctx->peer_idx);
         return;
     }
-    if (r < (ssize_t)sizeof(magic))
+    if (r < (ssize_t)sizeof(uint32))
         return;
 
-    if (magic == MIG_MSG_MAGIC) {
-        struct MigMsg mm;
-        int cfd = recv_fd(fd, &mm, sizeof(mm));
-        if (cfd < 0)
+    // Check for SCM_RIGHTS (migration message carries a file descriptor).
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    if (cmsg && cmsg->cmsg_type == SCM_RIGHTS
+        && cmsg->cmsg_len >= CMSG_LEN(sizeof(int))) {
+        int cfd;
+        memcpy(&cfd, CMSG_DATA(cmsg), sizeof(int));
+        if (buf.magic == MIG_MSG_MAGIC && (size_t)r >= sizeof(struct MigMsg)) {
+            h_accept_migrated(cfd, s, &buf.mig);
+        } else {
+            close(cfd);
+        }
+        return;
+    }
+
+    if (buf.magic == CMD_FWD_MAGIC) {
+        if (r < (ssize_t)sizeof(struct CmdFwdMsg)) {
+            twarnx("handle_peer: short CmdFwdMsg read %zd/%zu from peer %d",
+                   r, sizeof(struct CmdFwdMsg), ctx->peer_idx);
             return;
-        h_accept_migrated(cfd, s, &mm);
-    } else if (magic == CMD_FWD_MAGIC) {
-        struct CmdFwdMsg fwd;
-        r = read(fd, &fwd, sizeof(fwd));
-        if (r < (ssize_t)sizeof(fwd))
+        }
+        prot_handle_forwarded_cmd(s, &buf.cmd);
+    } else if (buf.magic == PUT_FWD_MAGIC) {
+        if (r < (ssize_t)offsetof(struct PutFwdMsg, body)) {
+            twarnx("handle_peer: short PutFwdMsg read %zd from peer %d",
+                   r, ctx->peer_idx);
             return;
-        prot_handle_forwarded_cmd(s, &fwd);
-    } else if (magic == PUT_FWD_MAGIC) {
-        struct PutFwdMsg *pm = malloc(sizeof(struct PutFwdMsg));
-        if (!pm) return;
-        memset(pm, 0, sizeof(*pm));
-        r = read(fd, pm, sizeof(*pm));
-        // Minimum: header without body.
-        if (r < (ssize_t)offsetof(struct PutFwdMsg, body)) { free(pm); return; }
-        if (pm->body_size < 0 || pm->body_size > PUT_FWD_MAX_BODY + 2) { free(pm); return; }
-        prot_handle_forwarded_put(s, pm);
-        free(pm);
-    } else if (magic == CMD_REPLY_MAGIC) {
-        struct CmdReplyMsg rpl;
-        r = read(fd, &rpl, sizeof(rpl));
-        if (r < (ssize_t)sizeof(rpl))
+        }
+        if (buf.put.body_size < 0 || buf.put.body_size > PUT_FWD_MAX_BODY + 2) {
+            twarnx("handle_peer: invalid body_size %d from peer %d",
+                   buf.put.body_size, ctx->peer_idx);
             return;
-        // Match reply to pending slot by sequence number.
-        if (rpl.data_len > 0 && rpl.data_len <= CMD_FWD_REPLY_SIZE && rpl.seq) {
-            for (int i = 0; i < PENDING_FWD_SLOTS; i++) {
-                if (s->pending_fwd[i].seq == rpl.seq && s->pending_fwd[i].conn) {
-                    Conn *pc = s->pending_fwd[i].conn;
-                    if (pc->gen == s->pending_fwd[i].gen && pc->sock.fd >= 0) {
-                        ssize_t r_ = write(pc->sock.fd, rpl.data, rpl.data_len);
-                        (void)r_;
-                        pc->fwd_pending = 0;
-                        // Re-register for read + resume pipelined commands.
+        }
+        prot_handle_forwarded_put(s, &buf.put);
+    } else if (buf.magic == CMD_REPLY_MAGIC) {
+        if (r < (ssize_t)sizeof(struct CmdReplyMsg)) {
+            twarnx("handle_peer: short CmdReplyMsg read %zd/%zu from peer %d",
+                   r, sizeof(struct CmdReplyMsg), ctx->peer_idx);
+            return;
+        }
+        // Match reply to pending slot by sequence number (hash lookup).
+        if (buf.rpl.data_len > 0 && buf.rpl.data_len <= CMD_FWD_REPLY_SIZE && buf.rpl.seq) {
+            int i = pending_fwd_find(s, buf.rpl.seq);
+            if (i >= 0) {
+                Conn *pc = s->pending_fwd[i].conn;
+                if (pc->gen == s->pending_fwd[i].gen && pc->sock.fd >= 0) {
+                    pc->fwd_pending = 0;
+                    if (write(pc->sock.fd, buf.rpl.data, buf.rpl.data_len) <= 0) {
+                        sockwant(&pc->sock, 0);
+                    } else {
                         sockwant(&pc->sock, 'r');
                         if (pc->cmd_read > 0)
                             pc->sock.f(pc->sock.x, 'r');
                     }
-                    s->pending_fwd[i].conn = NULL;
-                    s->pending_fwd[i].seq = 0;
-                    break;
                 }
+                s->pending_fwd[i].conn = NULL;
+                s->pending_fwd[i].seq = 0;
+                s->pending_fwd_used--;
             }
         }
-    } else {
-        // Unknown magic — drain the data.
-        char drain[4096];
-        ssize_t r_ = read(fd, drain, sizeof(drain));
-        (void)r_;
     }
+    // Unknown magic — already consumed by recvmsg, nothing to drain.
 }
 
 // Register (or re-register) a peer socket in epoll.

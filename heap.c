@@ -71,6 +71,9 @@ heapinsert(Heap *h, void *x)
 {
     if (unlikely(h->len == h->cap)) {
         size_t ncap = (h->len + 1) * 2;
+        if (ncap > SIZE_MAX / sizeof(void *)) {
+            return 0;
+        }
         void **ndata = realloc(h->data, sizeof(void *) * ncap);
         if (!ndata) {
             return 0;

@@ -176,13 +176,21 @@ allocate_job(int body_size)
         }
     }
 
-    // Zero struct, then set non-zero fields.
-    memset(j, 0, sizeof(Job));
+    memset(&j->r, 0, sizeof(Jobrec));
     j->r.created_at = now ? now : nanoseconds();
     j->r.body_size = body_size;
+    j->heap_index = 0;
+    j->tube = NULL;
+    j->reserver = NULL;
     j->body = (char *)j + sizeof(Job);
     j->prev = j;
     j->next = j;
+    j->ht_next = NULL;
+    j->file = NULL;
+    j->fnext = NULL;
+    j->fprev = NULL;
+    j->walresv = 0;
+    j->walused = 0;
     return j;
 }
 

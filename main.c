@@ -142,7 +142,7 @@ pin_to_cpu(int cpu)
 // Start a single worker process. Returns child PID to master,
 // does not return in child (calls srvserve then _exit).
 // ctl_fd: control pipe from master for peer updates (-1 to disable).
-static pid_t
+__attribute__((cold)) static pid_t
 spawn_worker(int id, int nworkers, int mesh[MAX_WORKERS][MAX_WORKERS], int ctl_fd)
 {
     pid_t pid = fork();
@@ -213,7 +213,7 @@ static int master_ctl_fd[MAX_WORKERS];
 
 // Restart a crashed worker: create new peer socketpairs,
 // push new fds to surviving workers via control pipe.
-static void
+__attribute__((cold)) static void
 restart_worker(int id, int nworkers)
 {
     // Create new mesh row for the restarted worker.
@@ -238,6 +238,9 @@ restart_worker(int id, int nworkers)
                 mesh[j][id] = -1; // don't pass to new worker
             } else {
                 // Failed to notify surviving worker — close both ends.
+                // Worker j keeps its stale peer_fd[id]; it will detect
+                // the dead peer via EOF on the next epoll cycle.
+                twarnx("restart_worker: failed to send new peer fd to worker %d", j);
                 close(sv[0]);
                 close(sv[1]);
                 mesh[id][j] = -1;

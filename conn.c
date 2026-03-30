@@ -27,9 +27,25 @@ make_conn(int fd, char start_state, Tube *use, Tube *watch)
         c = conn_pool;
         conn_pool = c->next;
         conn_pool_len--;
-        uint64 gen = c->gen + 1;
-        memset(c, 0, sizeof(Conn));
-        c->gen = gen;
+        c->gen++;
+        c->srv = NULL;
+        c->type = 0;
+        c->next = NULL;
+        c->tickat = 0;
+        c->fwd_pending = 0;
+        c->soonest_job = NULL;
+        c->rw = 0;
+        c->halfclosed = 0;
+        c->cmd_len = 0;
+        c->cmd_read = 0;
+        c->reply = NULL;
+        c->reply_len = 0;
+        c->reply_sent = 0;
+        c->in_job_read = 0;
+        c->in_job = NULL;
+        c->out_job = NULL;
+        c->out_job_sent = 0;
+        c->watch_idx = 0;
     } else {
         c = new(Conn);
     }
@@ -222,7 +238,7 @@ conn_setpos(void *c, size_t i)
 }
 
 
-void
+__attribute__((cold)) void
 connclose(Conn *c)
 {
     if (c->sock.fd >= 0) {
@@ -239,6 +255,7 @@ connclose(Conn *c)
             if (c->srv->pending_fwd[i].conn == c) {
                 c->srv->pending_fwd[i].conn = NULL;
                 c->srv->pending_fwd[i].seq = 0;
+                c->srv->pending_fwd_used--;
             }
         }
     }

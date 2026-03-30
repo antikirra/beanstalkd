@@ -44,22 +44,43 @@ shard_wal(Server *s, Job *j)
 static void epollq_add(Conn *c, char rw);
 
 // Allocate a pending forward slot and return its sequence number.
+// Uses hash-based indexing: seq & PENDING_FWD_MASK with linear probing.
 // Returns 0 if no slot available (all busy).
 static uint32
 pending_fwd_alloc(Server *s, Conn *c)
 {
-    for (int i = 0; i < PENDING_FWD_SLOTS; i++) {
+    uint32 seq = ++s->pending_fwd_seq;
+    if (!seq) seq = ++s->pending_fwd_seq; // skip 0
+    int base = seq & PENDING_FWD_MASK;
+    for (int probe = 0; probe < PENDING_FWD_SLOTS; probe++) {
+        int i = (base + probe) & PENDING_FWD_MASK;
         if (!s->pending_fwd[i].conn) {
-            uint32 seq = ++s->pending_fwd_seq;
-            if (!seq) seq = ++s->pending_fwd_seq; // skip 0
             s->pending_fwd[i].conn = c;
             s->pending_fwd[i].gen = c->gen;
             s->pending_fwd[i].seq = seq;
             s->pending_fwd[i].at = now;
+            s->pending_fwd_used++;
             return seq;
         }
     }
     return 0;
+}
+
+// Look up a pending forward slot by sequence number.
+// Returns the slot index, or -1 if not found.
+int
+pending_fwd_find(Server *s, uint32 seq)
+{
+    if (!seq) return -1;
+    int base = seq & PENDING_FWD_MASK;
+    for (int probe = 0; probe < PENDING_FWD_SLOTS; probe++) {
+        int i = (base + probe) & PENDING_FWD_MASK;
+        if (s->pending_fwd[i].seq == seq && s->pending_fwd[i].conn)
+            return i;
+        if (!s->pending_fwd[i].conn && !s->pending_fwd[i].seq)
+            return -1; // empty slot — not found
+    }
+    return -1;
 }
 
 // Forward the current command to the worker that owns job_id.
@@ -75,7 +96,7 @@ try_forward_job_cmd(Conn *c, uint64 job_id)
         return 0;
     uint32 seq = pending_fwd_alloc(s, c);
     if (!seq) return 0;
-    struct CmdFwdMsg fwd = {0};
+    struct CmdFwdMsg fwd;
     fwd.magic = CMD_FWD_MAGIC;
     fwd.from_worker = s->worker_id;
     fwd.seq = seq;
@@ -83,12 +104,11 @@ try_forward_job_cmd(Conn *c, uint64 job_id)
     fwd.cmd_len = c->cmd_len;
     ssize_t wr = write(s->peer_fd[target], &fwd, sizeof(fwd));
     if (wr != (ssize_t)sizeof(fwd)) {
-        for (int i = 0; i < PENDING_FWD_SLOTS; i++) {
-            if (s->pending_fwd[i].seq == seq) {
-                s->pending_fwd[i].conn = NULL;
-                s->pending_fwd[i].seq = 0;
-                break;
-            }
+        int idx = pending_fwd_find(s, seq);
+        if (idx >= 0) {
+            s->pending_fwd[idx].conn = NULL;
+            s->pending_fwd[idx].seq = 0;
+            s->pending_fwd_used--;
         }
         return 0;
     }
@@ -97,20 +117,20 @@ try_forward_job_cmd(Conn *c, uint64 job_id)
     return 1;
 }
 
-// Forward the current command to the worker owning the given tube.
+// Forward the current command to the worker owning the given tube hash.
 // Returns 1 if forwarded, 0 if local or failed.
 static int
-try_forward_tube_cmd(Conn *c, Tube *t)
+try_forward_tube_cmd(Conn *c, uint32 name_hash)
 {
     Server *s = c->srv;
-    if (s->nworkers <= 1 || !t)
+    if (s->nworkers <= 1)
         return 0;
-    int target = t->name_hash % s->nworkers;
+    int target = name_hash % s->nworkers;
     if (target == s->worker_id || s->peer_fd[target] < 0)
         return 0;
     uint32 seq = pending_fwd_alloc(s, c);
     if (!seq) return 0;
-    struct CmdFwdMsg fwd = {0};
+    struct CmdFwdMsg fwd;
     fwd.magic = CMD_FWD_MAGIC;
     fwd.from_worker = s->worker_id;
     fwd.seq = seq;
@@ -118,12 +138,11 @@ try_forward_tube_cmd(Conn *c, Tube *t)
     fwd.cmd_len = c->cmd_len;
     ssize_t wr = write(s->peer_fd[target], &fwd, sizeof(fwd));
     if (wr != (ssize_t)sizeof(fwd)) {
-        for (int i = 0; i < PENDING_FWD_SLOTS; i++) {
-            if (s->pending_fwd[i].seq == seq) {
-                s->pending_fwd[i].conn = NULL;
-                s->pending_fwd[i].seq = 0;
-                break;
-            }
+        int idx = pending_fwd_find(s, seq);
+        if (idx >= 0) {
+            s->pending_fwd[idx].conn = NULL;
+            s->pending_fwd[idx].seq = 0;
+            s->pending_fwd_used--;
         }
         return 0;
     }
@@ -131,11 +150,6 @@ try_forward_tube_cmd(Conn *c, Tube *t)
     epollq_add(c, 0); // suspend until reply
     return 1;
 }
-
-#define NAME_CHARS \
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZ" \
-    "abcdefghijklmnopqrstuvwxyz" \
-    "0123456789-+/;.$_()"
 
 // Valid tube name characters (lookup table replaces strspn).
 static const char valid_name_char[256] = {
@@ -361,6 +375,7 @@ static uint64 ready_ct = 0;
 static uint64 delayed_ct = 0;
 static uint64 paused_ct = 0;
 static uint64 timeout_ct = 0;
+static int tubes_dirty = 1; // set when tube list changes, cleared after stats sync
 
 int64 now = 0;
 static uint64 op_ct[TOTAL_OPS] = {0};
@@ -477,6 +492,7 @@ prot_remove_tube(Tube *t)
         heapremove(&pause_tube_heap, t->pause_heap_index);
         t->in_pause_heap = 0;
     }
+    tubes_dirty = 1;
 }
 
 static Tube *default_tube;
@@ -1319,38 +1335,36 @@ enqueue_incoming_job(Conn *c)
           } else {
             uint32 seq = pending_fwd_alloc(c->srv, c);
             if (seq) {
+                static struct PutFwdMsg pm;
                 size_t msg_size = offsetof(struct PutFwdMsg, body) + j->r.body_size;
-                struct PutFwdMsg *pm = calloc(1, sizeof(struct PutFwdMsg));
-                if (pm) {
-                    pm->magic = PUT_FWD_MAGIC;
-                    pm->from_worker = c->srv->worker_id;
-                    pm->seq = seq;
-                    pm->pri = j->r.pri;
-                    pm->delay = j->r.delay;
-                    pm->ttr = j->r.ttr;
-                    memcpy(pm->tube, j->tube->name, j->tube->name_len + 1);
-                    pm->body_size = j->r.body_size;
-                    memcpy(pm->body, j->body, j->r.body_size);
-                    ssize_t wr = write(c->srv->peer_fd[target], pm, msg_size);
-                    free(pm);
-                    if (wr == (ssize_t)msg_size) {
-                        if (j->walresv) {
-                            Wal *w = shard_wal(c->srv, j);
-                            walresvreturn(w, j->walresv);
-                            j->walresv = 0;
-                        }
-                        job_free(j);
-                        c->fwd_pending = 1;
-                        epollq_add(c, 0);
-                        return;
+                pm.magic = PUT_FWD_MAGIC;
+                pm.from_worker = c->srv->worker_id;
+                pm.seq = seq;
+                pm.pri = j->r.pri;
+                pm.delay = j->r.delay;
+                pm.ttr = j->r.ttr;
+                memcpy(pm.tube, j->tube->name, j->tube->name_len + 1);
+                pm.body_size = j->r.body_size;
+                memcpy(pm.body, j->body, j->r.body_size);
+                ssize_t wr = write(c->srv->peer_fd[target], &pm, msg_size);
+                if (wr == (ssize_t)msg_size) {
+                    if (j->walresv) {
+                        Wal *w = shard_wal(c->srv, j);
+                        walresvreturn(w, j->walresv);
+                        j->walresv = 0;
                     }
+                    job_free(j);
+                    c->fwd_pending = 1;
+                    epollq_add(c, 0);
+                    return;
                 }
                 // Undo slot on failure.
-                for (int i = 0; i < PENDING_FWD_SLOTS; i++) {
-                    if (c->srv->pending_fwd[i].seq == seq) {
-                        c->srv->pending_fwd[i].conn = NULL;
-                        c->srv->pending_fwd[i].seq = 0;
-                        break;
+                {
+                    int idx = pending_fwd_find(c->srv, seq);
+                    if (idx >= 0) {
+                        c->srv->pending_fwd[idx].conn = NULL;
+                        c->srv->pending_fwd[idx].seq = 0;
+                        c->srv->pending_fwd_used--;
                     }
                 }
             }
@@ -1448,23 +1462,28 @@ fmt_stats(char *buf, size_t size, void *x)
             for (int i = 0; i < TOTAL_OPS && i < SHARED_STATS_OPS; i++)
                 agg_op[i] += ss->op_ct[i];
         }
-        // Deduplicate tube count across workers.
-        // Reuse shared_stats tube_names directly — O(W*T²) but admin-only.
+        // Deduplicate tube count across workers using hash-based seen set.
+        // Hash each tube name, check collisions with strcmp. O(W*T) expected.
+        static uint32 seen_hashes[SHARED_MAX_TUBES];
+        static const char *seen_names[SHARED_MAX_TUBES];
         int nseen = 0;
         for (int w = 0; w < s->nworkers; w++) {
             struct SharedStats *ss2 = &shared_stats[w];
             for (uint32 ti = 0; ti < ss2->tube_count; ti++) {
+                uint32 h = tube_name_hash(ss2->tube_names[ti]);
                 int dup = 0;
-                // Check against all tubes from earlier workers.
-                for (int w2 = 0; w2 < w && !dup; w2++) {
-                    struct SharedStats *ss3 = &shared_stats[w2];
-                    for (uint32 tj = 0; tj < ss3->tube_count; tj++) {
-                        if (strcmp(ss2->tube_names[ti], ss3->tube_names[tj]) == 0) {
-                            dup = 1; break;
-                        }
+                for (int k = 0; k < nseen; k++) {
+                    if (seen_hashes[k] == h &&
+                        strcmp(seen_names[k], ss2->tube_names[ti]) == 0) {
+                        dup = 1;
+                        break;
                     }
                 }
-                if (!dup) nseen++;
+                if (!dup && nseen < SHARED_MAX_TUBES) {
+                    seen_hashes[nseen] = h;
+                    seen_names[nseen] = ss2->tube_names[ti];
+                    nseen++;
+                }
             }
         }
         agg_tubes = nseen;
@@ -1908,7 +1927,7 @@ dispatch_cmd(Conn *c)
         }
 
         if (!j) {
-            if (try_forward_tube_cmd(c, c->use)) return;
+            if (try_forward_tube_cmd(c, c->use->name_hash)) return;
             reply_msg(c, MSG_NOTFOUND);
             return;
         }
@@ -1927,7 +1946,7 @@ dispatch_cmd(Conn *c)
         }
 
         if (!j) {
-            if (try_forward_tube_cmd(c, c->use)) return;
+            if (try_forward_tube_cmd(c, c->use->name_hash)) return;
             reply_msg(c, MSG_NOTFOUND);
             return;
         }
@@ -1948,7 +1967,7 @@ dispatch_cmd(Conn *c)
             j = NULL;
 
         if (!j) {
-            if (try_forward_tube_cmd(c, c->use)) return;
+            if (try_forward_tube_cmd(c, c->use->name_hash)) return;
             reply_msg(c, MSG_NOTFOUND);
             return;
         }
@@ -1975,14 +1994,14 @@ dispatch_cmd(Conn *c)
         reply_job(c, j, MSG_FOUND);
         return;
 
-    case OP_RESERVE_TIMEOUT:
-        errno = 0;
+    case OP_RESERVE_TIMEOUT: {
         uint32 utimeout = 0;
         if (read_u32(&utimeout, c->cmd + CMD_RESERVE_TIMEOUT_LEN, NULL) != 0 || utimeout > INT_MAX) {
             reply_msg(c, MSG_BAD_FORMAT);
             return;
         }
         timeout = (int)utimeout;
+        }
         /* Falls through */
 
     case OP_RESERVE:
@@ -2191,7 +2210,7 @@ dispatch_cmd(Conn *c)
         op_ct[type]++;
 
         i = kick_jobs(c->srv, c->use, count);
-        if (i == 0 && try_forward_tube_cmd(c, c->use)) return;
+        if (i == 0 && try_forward_tube_cmd(c, c->use->name_hash)) return;
         reply_line(c, STATE_SEND_WORD, "KICKED %u\r\n", i);
         return;
 
@@ -2278,12 +2297,10 @@ dispatch_cmd(Conn *c)
         if (!t) {
             // In multi-worker mode, forward to the worker that owns this tube.
             if (c->srv->nworkers > 1) {
-                char tname[MAX_TUBE_NAME_LEN];
-                memcpy(tname, name, namelen);
-                tname[namelen] = '\0';
-                int target = tube_name_hash(tname) % c->srv->nworkers;
+                uint32 h = tube_name_hash(name);
+                int target = h % c->srv->nworkers;
                 if (target != c->srv->worker_id && c->srv->peer_fd[target] >= 0) {
-                    if (try_forward_tube_cmd(c, tube_find_or_make(tname))) return;
+                    if (try_forward_tube_cmd(c, h)) return;
                 }
             }
             reply_msg(c, MSG_NOTFOUND);
@@ -2305,19 +2322,24 @@ dispatch_cmd(Conn *c)
         // In multi-worker mode, build YAML from all workers' tube names
         // via shared memory. Avoids creating phantom tube objects.
         if (shared_stats && c->srv->nworkers > 1) {
-            // Collect unique tube names.
-            char names[SHARED_MAX_TUBES][MAX_TUBE_NAME_LEN];
+            // Collect unique tube names using hash-based dedup.
+            const char *names[SHARED_MAX_TUBES];
+            uint32 hashes[SHARED_MAX_TUBES];
             int count = 0;
             for (int w = 0; w < c->srv->nworkers; w++) {
                 struct SharedStats *ss = &shared_stats[w];
                 for (uint32 ti = 0; ti < ss->tube_count && count < SHARED_MAX_TUBES; ti++) {
-                    // Dedup: linear scan (OK for admin command).
+                    uint32 h = tube_name_hash(ss->tube_names[ti]);
                     int dup = 0;
                     for (int k = 0; k < count; k++) {
-                        if (strcmp(names[k], ss->tube_names[ti]) == 0) { dup = 1; break; }
+                        if (hashes[k] == h &&
+                            strcmp(names[k], ss->tube_names[ti]) == 0) {
+                            dup = 1; break;
+                        }
                     }
                     if (!dup) {
-                        memcpy(names[count], ss->tube_names[ti], MAX_TUBE_NAME_LEN);
+                        hashes[count] = h;
+                        names[count] = ss->tube_names[ti];
                         count++;
                     }
                 }
@@ -2517,12 +2539,10 @@ watch_local:
         if (!t) {
             // In multi-worker mode, forward to the owner worker.
             if (c->srv->nworkers > 1) {
-                char tname[MAX_TUBE_NAME_LEN];
-                memcpy(tname, name, namelen);
-                tname[namelen] = '\0';
-                int target = tube_name_hash(tname) % c->srv->nworkers;
+                uint32 h = tube_name_hash(name);
+                int target = h % c->srv->nworkers;
                 if (target != c->srv->worker_id && c->srv->peer_fd[target] >= 0) {
-                    if (try_forward_tube_cmd(c, tube_find_or_make(tname))) return;
+                    if (try_forward_tube_cmd(c, h)) return;
                 }
             }
             reply_msg(c, MSG_NOTFOUND);
@@ -2605,7 +2625,7 @@ conn_timeout(Conn *c)
     }
 }
 
-void
+__attribute__((cold)) void
 enter_drain_mode(int sig)
 {
     UNUSED_PARAMETER(sig);
@@ -2940,20 +2960,25 @@ prottick(Server *s)
     }
 
     // Timeout forwarded commands (5s). Prevents client hanging if peer is dead.
+    if (s->pending_fwd_used > 0) {
     for (int i = 0; i < PENDING_FWD_SLOTS; i++) {
         if (s->pending_fwd[i].conn && now - s->pending_fwd[i].at > 5000000000LL) {
             Conn *pc = s->pending_fwd[i].conn;
             if (pc->gen == s->pending_fwd[i].gen && pc->sock.fd >= 0) {
-                ssize_t r_ = write(pc->sock.fd, "NOT_FOUND\r\n", 11);
-                (void)r_;
                 pc->fwd_pending = 0;
-                sockwant(&pc->sock, 'r');
-                if (pc->cmd_read > 0)
-                    pc->sock.f(pc->sock.x, 'r');
+                if (write(pc->sock.fd, "NOT_FOUND\r\n", 11) <= 0) {
+                    sockwant(&pc->sock, 0);
+                } else {
+                    sockwant(&pc->sock, 'r');
+                    if (pc->cmd_read > 0)
+                        pc->sock.f(pc->sock.x, 'r');
+                }
             }
             s->pending_fwd[i].conn = NULL;
             s->pending_fwd[i].seq = 0;
+            s->pending_fwd_used--;
         }
+    }
     }
 
     // Publish stats to shared memory (1Hz).
@@ -2974,10 +2999,13 @@ prottick(Server *s)
             ss->cur_producer_ct = count_cur_producers();
             ss->cur_worker_ct = count_cur_workers();
             ss->tot_conn_ct = count_tot_conns();
-            ss->tube_count = tubes.len < SHARED_MAX_TUBES ? tubes.len : SHARED_MAX_TUBES;
-            for (size_t ti = 0; ti < ss->tube_count; ti++) {
-                Tube *tt = tubes.items[ti];
-                memcpy(ss->tube_names[ti], tt->name, tt->name_len + 1);
+            if (tubes_dirty || ss->tube_count != (tubes.len < SHARED_MAX_TUBES ? tubes.len : SHARED_MAX_TUBES)) {
+                ss->tube_count = tubes.len < SHARED_MAX_TUBES ? tubes.len : SHARED_MAX_TUBES;
+                for (size_t ti = 0; ti < ss->tube_count; ti++) {
+                    Tube *tt = tubes.items[ti];
+                    memcpy(ss->tube_names[ti], tt->name, tt->name_len + 1);
+                }
+                tubes_dirty = 0;
             }
             for (int i = 0; i < TOTAL_OPS && i < SHARED_STATS_OPS; i++)
                 ss->op_ct[i] = op_ct[i];
@@ -3160,9 +3188,9 @@ prot_handle_forwarded_cmd(Server *s, struct CmdFwdMsg *fwd)
         char *name = cmd + 11;
         // Strip \r\n
         size_t nl = strlen(name);
-        if (nl >= 2 && name[nl-2] == '\r') name[nl-2] = '\0';
+        if (nl >= 2 && name[nl-2] == '\r') { name[nl-2] = '\0'; nl -= 2; }
 
-        Tube *t = tube_find_name(name, strlen(name));
+        Tube *t = tube_find_name(name, nl);
         if (t) {
             char buf[STATS_BUF_SIZE];
             int n = fmt_stats_tube(buf, sizeof(buf), t);
@@ -3181,15 +3209,11 @@ prot_handle_forwarded_cmd(Server *s, struct CmdFwdMsg *fwd)
         if (sp) {
             *sp = '\0';
             char *delay_str = sp + 1;
-            Tube *t = tube_find_name(name, strlen(name));
+            Tube *t = tube_find_name(name, sp - name);
             if (t) {
                 // Parse delay and apply pause.
                 int64 delay = 0;
-                errno = 0;
-                char *end = NULL;
-                unsigned long long v = strtoull(delay_str, &end, 10);
-                if (!errno && end != delay_str) {
-                    delay = (int64)v * 1000000000;
+                if (read_duration(&delay, delay_str, NULL) == 0) {
                     if (delay == 0) delay = 1;
                     t->unpause_at = nanoseconds() + delay;
                     if (!t->pause) paused_ct++;
@@ -3335,8 +3359,9 @@ prot_handle_forwarded_cmd(Server *s, struct CmdFwdMsg *fwd)
     // Send reply back to originating worker.
     if (fwd->from_worker >= 0 && fwd->from_worker < s->nworkers
         && s->peer_fd[fwd->from_worker] >= 0) {
-        ssize_t r_ = write(s->peer_fd[fwd->from_worker], &rpl, sizeof(rpl));
-        (void)r_;
+        if (write(s->peer_fd[fwd->from_worker], &rpl, sizeof(rpl)) <= 0) {
+            twarnx("fwd_cmd reply write to peer %d failed", fwd->from_worker);
+        }
     }
 }
 
@@ -3405,8 +3430,9 @@ prot_handle_forwarded_put(Server *s, struct PutFwdMsg *pm)
 reply:
     if (pm->from_worker >= 0 && pm->from_worker < s->nworkers
         && s->peer_fd[pm->from_worker] >= 0) {
-        ssize_t r_ = write(s->peer_fd[pm->from_worker], &rpl, sizeof(rpl));
-        (void)r_;
+        if (write(s->peer_fd[pm->from_worker], &rpl, sizeof(rpl)) <= 0) {
+            twarnx("fwd_put reply write to peer %d failed", pm->from_worker);
+        }
     }
 }
 
@@ -3475,12 +3501,11 @@ h_accept_migrated(int cfd, Server *s, struct MigMsg *mm)
     epollq_apply();
 }
 
-void
+__attribute__((cold)) void
 prot_init()
 {
     now = nanoseconds();
     started_at = now;
-    memset(op_ct, 0, sizeof(op_ct));
 
     int dev_random = open("/dev/urandom", O_RDONLY);
     if (dev_random < 0) {
@@ -3523,7 +3548,7 @@ prot_init()
 // structures and adds it to the log.
 //
 // Returns 1 on success, 0 on failure.
-int
+__attribute__((cold)) int
 prot_replay(Server *s, Job *list)
 {
     Job *j, *nj;

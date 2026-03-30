@@ -226,7 +226,7 @@ cttest_mw_stats_aggregation()
     cksub(fd3, "OK ");
     // Read stats body — just verify we get a response without crash.
     char buf[8192];
-    read(fd3, buf, sizeof(buf));
+    { ssize_t n_ = read(fd3, buf, sizeof(buf)); (void)n_; }
 
     close(fd1);
     close(fd2);

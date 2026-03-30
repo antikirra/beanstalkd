@@ -144,8 +144,11 @@ int
 fileread(File *f, Job *list)
 {
     int err = 0, v;
+    ReadBuf rb = {.pos = 0, .filled = 0};
+    f->rbuf = &rb;
 
     if (!readfull(f, &v, sizeof(v), &err, "version")) {
+        f->rbuf = NULL;
         return err;
     }
     switch (v) {
@@ -153,15 +156,18 @@ fileread(File *f, Job *list)
         fileincref(f);
         while (readrec(f, list, &err));
         filedecref(f);
+        f->rbuf = NULL;
         return err;
     case Walver5:
         fileincref(f);
         while (readrec5(f, list, &err));
         filedecref(f);
+        f->rbuf = NULL;
         return err;
     }
 
     warnx("%s: unknown version: %d", f->path, v);
+    f->rbuf = NULL;
     return 1;
 }
 
@@ -179,17 +185,8 @@ readrec(File *f, Job *l, int *err)
     Tube *t;
     char tubename[MAX_TUBE_NAME_LEN];
 
-    r = read(f->fd, &namelen, sizeof(int));
-    if (r == -1) {
-        twarn("read");
-        warnpos(f, 0, "error");
-        *err = 1;
-        return 0;
-    }
-    if (r != sizeof(int)) {
-        if (r > 0) *err = 1;
-        return 0;
-    }
+    r = readfull(f, &namelen, sizeof(int), err, "namelen");
+    if (!r) return 0;
     sz += r;
     if (namelen >= MAX_TUBE_NAME_LEN) {
         warnpos(f, -r, "namelen %d exceeds maximum of %d", namelen, MAX_TUBE_NAME_LEN - 1);
@@ -325,17 +322,8 @@ readrec5(File *f, Job *l, int *err)
     Tube *t;
     char tubename[MAX_TUBE_NAME_LEN];
 
-    r = read(f->fd, &namelen, sizeof(namelen));
-    if (r == -1) {
-        twarn("read");
-        warnpos(f, 0, "error");
-        *err = 1;
-        return 0;
-    }
-    if (r != sizeof(namelen)) {
-        if (r > 0) *err = 1;
-        return 0;
-    }
+    r = readfull(f, &namelen, sizeof(namelen), err, "v5 namelen");
+    if (!r) return 0;
     sz += r;
     if (namelen >= MAX_TUBE_NAME_LEN) {
         warnpos(f, -r, "namelen %zu exceeds maximum of %d", namelen, MAX_TUBE_NAME_LEN - 1);
@@ -467,13 +455,45 @@ Error:
 static int
 readfull(File *f, void *c, int n, int *err, char *desc)
 {
+    ReadBuf *rb = f->rbuf;
+    char *dst = (char *)c;
     int got = 0;
 
     while (got < n) {
-        int r = read(f->fd, (char *)c + got, n - got);
-        if (r == -1) {
-            if (errno == EINTR)
+        // Use buffered path if available.
+        if (rb) {
+            if (rb->pos < rb->filled) {
+                int avail = rb->filled - rb->pos;
+                int chunk = (n - got < avail) ? n - got : avail;
+                memcpy(dst + got, rb->buf + rb->pos, chunk);
+                rb->pos += chunk;
+                got += chunk;
                 continue;
+            }
+            // Refill buffer.
+            int r = read(f->fd, rb->buf, sizeof(rb->buf));
+            if (r == -1) {
+                if (errno == EINTR) continue;
+                twarn("read");
+                warnpos(f, 0, "error reading %s", desc);
+                *err = 1;
+                return 0;
+            }
+            if (r == 0) {
+                if (got == 0) return 0; // expected EOF
+                warnpos(f, -got, "unexpected EOF reading %d bytes (got %d): %s", n, got, desc);
+                *err = 1;
+                return 0;
+            }
+            rb->pos = 0;
+            rb->filled = r;
+            continue;
+        }
+
+        // Unbuffered fallback.
+        int r = read(f->fd, dst + got, n - got);
+        if (r == -1) {
+            if (errno == EINTR) continue;
             twarn("read");
             warnpos(f, 0, "error reading %s", desc);
             *err = 1;
@@ -496,6 +516,9 @@ warnpos(File *f, int adj, char *fmt, ...)
     va_list ap;
 
     off = lseek(f->fd, 0, SEEK_CUR);
+    // Adjust for unread buffered data.
+    if (f->rbuf)
+        off -= (f->rbuf->filled - f->rbuf->pos);
     fprintf(stderr, "%s:%d: ", f->path, off+adj);
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);

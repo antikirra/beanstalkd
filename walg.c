@@ -627,6 +627,7 @@ walread(Wal *w, Job *list, int min)
 
         f->fd = fd;
         posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+        posix_fadvise(fd, 0, w->filesize, POSIX_FADV_WILLNEED);
         fileadd(f, w);
         err |= fileread(f, list);
         if (close(fd) == -1)

@@ -444,6 +444,7 @@ struct PutFwdMsg {
 };
 
 int  prot_replay(Server *s, Job *list);
+int  pending_fwd_find(Server *s, uint32 seq);
 
 // Control message from master to worker: update peer_fd for a restarted worker.
 // Sent via ctl_fd with SCM_RIGHTS carrying the new socketpair end.
@@ -572,6 +573,13 @@ void walsyncstart(Wal*);
 void walsyncstop(Wal*);
 
 
+// Buffered reader for WAL recovery — reduces syscalls by ~95%.
+typedef struct ReadBuf {
+    char buf[65536];
+    int  pos;
+    int  filled;
+} ReadBuf;
+
 struct File {
     File *next;
     uint refs;
@@ -582,6 +590,7 @@ struct File {
     int  resv;
     char *path;
     Wal  *w;
+    ReadBuf *rbuf; // optional buffered reader, set during recovery
 
     Job jlist;    // jobs written in this file
 };
@@ -628,10 +637,12 @@ struct Server {
     int    peer_fd[MAX_WORKERS];     // Unix sockets to peer workers
     int    ctl_fd;                   // control pipe from master (recv new peer fds)
 
-    // Pending forwarded commands: ring buffer for concurrent in-flight forwards.
+    // Pending forwarded commands: hash table for concurrent in-flight forwards.
     // Each entry tracks the connection waiting for a reply, with generation
     // and sequence number to detect stale/reused Conn pointers.
-    #define PENDING_FWD_SLOTS 16
+    // Indexed by (seq & PENDING_FWD_MASK) with linear probing.
+    #define PENDING_FWD_SLOTS 64
+    #define PENDING_FWD_MASK  (PENDING_FWD_SLOTS - 1)
     struct {
         Conn   *conn;
         uint64  gen;      // conn generation at time of forward
@@ -639,6 +650,7 @@ struct Server {
         int64   at;       // nanoseconds when forward was sent
     } pending_fwd[PENDING_FWD_SLOTS];
     uint32  pending_fwd_seq;        // next sequence number to assign
+    int     pending_fwd_used;       // number of occupied slots (for scan skip)
 };
 void srv_acquire_wal(Server *s);
 int  detect_ncpu(void);

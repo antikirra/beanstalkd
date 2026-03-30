@@ -1,9 +1,10 @@
 PREFIX?=/usr/local
 BINDIR=$(DESTDIR)$(PREFIX)/bin
 
-CFLAGS ?= -O2
+CFLAGS ?= -O2 -flto=auto
 override CFLAGS+=-Wall -Werror -Wformat=2 -g
 override LDFLAGS?=
+override LDFLAGS+=-flto=auto
 
 LDLIBS?=
 LDLIBS+=-lrt -lpthread
