@@ -10,7 +10,7 @@ Fork of [upstream beanstalkd](https://github.com/beanstalkd/beanstalkd) with 35 
 
 **Linux kernel 6.1+**, glibc, gcc. No cross-platform support — the codebase uses Linux APIs directly without abstractions or `#ifdef` guards.
 
-Linux APIs used: `epoll_create1`, `accept4`, `fallocate`, `fdatasync`, `CLOCK_MONOTONIC_COARSE`, `SOCK_NONBLOCK|SOCK_CLOEXEC`, `O_CLOEXEC`, `TCP_FASTOPEN`, `TCP_CORK`, `SO_INCOMING_CPU`, `SO_TXREHASH`, `SO_REUSEPORT`, `sched_setaffinity`, `posix_fadvise`, `malloc_trim`, `SCM_RIGHTS`.
+Linux APIs used: `epoll_create1`, `accept4`, `fallocate`, `fdatasync`, `CLOCK_MONOTONIC_COARSE`, `SOCK_NONBLOCK|SOCK_CLOEXEC`, `O_CLOEXEC`, `TCP_FASTOPEN`, `TCP_DEFER_ACCEPT`, `TCP_CORK`, `SO_INCOMING_CPU`, `SO_TXREHASH`, `SO_REUSEPORT`, `sched_setaffinity`, `posix_fadvise`, `malloc_trim`, `SCM_RIGHTS`.
 
 ## Quick start
 
@@ -125,14 +125,16 @@ By default, beanstalkd forks N worker processes (one per CPU core). Override wit
 - Inline reply flush: write directly in `reply()`, skip epoll round-trip
 - `writev` fast path for job body (header+body in one syscall)
 - Batch epoll: 64 events per `epoll_wait`, drain loop before next `prottick`
-- `epoll_ctl` caching: skip when registered mode unchanged
+- `epoll_ctl` caching: skip when registered mode unchanged; `sockwant` branch restructuring with `likely()` for hot-path early exit
 - `TCP_CORK` only when pipelining detected (was unconditional)
 - `TCP_QUICKACK` once at accept time (removed per-read-event setsockopt)
 - `accept4(SOCK_NONBLOCK|SOCK_CLOEXEC)` — atomic, no fcntl
-- `CLOCK_MONOTONIC_COARSE` — ~5ns vs ~25ns, cached per tick
+- `CLOCK_MONOTONIC_COARSE` — ~5ns vs ~25ns, once per epoll batch
+- `scan_line_end`: incremental offset skips already-scanned bytes on partial reads
+- Reserve fast path: check ready queue before enqueuing into `waiting_conns`, skip `ms_append`+`ms_take` round-trip when job is already available
 
 **Parsing and formatting:**
-- `reply_inserted`/`reply_using`/`reply_job` via `u64toa`+memcpy (no vsnprintf)
+- `reply_inserted`/`reply_using`/`reply_job` via `u64toa` directly into `reply_buf` (no vsnprintf, no intermediate buffer)
 - `u64toa`: two-digit pair lookup table halves div/mod count
 - `read_uint` manual base-10 (no strtoumax/locale)
 - Tube name validation via 256-byte lookup table (no strspn)
@@ -142,22 +144,25 @@ By default, beanstalkd forks N worker processes (one per CPU core). Override wit
 **Memory and data structures:**
 - Size-classed job pool: 11 buckets (64B–64KB), O(1) reuse
 - Conn struct: cache-line layout — hot fields in first 2 lines, large buffers at end
-- Conn slab pool: up to 256 recycled structs
-- Incremental rehash: 16 buckets/op, dual-table lookup during migration
+- Conn slab pool: up to 256 recycled structs, `memset`-based reset (was 18 individual field zeroes)
+- Incremental rehash: 16 buckets/op, dual-table lookup during migration, `unlikely()` on all rehash paths
 - Job alloc: single `memset` of entire struct (was partial memset + 8 field assignments)
 - Job copy: selective field copy (was `memcpy` of entire struct including overwritten pointers)
-- Tube hash: DJB2 + finalizer for better power-of-2 distribution; hash-first filter skips strcmp on chain probes
+- Tube hash: DJB2 + finalizer for better power-of-2 distribution; hash-first filter skips strcmp on chain probes; `tube_find_name_h` variant with precomputed hash eliminates double hashing in stats-tube/pause-tube
 - Tube owner/shard: cached at creation (eliminates modulo per put/delete/WAL write)
 - Heap siftup: prefetches all 4 grandchildren for cache-friendly traversal
 - `connsched`: skips heapresift when tickat unchanged
+- `conntickat`: fast exit when no pending timeout and no reserved jobs
 - `MALLOC_ARENA_MAX=1` — single glibc arena (-39% RSS)
 - Periodic `malloc_trim` returns pages to OS
-- Inline `tube_dref`/`tube_iref`/`job_list_reset`/`job_list_is_empty`
+- Inline `tube_dref`/`tube_iref`/`job_list_reset`/`job_list_is_empty`, `is_job_reserved_by_conn`, `remove_this_reserved_job`, `maybe_enqueue_incoming_job`, `conndeadlinesoon`, `conn_ready`
 
 **WAL:**
 - Per-worker WAL directories with independent async fsync threads
 - `writev` for WAL records (was 2-4 separate writes)
 - `filewritev` fast path: single writev check before entering retry loop
+- `filewrjobshort` marked hot (called on every job state change)
+- `walresvput`: precomputed constant expression (was 6 separate additions)
 - `fallocate()` for O(1) preallocation
 - Rate-limited compaction (1ms throttle)
 - Async dirsync handoff to fsync thread
@@ -165,7 +170,8 @@ By default, beanstalkd forks N worker processes (one per CPU core). Override wit
 
 **Network:**
 - `SO_REUSEPORT` for kernel-level load balancing across workers
-- `TCP_FASTOPEN` — -1 RTT for new connections
+- `TCP_FASTOPEN` (qlen 1024) — -1 RTT for new connections
+- `TCP_DEFER_ACCEPT` — kernel holds connection until client sends data, reducing empty accept events
 - `SO_INCOMING_CPU` — bind RX path to pinned CPU
 - CPU pinning via `sched_setaffinity` (`-t` flag)
 
