@@ -753,22 +753,18 @@ u64toa(char *end, uint64 v)
 }
 
 // reply "INSERTED <id>\r\n" without vsnprintf.
-// Writes number directly into reply_buf tail to avoid intermediate buffer.
+// Builds string backwards from end of reply_buf to eliminate memmove.
 __attribute__((hot)) static void
 reply_inserted(Conn *c, uint64 id)
 {
-    char *buf = c->reply_buf;
-    memcpy(buf, "INSERTED ", 9);
-    // u64toa writes right-to-left into buf[9..28], then we close the gap.
-    char *numend = buf + 29; // 9 + 20 (max digits)
-    char *numstart = u64toa(numend, id);
-    int nlen = (int)(numend - numstart);
-    // Shift number left to abut "INSERTED " — typically 1-4 byte memmove.
-    if (numstart != buf + 9)
-        memmove(buf + 9, numstart, nlen);
-    buf[9 + nlen] = '\r';
-    buf[10 + nlen] = '\n';
-    reply(c, buf, 11 + nlen, STATE_SEND_WORD);
+    char *end = c->reply_buf + LINE_BUF_SIZE;
+    *--end = '\n';
+    *--end = '\r';
+    char *p = u64toa(end, id);
+    *--p = ' ';
+    p -= 8;
+    memcpy(p, "INSERTED", 8);
+    reply(c, p, (int)(c->reply_buf + LINE_BUF_SIZE - p), STATE_SEND_WORD);
 }
 
 // reply "USING <name>\r\n" without vsnprintf.
@@ -792,27 +788,16 @@ reply_job_n(Conn *c, Job *j, const char *msg, int msglen)
     c->out_job = j;
     c->out_job_sent = 0;
 
-    char *buf = c->reply_buf;
-    memcpy(buf, msg, msglen);
-    buf[msglen] = ' ';
-    buf += msglen + 1;
-
-    char numbuf[20];
-    char *end = numbuf + 20;
-    char *start = u64toa(end, j->r.id);
-    int nlen = (int)(end - start);
-    memcpy(buf, start, nlen);
-    buf += nlen;
-
-    *buf++ = ' ';
-    start = u64toa(end, j->r.body_size - 2);
-    nlen = (int)(end - start);
-    memcpy(buf, start, nlen);
-    buf += nlen;
-
-    *buf++ = '\r';
-    *buf++ = '\n';
-    reply(c, c->reply_buf, (int)(buf - c->reply_buf), STATE_SEND_JOB);
+    char *end = c->reply_buf + LINE_BUF_SIZE;
+    *--end = '\n';
+    *--end = '\r';
+    char *p = u64toa(end, j->r.body_size - 2);
+    *--p = ' ';
+    p = u64toa(p, j->r.id);
+    *--p = ' ';
+    p -= msglen;
+    memcpy(p, msg, msglen);
+    reply(c, p, (int)(c->reply_buf + LINE_BUF_SIZE - p), STATE_SEND_JOB);
 }
 #define reply_job(c, j, msg) reply_job_n(c, j, msg, sizeof(msg) - 1)
 
@@ -1736,12 +1721,34 @@ typedef int(*fmt_fn)(char *, size_t, void *);
 // Stats buffer size. Enough for any stats response (typical ~1.5KB).
 #define STATS_BUF_SIZE 4096
 
+// Cached global stats (100ms TTL).
+static struct {
+    char buf[STATS_BUF_SIZE];
+    int  len;
+    int64 at;
+} stats_cache;
+
 static void
 do_stats(Conn *c, fmt_fn fmt, void *data)
 {
-    /* Allocate once, format directly into the job body.
-     * Avoids the old two-pass approach (measure + format)
-     * and also avoids stack buffer + memcpy. */
+    // For global stats, use cached version if fresh (100ms TTL).
+    int is_global_stats = (fmt == (fmt_fn)fmt_stats);
+    if (is_global_stats && stats_cache.len > 0
+        && now - stats_cache.at < 100000000LL) {
+        c->out_job = allocate_job(stats_cache.len + 2);
+        if (!c->out_job) {
+            reply_serr(c, MSG_OUT_OF_MEMORY);
+            return;
+        }
+        c->out_job->r.state = Copy;
+        memcpy(c->out_job->body, stats_cache.buf, stats_cache.len);
+        c->out_job->r.body_size = stats_cache.len + 2;
+        memcpy(c->out_job->body + stats_cache.len, "\r\n", 2);
+        c->out_job_sent = 0;
+        reply_line(c, STATE_SEND_JOB, "OK %d\r\n", stats_cache.len);
+        return;
+    }
+
     c->out_job = allocate_job(STATS_BUF_SIZE);
     if (!c->out_job) {
         reply_serr(c, MSG_OUT_OF_MEMORY);
@@ -1757,6 +1764,12 @@ do_stats(Conn *c, fmt_fn fmt, void *data)
         return;
     }
     c->out_job->r.body_size = r;
+
+    if (is_global_stats && r > 0 && r < STATS_BUF_SIZE) {
+        memcpy(stats_cache.buf, c->out_job->body, r);
+        stats_cache.len = r - 2;
+        stats_cache.at = now;
+    }
 
     c->out_job_sent = 0;
     reply_line(c, STATE_SEND_JOB, "OK %d\r\n", r - 2);

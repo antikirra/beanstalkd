@@ -100,9 +100,20 @@ make_inet_socket(char *host, char *port)
             setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf);
         }
 
+        // Reduce epoll EPOLLOUT wakeups for pipelined clients.
+        {
+            int lowat = 16384;
+            setsockopt(fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &lowat, sizeof lowat);
+        }
+
+        // Detect dead connections without application-level keepalive.
+        {
+            int user_timeout = 30000;
+            setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout, sizeof user_timeout);
+        }
+
         // Hint kernel to deliver incoming packets on the CPU where
-        // the listening socket is pinned. Improves cache locality
-        // when combined with -t (CPU pinning).
+        // the listening socket is pinned.
         if (srv.cpu >= 0) {
             int cpu = srv.cpu;
             setsockopt(fd, SOL_SOCKET, SO_INCOMING_CPU, &cpu, sizeof cpu);
