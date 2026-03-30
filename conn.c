@@ -231,10 +231,13 @@ connclose(Conn *c)
 {
     if (c->sock.fd >= 0) {
         sockwant(&c->sock, 0);
-        close(c->sock.fd);
         if (verbose) {
             printf("close %d\n", c->sock.fd);
         }
+        close(c->sock.fd);
+        c->sock.fd = -1;
+    } else {
+        return; // already closed — guard against double-close/double-pool
     }
 
     // Clear all pending forward slots referencing this conn.

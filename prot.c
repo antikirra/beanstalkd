@@ -1207,11 +1207,12 @@ which_cmd(Conn *c)
      * second byte (or later) resolves most without strncmp. */
     switch (c->cmd[0]) {
     case 'p':
+        if (c->cmd_len < 6) break; // shortest: "put X\r\n" = 7
         switch (c->cmd[1]) {
         case 'u': TEST_CMD(c->cmd, CMD_PUT, OP_PUT); break;
         case 'e':
             if (c->cmd[4] == ' ') return OP_PEEKJOB; // "peek "
-            // peek-ready, peek-delayed, peek-buried: disambiguate on byte 5
+            if (c->cmd_len < 12) break; // shortest: "peek-ready\r\n" = 12
             switch (c->cmd[5]) {
             case 'r': TEST_CMD(c->cmd, CMD_PEEK_READY, OP_PEEK_READY); break;
             case 'd': TEST_CMD(c->cmd, CMD_PEEK_DELAYED, OP_PEEK_DELAYED); break;
@@ -1239,6 +1240,7 @@ which_cmd(Conn *c)
         TEST_CMD(c->cmd, CMD_BURY, OP_BURY);
         break;
     case 'k':
+        if (c->cmd_len < 7) break; // shortest: "kick N\r\n" = 8
         if (c->cmd[4] == ' ') return OP_KICK;       // "kick "
         TEST_CMD(c->cmd, CMD_KICKJOB, OP_KICKJOB);   // "kick-job "
         break;
@@ -1246,11 +1248,11 @@ which_cmd(Conn *c)
         TEST_CMD(c->cmd, CMD_TOUCH, OP_TOUCH);
         break;
     case 's':
-        // stats, stats-job, stats-tube: disambiguate on byte 5
-        if (c->cmd_len <= 7 && c->cmd[5] == '\r')
+        if (c->cmd_len < 7) break; // shortest: "stats\r\n" = 7
+        if (c->cmd_len == 7 && c->cmd[5] == '\r')
             return OP_STATS; // bare "stats\r\n"
-        if (c->cmd[6] == 'j') return OP_STATSJOB;    // "stats-job "
-        if (c->cmd[6] == 't') return OP_STATS_TUBE;  // "stats-tube "
+        if (c->cmd_len >= 12 && c->cmd[6] == 'j') return OP_STATSJOB;
+        if (c->cmd_len >= 13 && c->cmd[6] == 't') return OP_STATS_TUBE;
         TEST_CMD(c->cmd, CMD_STATS, OP_STATS);
         break;
     case 'u':
@@ -1263,12 +1265,11 @@ which_cmd(Conn *c)
         TEST_CMD(c->cmd, CMD_IGNORE, OP_IGNORE);
         break;
     case 'l':
-        // list-tubes, list-tube-used, list-tubes-watched
+        if (c->cmd_len < 12) break; // shortest: "list-tubes\r\n" = 12
         if (c->cmd[9] == 's') {
-            // list-tubes or list-tubes-watched
             if (c->cmd_len > 12)
-                return OP_LIST_TUBES_WATCHED; // "list-tubes-watched"
-            return OP_LIST_TUBES;             // "list-tubes"
+                return OP_LIST_TUBES_WATCHED; // "list-tubes-watched\r\n"
+            return OP_LIST_TUBES;             // "list-tubes\r\n"
         }
         TEST_CMD(c->cmd, CMD_LIST_TUBE_USED, OP_LIST_TUBE_USED);
         break;
@@ -1933,6 +1934,12 @@ dispatch_cmd(Conn *c)
     int64 delay, ttr;
     uint64 id;
     Tube *t = NULL;
+
+    /* scan_line_end guarantees cmd_len >= 2, but guard against misuse. */
+    if (unlikely(c->cmd_len < 2)) {
+        reply_msg(c, MSG_BAD_FORMAT);
+        return;
+    }
 
     /* NUL-terminate this string so we can use strtol and friends */
     c->cmd[c->cmd_len - 2] = '\0';
@@ -3293,7 +3300,10 @@ prot_handle_forwarded_cmd(Server *s, struct CmdFwdMsg *fwd)
     size_t len = fwd->cmd_len;
 
     // NUL-terminate for string ops.
-    if (len >= LINE_BUF_SIZE) len = LINE_BUF_SIZE - 1;
+    if (unlikely(len >= LINE_BUF_SIZE)) {
+        twarnx("forwarded cmd truncated: %zu >= %d", len, LINE_BUF_SIZE);
+        len = LINE_BUF_SIZE - 1;
+    }
     cmd[len] = '\0';
 
     if (strncmp(cmd, "stats-tube ", 11) == 0) {

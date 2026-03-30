@@ -546,6 +546,8 @@ walresvreturn(Wal *w, int n)
 {
     if (!w->use) return;
     if (n <= 0) return;
+    // Clamp to actual reservation to prevent underflow from caller bugs.
+    if (n > w->cur->resv) n = w->cur->resv;
     w->resv -= n;
     w->cur->resv -= n;
     w->cur->free += n;

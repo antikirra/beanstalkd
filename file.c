@@ -132,7 +132,12 @@ filermjob(File *f, Job *j)
     j->fnext = 0;
     j->fprev = 0;
     j->file = NULL;
-    f->w->alive -= j->walused;
+    if (j->walused <= f->w->alive) {
+        f->w->alive -= j->walused;
+    } else {
+        twarnx("filermjob: walused %"PRId64" > alive %"PRId64, j->walused, f->w->alive);
+        f->w->alive = 0;
+    }
     j->walused = 0;
     filedecref(f);
 }
@@ -217,6 +222,14 @@ readrec(File *f, Job *l, int *err)
 
     // are we reading trailing zeroes?
     if (!jr.id) return 0;
+
+    // Reject jobs with body_size < 2 from corrupted WAL.
+    // Valid jobs always include \r\n trailer (body_size >= 2).
+    if (namelen && jr.body_size < 2 && jr.state != Invalid) {
+        warnpos(f, -sz, "job %"PRIu64" invalid body_size %d", jr.id, jr.body_size);
+        *err = 1;
+        return 0;
+    }
 
     j = job_find(jr.id);
     if (!(j || namelen)) {
@@ -348,6 +361,12 @@ readrec5(File *f, Job *l, int *err)
 
     // are we reading trailing zeroes?
     if (!jr.id) return 0;
+
+    if (namelen && jr.body_size < 2 && jr.state != Invalid) {
+        warnpos(f, -sz, "v5 job %"PRIu64" invalid body_size %d", jr.id, jr.body_size);
+        *err = 1;
+        return 0;
+    }
 
     j = job_find(jr.id);
     if (!(j || namelen)) {
