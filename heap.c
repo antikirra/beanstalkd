@@ -43,12 +43,16 @@ siftup(Heap *h, size_t k)
         size_t l = k * 2 + 1;
         size_t r = k * 2 + 2;
 
-        // Prefetch all 4 grandchildren (next iteration's comparison targets).
-        size_t gl = l * 2 + 1;  // left-left, left-right, right-left, right-right
-        if (gl < h->len) __builtin_prefetch(h->data[gl], 0, 1);
-        if (gl + 1 < h->len) __builtin_prefetch(h->data[gl + 1], 0, 1);
-        if (gl + 2 < h->len) __builtin_prefetch(h->data[gl + 2], 0, 1);
-        if (gl + 3 < h->len) __builtin_prefetch(h->data[gl + 3], 0, 1);
+        // Prefetch grandchildren for large heaps where L2/L3 latency matters.
+        // Skip for small heaps: prefetch overhead (4 branches + 4 insns)
+        // exceeds the latency it would hide when data fits in L1.
+        if (h->len > 32) {
+            size_t gl = l * 2 + 1;
+            if (gl < h->len) __builtin_prefetch(h->data[gl], 0, 1);
+            if (gl + 1 < h->len) __builtin_prefetch(h->data[gl + 1], 0, 1);
+            if (gl + 2 < h->len) __builtin_prefetch(h->data[gl + 2], 0, 1);
+            if (gl + 3 < h->len) __builtin_prefetch(h->data[gl + 3], 0, 1);
+        }
 
         // Find the smallest child, comparing against saved element x.
         size_t s = k;

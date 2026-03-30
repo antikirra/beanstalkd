@@ -17,7 +17,6 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <inttypes.h>
-#include <stdarg.h>
 #include <signal.h>
 #include <limits.h>
 #include <malloc.h>
@@ -692,30 +691,7 @@ reply(Conn *c, char *line, int len, int state)
     c->state = state;
 }
 
-static void
-reply_line(Conn*, int, const char*, ...)
-__attribute__((format(printf, 3, 4)));
 
-// reply_line prints *fmt into c->reply_buffer and
-// calls reply() for the string and state.
-static void
-reply_line(Conn *c, int state, const char *fmt, ...)
-{
-    int r;
-    va_list ap;
-
-    va_start(ap, fmt);
-    r = vsnprintf(c->reply_buf, LINE_BUF_SIZE, fmt, ap);
-    va_end(ap);
-
-    /* Make sure the buffer was big enough. If not, we have a bug. */
-    if (r < 0 || r >= LINE_BUF_SIZE) {
-        reply_serr(c, MSG_INTERNAL_ERROR);
-        return;
-    }
-
-    reply(c, c->reply_buf, r, state);
-}
 
 // Two-digit lookup table: "00", "01", ..., "99".
 // Halves the number of divisions in decimal conversion.
@@ -827,6 +803,20 @@ reply_buried(Conn *c, uint64 id)
     p -= 6;
     memcpy(p, "BURIED", 6);
     reply(c, p, (int)(c->reply_buf + LINE_BUF_SIZE - p), STATE_SEND_WORD);
+}
+
+// reply "OK <size>\r\n" without vsnprintf (stats, list-tubes responses).
+static void
+reply_ok_size(Conn *c, uint64 size)
+{
+    char *end = c->reply_buf + LINE_BUF_SIZE;
+    *--end = '\n';
+    *--end = '\r';
+    char *p = u64toa(end, size);
+    *--p = ' ';
+    p -= 2;
+    memcpy(p, "OK", 2);
+    reply(c, p, (int)(c->reply_buf + LINE_BUF_SIZE - p), STATE_SEND_JOB);
 }
 
 // remove_waiting_conn unsets CONN_TYPE_WAITING for the connection,
@@ -1769,10 +1759,11 @@ static struct {
 static void
 do_stats(Conn *c, fmt_fn fmt, void *data)
 {
-    // For global stats, use cached version if fresh (100ms TTL).
+    // For global stats, use cached version if fresh (500ms TTL).
+    // At 100K ops/sec this reduces full formatting from 10/sec to 2/sec.
     int is_global_stats = (fmt == (fmt_fn)fmt_stats);
     if (is_global_stats && stats_cache.len > 0
-        && now - stats_cache.at < 100000000LL) {
+        && now - stats_cache.at < 500000000LL) {
         c->out_job = allocate_job(stats_cache.len + 2);
         if (!c->out_job) {
             reply_serr(c, MSG_OUT_OF_MEMORY);
@@ -1783,7 +1774,7 @@ do_stats(Conn *c, fmt_fn fmt, void *data)
         c->out_job->r.body_size = stats_cache.len + 2;
         memcpy(c->out_job->body + stats_cache.len, "\r\n", 2);
         c->out_job_sent = 0;
-        reply_line(c, STATE_SEND_JOB, "OK %d\r\n", stats_cache.len);
+        reply_ok_size(c, (uint64)stats_cache.len);
         return;
     }
 
@@ -1810,7 +1801,7 @@ do_stats(Conn *c, fmt_fn fmt, void *data)
     }
 
     c->out_job_sent = 0;
-    reply_line(c, STATE_SEND_JOB, "OK %d\r\n", r - 2);
+    reply_ok_size(c, (uint64)(r - 2));
 }
 
 static void
@@ -1852,7 +1843,7 @@ do_list_tubes(Conn *c, Ms *l)
     size_t resp_z = buf - c->out_job->body;
     c->out_job->r.body_size = resp_z;
     c->out_job_sent = 0;
-    reply_line(c, STATE_SEND_JOB, "OK %zu\r\n", resp_z - 2);
+    reply_ok_size(c, (uint64)(resp_z - 2));
 }
 
 static int
@@ -2521,7 +2512,7 @@ dispatch_cmd(Conn *c)
             memcpy(buf, "\r\n", 2);
             c->out_job->r.body_size = body_z + 2;
             c->out_job_sent = 0;
-            reply_line(c, STATE_SEND_JOB, "OK %zu\r\n", body_z);
+            reply_ok_size(c, (uint64)body_z);
         } else {
             do_list_tubes(c, &tubes);
         }
@@ -2560,7 +2551,7 @@ dispatch_cmd(Conn *c)
             *buf++ = '\n';
             memcpy(buf, "\r\n", 2);
             c->out_job_sent = 0;
-            reply_line(c, STATE_SEND_JOB, "OK %zu\r\n", body_z);
+            reply_ok_size(c, (uint64)body_z);
         }
         return;
 
