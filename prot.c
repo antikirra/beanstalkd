@@ -3587,7 +3587,7 @@ h_accept_migrated(int cfd, Server *s, struct MigMsg *mm)
     c->sock.fd = cfd;
 
     // Flush pending reply (e.g. "WATCHING 1\r\n").
-    if (mm->pending_reply_len > 0) {
+    if (mm->pending_reply_len > 0 && mm->pending_reply_len <= (int)sizeof(mm->pending_reply)) {
         ssize_t wr = write(cfd, mm->pending_reply, mm->pending_reply_len);
         if (wr == -1 && errno != EAGAIN) {
             connclose(c);

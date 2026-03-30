@@ -254,6 +254,12 @@ handle_peer(struct PeerCtx *ctx, int ev)
                    buf.put.body_size, ctx->peer_idx);
             return;
         }
+        if (r < (ssize_t)(offsetof(struct PutFwdMsg, body) + buf.put.body_size)) {
+            twarnx("handle_peer: truncated PutFwdMsg body from peer %d (%zd < %zu)",
+                   ctx->peer_idx, r,
+                   offsetof(struct PutFwdMsg, body) + buf.put.body_size);
+            return;
+        }
         prot_handle_forwarded_put(s, &buf.put);
     } else if (buf.magic == CMD_REPLY_MAGIC) {
         // Variable-length: header + data_len bytes.
@@ -262,8 +268,13 @@ handle_peer(struct PeerCtx *ctx, int ev)
                    r, ctx->peer_idx);
             return;
         }
+        if (buf.rpl.data_len < 0 || buf.rpl.data_len > CMD_FWD_REPLY_SIZE ||
+            r < (ssize_t)(offsetof(struct CmdReplyMsg, data) + buf.rpl.data_len)) {
+            twarnx("handle_peer: truncated CmdReplyMsg from peer %d", ctx->peer_idx);
+            return;
+        }
         // Match reply to pending slot by sequence number (hash lookup).
-        if (buf.rpl.data_len > 0 && buf.rpl.data_len <= CMD_FWD_REPLY_SIZE && buf.rpl.seq) {
+        if (buf.rpl.data_len > 0 && buf.rpl.seq) {
             int i = pending_fwd_find(s, buf.rpl.seq);
             if (i >= 0) {
                 Conn *pc = s->pending_fwd[i].conn;
