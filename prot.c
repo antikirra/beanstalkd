@@ -2347,14 +2347,14 @@ dispatch_cmd(Conn *c)
         }
         op_ct[type]++;
 
-        t = tube_find_name(name, namelen);
+        uint32 sth = tube_name_hash(name);
+        t = tube_find_name_h(name, namelen, sth);
         if (!t) {
             // In multi-worker mode, forward to the worker that owns this tube.
             if (c->srv->nworkers > 1) {
-                uint32 h = tube_name_hash(name);
-                int target = h % c->srv->nworkers;
+                int target = sth % c->srv->nworkers;
                 if (target != c->srv->worker_id && c->srv->peer_fd[target] >= 0) {
-                    if (try_forward_tube_cmd(c, h)) return;
+                    if (try_forward_tube_cmd(c, sth)) return;
                 }
             }
             reply_msg(c, MSG_NOTFOUND);
@@ -2600,14 +2600,14 @@ watch_local:
             reply_msg(c, MSG_BAD_FORMAT);
             return;
         }
-        t = tube_find_name(name, namelen);
+        uint32 pth = tube_name_hash(name);
+        t = tube_find_name_h(name, namelen, pth);
         if (!t) {
             // In multi-worker mode, forward to the owner worker.
             if (c->srv->nworkers > 1) {
-                uint32 h = tube_name_hash(name);
-                int target = h % c->srv->nworkers;
+                int target = pth % c->srv->nworkers;
                 if (target != c->srv->worker_id && c->srv->peer_fd[target] >= 0) {
-                    if (try_forward_tube_cmd(c, h)) return;
+                    if (try_forward_tube_cmd(c, pth)) return;
                 }
             }
             reply_msg(c, MSG_NOTFOUND);

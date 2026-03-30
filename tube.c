@@ -10,27 +10,27 @@ struct Ms tubes;
 #define TUBE_HASH_SIZE 4096
 static Tube *tube_ht[TUBE_HASH_SIZE];
 
-// tube_name_hash returns a raw DJB2 hash of the tube name.
-// Used for tube hash table lookup and WAL shard routing.
+// tube_name_hash returns a finalized DJB2 hash of the tube name.
+// Used for tube hash table lookup, WAL shard routing, and worker ownership.
+// Finalizer mixes high bits into low bits for better distribution
+// under power-of-2 modulo (TUBE_HASH_SIZE, nworkers, nshards).
 uint
 tube_name_hash(const char *name)
 {
     uint h = 5381;
     while (*name)
         h = h * 33 + (unsigned char)*name++;
+    // Finalizer: mix high bits down for better low-bit distribution.
+    h ^= h >> 16;
+    h *= 0x45d9f3b;
+    h ^= h >> 16;
     return h;
-}
-
-static uint
-tube_hash(const char *name)
-{
-    return tube_name_hash(name) % TUBE_HASH_SIZE;
 }
 
 static void
 tube_ht_add(Tube *t)
 {
-    uint i = tube_hash(t->name);
+    uint i = t->name_hash % TUBE_HASH_SIZE;
     t->ht_next = tube_ht[i];
     tube_ht[i] = t;
 }
@@ -38,7 +38,7 @@ tube_ht_add(Tube *t)
 static void
 tube_ht_remove(Tube *t)
 {
-    uint i = tube_hash(t->name);
+    uint i = t->name_hash % TUBE_HASH_SIZE;
     Tube **slot = &tube_ht[i];
     while (*slot && *slot != t)
         slot = &(*slot)->ht_next;
@@ -47,18 +47,26 @@ tube_ht_remove(Tube *t)
     t->ht_next = NULL;
 }
 
-// tube_find_name finds a tube by name in the global hash table. O(1).
+// tube_find_name_h finds a tube by name with a precomputed hash.
+// Hash-first filter skips memcmp on non-matching chain entries.
 Tube *
-tube_find_name(const char *name, size_t len)
+tube_find_name_h(const char *name, size_t len, uint h)
 {
-    uint i = tube_hash(name);
-    Tube *t = tube_ht[i];
+    Tube *t = tube_ht[h % TUBE_HASH_SIZE];
     while (t) {
-        if (t->name_len == len && memcmp(t->name, name, len) == 0)
+        if (t->name_hash == h && t->name_len == len
+            && memcmp(t->name, name, len) == 0)
             return t;
         t = t->ht_next;
     }
     return NULL;
+}
+
+// tube_find_name finds a tube by name in the global hash table. O(1).
+Tube *
+tube_find_name(const char *name, size_t len)
+{
+    return tube_find_name_h(name, len, tube_name_hash(name));
 }
 
 

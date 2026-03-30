@@ -360,6 +360,7 @@ static inline void tube_dref(Tube *t) {
 static inline void tube_iref(Tube *t) { if (t) ++t->refs; }
 Tube *tube_find(Ms *tubeset, const char *name);
 Tube *tube_find_name(const char *name, size_t len);
+Tube *tube_find_name_h(const char *name, size_t len, uint hash);
 uint  tube_name_hash(const char *name);
 Tube *tube_find_or_make(const char *name);
 Tube *tube_find_or_make_n(const char *name, size_t len);

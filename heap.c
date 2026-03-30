@@ -43,10 +43,12 @@ siftup(Heap *h, size_t k)
         size_t l = k * 2 + 1;
         size_t r = k * 2 + 2;
 
-        // Prefetch grandchildren (next iteration's comparison targets).
-        size_t gl = l * 2 + 1;
+        // Prefetch all 4 grandchildren (next iteration's comparison targets).
+        size_t gl = l * 2 + 1;  // left-left, left-right, right-left, right-right
         if (gl < h->len) __builtin_prefetch(h->data[gl], 0, 1);
+        if (gl + 1 < h->len) __builtin_prefetch(h->data[gl + 1], 0, 1);
         if (gl + 2 < h->len) __builtin_prefetch(h->data[gl + 2], 0, 1);
+        if (gl + 3 < h->len) __builtin_prefetch(h->data[gl + 3], 0, 1);
 
         // Find the smallest child, comparing against saved element x.
         size_t s = k;
