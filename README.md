@@ -1,225 +1,146 @@
 # beanstalkd
 
-Linux-native, multi-core work queue in C99. Single binary, zero dependencies.
+Linux-native, multi-core work queue. Single C99 binary, zero dependencies.
 
-Fork of [upstream beanstalkd](https://github.com/beanstalkd/beanstalkd) with 35 bug fixes, multi-process architecture, and per-syscall optimizations. Wire protocol and WAL format are unchanged — existing client libraries work unmodified.
+Fork of [upstream beanstalkd](https://github.com/beanstalkd/beanstalkd): multi-process architecture, O(1) scheduling, per-syscall optimizations, 35 bug fixes. Wire protocol and WAL format unchanged — existing clients work unmodified.
 
-> **Breaking change:** each connection watches exactly one tube. The `watch` command switches the tube (not accumulates). `use` and `watch` are independent — `use` sets the producing tube locally, `watch` migrates the connection to the consuming tube's worker. See [Single-tube watch](#single-tube-watch) below.
-
-## Requirements
-
-**Linux kernel 6.1+**, glibc, gcc. No cross-platform support — the codebase uses Linux APIs directly without abstractions or `#ifdef` guards.
-
-Linux APIs used: `epoll_create1`, `accept4`, `fallocate`, `fdatasync`, `CLOCK_MONOTONIC_COARSE`, `SOCK_NONBLOCK|SOCK_CLOEXEC`, `O_CLOEXEC`, `TCP_FASTOPEN`, `TCP_DEFER_ACCEPT`, `TCP_CORK`, `SO_INCOMING_CPU`, `SO_TXREHASH`, `SO_REUSEPORT`, `sched_setaffinity`, `posix_fadvise`, `malloc_trim`, `SCM_RIGHTS`.
+> **Breaking change:** each connection watches one tube. `watch` switches (not accumulates). See [Single-tube watch](#single-tube-watch).
 
 ## Quick start
 
 ```sh
-# Docker (any host OS):
+make && ./beanstalkd                          # single process
+./beanstalkd -b /var/lib/beanstalkd -w 4      # 4 workers + WAL
 docker build -t beanstalkd . && docker run -p 11300:11300 beanstalkd
-
-# Native (Linux 6.1+):
-make && ./beanstalkd
-
-# With WAL persistence and 4 workers:
-./beanstalkd -b /var/lib/beanstalkd -w 4
 ```
 
-## Build and test
+Requires **Linux 6.1+**, glibc, gcc. Uses Linux APIs directly: `epoll`, `accept4`, `fallocate`, `fdatasync`, `SCM_RIGHTS`, `SO_REUSEPORT`, `TCP_FASTOPEN`, `TCP_DEFER_ACCEPT`, `TCP_CORK`, `sched_setaffinity`, `CLOCK_MONOTONIC_COARSE`.
+
+## Benchmark
+
+Server: Debian 12, kernel 6.1.0-44, 8 vCPU, 12GB RAM, SSD. Both binaries: `gcc -O2 -DNDEBUG`, WAL enabled, fsync 50ms. C bench client (epoll, pipelined). All values are ops/s (put + reserve + delete cycles).
+
+| Scenario | Upstream | Fork (`-w 1`) | Fork (8 workers) |
+|----------|----------|---------------|-------------------|
+| **S1** Throughput 8 conn, pipe=64 | 49,486 | **124,126** (+151%) | **203,054** (+310%) |
+| **S2** Latency 1 conn, pipe=1 | 24,858 | **62,264** (+150%) | 50,435 (+103%) |
+| **S3** Large body 16KB, 8 conn | 27,026 | **38,224** (+41%) | **81,772** (+203%) |
+| **S4** High concurrency 32 conn | 34,762 | **97,191** (+180%) | **194,889** (+461%) |
+| **S5** Deep pipeline 1 conn, pipe=256 | 67,859 | **123,429** (+82%) | **139,191** (+105%) |
+| **S6** 500 tubes, 4 clients | 20,742 | 20,198 | **37,229** (+80%) |
+
+<details>
+<summary>Latency breakdown</summary>
+
+| | Upstream | Fork (`-w 1`) | Fork (8W) |
+|---|---|---|---|
+| S1 P50 | 5,173 µs | 2,742 µs | **1,796 µs** |
+| S1 P99.9 | 51,598 µs | **10,118 µs** | 38,728 µs |
+| S2 P50 | 34.0 µs | **26.2 µs** | 28.7 µs |
+| S2 P99.9 | 16,708 µs | **7,571 µs** | 11,128 µs |
+
+</details>
 
 ```sh
-make                                    # build
-make check                              # 203 unit tests
-make check-mw                           # 12 multi-worker integration tests
-make bench                              # benchmarks
-docker build -f Dockerfile.build .      # CI: UBSan + cppcheck
-docker build -f Dockerfile.benchmark .  # A/B comparison vs upstream
+docker build -f Dockerfile.benchmark . && docker run --rm <image>  # reproducible A/B
 ```
-
-CI pipeline (`Dockerfile.build`): 203 unit tests (UBSan) + 12 multi-worker integration tests + cppcheck.
-
-Production image (`Dockerfile`): multi-stage build on bookworm-slim, LTO, `-Os -march=native -fvisibility=hidden`, full RELRO.
 
 ## Fork vs upstream
 
 | | Upstream | This fork |
-|---|----------|-----------|
-| Platform | Linux, macOS, FreeBSD, SunOS | Linux 6.1+ only |
-| Multi-tube watch | Yes (N tubes per connection) | No (1 tube per connection) |
-| Multi-core | Single-threaded | N workers, one per CPU core |
+|---|---|---|
+| Architecture | Single-threaded | N workers, one per CPU core |
 | Scheduling | O(tubes) scan per tick | O(1) heaps + direct match |
-| Syscalls per command | ~4 (read→epoll→write→epoll) | ~2 (read→write, inline flush) |
-| Job hash rehash | Stop-the-world O(n) | Incremental, 16 buckets/op |
+| Syscalls | ~4 per command | ~2 (inline reply flush) |
+| Job hash rehash | Stop-the-world | Incremental, 16 buckets/op |
 | Job pool | Exact size match | 11 size classes, O(1) reuse |
-| WAL | Single file, 1 fsync thread | Per-worker, async fsync |
-| Known crash/data bugs | 22 open | 35 fixed |
-| Tests | 100 unit | 203 unit + 12 multi-worker integration |
+| WAL | Single file chain | Per-worker, async fsync |
+| Crash/data bugs | 22 open | 35 fixed |
+| Tests | 100 unit | 203 unit + 12 MW integration |
+| Platform | Linux, macOS, FreeBSD | Linux 6.1+ only |
+
+## Build and test
+
+```sh
+make check                              # 203 unit tests (UBSan in CI)
+make check-mw                           # 12 multi-worker integration tests
+docker build -f Dockerfile.build .      # full CI: UBSan + MW tests + cppcheck
+```
 
 ## Single-tube watch
 
-Upstream beanstalkd allows `watch`ing multiple tubes per connection. The `reserve` command scans all watched tubes to find the highest-priority ready job, requiring a global matchable heap — an inherently serial operation that cannot be partitioned across CPU cores.
+Upstream allows watching N tubes per connection. `reserve` scans all watched tubes — an inherently serial operation that cannot be partitioned across cores.
 
-This fork restricts each connection to one watched tube:
+This fork: one watched tube per connection.
 
-- `watch <tube>` — **switches** to `<tube>`, always replies `WATCHING 1`
-- `ignore <tube>` — no-op if it's the current tube (cannot have zero), always replies `WATCHING 1`
-- `reserve` — blocks on the single watched tube only
-- `use <tube>` — changes producer tube **independently** of `watch` (no migration)
-
-`use` and `watch` are fully independent, as in upstream. `use` determines where `put` sends jobs. `watch` determines where `reserve` receives jobs. A client can `use` one tube for producing and `watch` another for consuming. When the `use` tube is on a different worker, puts are transparently forwarded via Unix socket IPC.
-
-**Client library compatibility:** all major libraries (Pheanstalk, Beaneater, go-beanstalk, beanstalkc) support multi-tube watch as a core feature. In this fork, calling `watch` multiple times switches the tube — only the last one is active. Clients that use multi-tube watch need one connection per tube. Run with `-V` to log tube switches for debugging.
+- `watch <tube>` — switches to `<tube>`, replies `WATCHING 1`
+- `ignore <tube>` — no-op, replies `WATCHING 1`
+- `use` and `watch` are independent: `use` sets producer tube, `watch` sets consumer tube
 
 ```
 # Before (upstream, one connection):
 conn.watch('emails').watch('notifications').reserve()
 
-# After (this fork, two connections):
-conn1.watch('emails').reserve()        # connection 1
-conn2.watch('notifications').reserve() # connection 2
+# After (this fork, one connection per tube):
+conn1.watch('emails').reserve()
+conn2.watch('notifications').reserve()
 ```
 
 ## Multi-process architecture
 
-By default, beanstalkd forks N worker processes (one per CPU core). Override with `-w N`.
+Forks N workers (one per CPU core). Override with `-w N`. Single-process: `-w 0`, `-w 1`, or `-t CPU`.
 
-**Master process:** monitors workers via `waitpid`, restarts on crash, forwards `SIGTERM`/`SIGUSR1`.
+**Master:** monitors workers via `waitpid`, restarts on crash, forwards signals.
 
-**Each worker:**
-- Binds its own `SO_REUSEPORT` socket on port 11300
-- Owns tubes deterministically: `tube_name_hash(name) % nworkers`
-- Runs independent event loop (epoll, heaps, job hash table, counters)
-- Has its own WAL directory (`<wal_dir>/wN/`)
-- Allocates interleaved job IDs (worker K → 1+K, 1+K+N, 1+K+2N, ...)
+**Workers:** each binds `SO_REUSEPORT` on port 11300, owns tubes by `hash(name) % N`, runs independent epoll loop with own WAL directory and interleaved job IDs.
 
-**Connection routing:**
-- `watch` migrates the connection to the tube's owner worker via `SCM_RIGHTS` fd passing (buffered pipeline data travels with the fd)
-- `use` is local — does not migrate. `put` commands are forwarded to the tube's owner worker via `PutFwdMsg` (up to 32KB body, larger jobs enqueue locally)
-- `peek <id>`, `stats-job <id>`, `kick-job <id>` are forwarded to the job's owner worker by ID routing (`(id-1) % nworkers`)
-- `stats-tube`, `pause-tube`, `peek-ready/delayed/buried`, `kick` are forwarded to the tube's owner worker
-- `stats` aggregates all workers' counters via `mmap`'d shared memory (1Hz publish, seqlock for torn-read protection)
-- IPC messages: variable-length send (header + actual data bytes, not full struct)
-- On accept, worker speculatively reads the first command; if `watch` targets a remote tube, the fd is migrated before creating a `Conn`
-- Master monitors workers and restarts crashed ones with full mesh recovery (new socketpairs distributed via control pipe + `SCM_RIGHTS`)
-
-**Single-process fallback:** `-t CPU` (pin to core), `-w 0`, `-w 1`, or 1 CPU detected.
+**Routing:**
+- `watch` → migrates connection via `SCM_RIGHTS` to tube's owner
+- `put` → forwarded to tube owner via `PutFwdMsg` (zero-copy sendmsg scatter-gather)
+- `peek/stats-job/kick-job/delete <id>` → forwarded by `(id-1) % N`
+- `stats-tube/pause-tube/peek-ready/kick` → forwarded by tube hash
+- `stats` → aggregates via `mmap`'d shared memory (seqlock, 1Hz publish)
+- Mesh recovery: master distributes new socketpairs via control pipe on worker restart
 
 ## Bug fixes (35)
 
-**Crashes:** NULL deref in conn_timeout, infinite loop in rawfalloc, WAL rollback corruption, unsafe `exit()` in signal handler, `EPOLLERR` causing 100% CPU, OOM in `prot_init` → SIGSEGV.
+**Crashes:** NULL deref in conn_timeout, infinite loop in rawfalloc, WAL rollback corruption, unsafe signal handler exit, EPOLLERR 100% CPU, prot_init OOM SIGSEGV.
 
-**Data loss:** job/memory leaks in h_accept and enqueue_incoming_job, job_copy dangling pointer, WAL nrec increment on failure, corrupt WAL records silently skipped, walmaint errors silently ignored, prot_replay orphaning jobs, `enqueue_job` WAL failure leaving job in two structures, `release`/`bury` WAL failure orphaning jobs, `delayed_ct` truncated to 32 bits, `pause-time-left` wraparound, WAL stats not aggregated across shards, `total_jobs_ct` incremented before enqueue check, heap OOM silently ignored, WAL reservation leak in kick/release paths.
+**Data loss:** job leaks in h_accept/enqueue_incoming_job, job_copy dangling pointer, WAL nrec on failure, corrupt WAL records skipped, walmaint errors ignored, prot_replay orphans, enqueue_job WAL failure leaving job in two structures, release/bury WAL failure orphans, delayed_ct 32-bit truncation, pause-time-left wraparound, WAL stats not aggregated, total_jobs_ct premature increment, heap OOM ignored, WAL reservation leak in kick/release.
 
-**Hardening:** input validation for kick/reserve-timeout, option parsing overflow, EMFILE backpressure (deregister listen socket), `scan_line_end` bare `\r`, connsched heap corruption on OOM, snprintf negative return, stale fd after WAL file close, IPv6 stack overflow in verbose stats.
+**Hardening:** input validation for kick/reserve-timeout, option parsing overflow, EMFILE backpressure, scan_line_end bare `\r`, connsched heap OOM, snprintf negative return, stale WAL fd, IPv6 stats overflow.
 
-**WAL integrity:** directory fsync, `fdatasync()`, EINTR/short-read handling, `fallocate()` preallocation, partial replay recovery.
+## Performance
 
-## Performance changes
+**Scheduling:** O(1) delay/pause/timeout heaps; direct process_tube match on enqueue; heapresift in-place; heap grandchild prefetch.
 
-**Scheduling:**
-- O(1) heaps for delayed tubes, paused tubes, connection timeouts (was O(tubes) scan)
-- Direct `process_tube()` matches jobs↔conns within a tube on enqueue/unpause (eliminates global matchable heap)
-- `heapresift()` for in-place re-ordering (was remove+insert)
+**Syscall reduction:** inline reply flush (skip epoll round-trip); writev for job body; 64-event epoll batch with drain loop; epoll_ctl caching; TCP_CORK only on pipeline; TCP_QUICKACK at accept; accept4 atomic flags; CLOCK_MONOTONIC_COARSE per batch; incremental scan_line_end; reserve fast path (skip ms round-trip when job ready).
 
-**Syscall reduction:**
-- Inline reply flush: write directly in `reply()`, skip epoll round-trip
-- `writev` fast path for job body (header+body in one syscall)
-- Batch epoll: 64 events per `epoll_wait`, drain loop before next `prottick`
-- `epoll_ctl` caching: skip when registered mode unchanged; `sockwant` branch restructuring with `likely()` for hot-path early exit
-- `TCP_CORK` only when pipelining detected (was unconditional)
-- `TCP_QUICKACK` once at accept time (removed per-read-event setsockopt)
-- `accept4(SOCK_NONBLOCK|SOCK_CLOEXEC)` — atomic, no fcntl
-- `CLOCK_MONOTONIC_COARSE` — ~5ns vs ~25ns, once per epoll batch
-- `scan_line_end`: incremental offset skips already-scanned bytes on partial reads
-- Reserve fast path: check ready queue before enqueuing into `waiting_conns`, skip `ms_append`+`ms_take` round-trip when job is already available
+**Parsing:** u64toa two-digit pair table; reply_inserted/reply_job backward build into reply_buf; manual base-10 read_uint; 256-byte tube name lookup table; two-level byte command dispatch.
 
-**Parsing and formatting:**
-- `reply_inserted`/`reply_using`/`reply_job` via `u64toa` directly into `reply_buf` (no vsnprintf, no intermediate buffer)
-- `u64toa`: two-digit pair lookup table halves div/mod count
-- `read_uint` manual base-10 (no strtoumax/locale)
-- Tube name validation via 256-byte lookup table (no strspn)
-- NUL injection check via `memchr` (no strlen)
-- Command dispatch: two-level byte dispatch (cmd[0] then cmd[1]/cmd[4-9]) resolves most commands without strncmp
+**Memory:** 11-class job pool (64B–64KB); cache-line Conn/Tube struct layout; Conn slab pool (256); incremental rehash (16 buckets/op, dual-table); DJB2+finalizer tube hash with hash-first filter; cached tube owner/shard; MALLOC_ARENA_MAX=1; periodic malloc_trim; lazy heap alloc for MW-only buffers.
 
-**Memory and data structures:**
-- Size-classed job pool: 11 buckets (64B–64KB), O(1) reuse
-- Conn struct: cache-line layout — hot fields in first 2 lines, large buffers at end
-- Conn slab pool: up to 256 recycled structs, `memset`-based reset (was 18 individual field zeroes)
-- Incremental rehash: 16 buckets/op, dual-table lookup during migration, `unlikely()` on all rehash paths
-- Job alloc: single `memset` of entire struct (was partial memset + 8 field assignments)
-- Job copy: selective field copy (was `memcpy` of entire struct including overwritten pointers)
-- Tube hash: DJB2 + finalizer for better power-of-2 distribution; hash-first filter skips strcmp on chain probes; `tube_find_name_h` variant with precomputed hash eliminates double hashing in stats-tube/pause-tube
-- Tube owner/shard: cached at creation (eliminates modulo per put/delete/WAL write)
-- Heap siftup: prefetches all 4 grandchildren for cache-friendly traversal
-- `connsched`: skips heapresift when tickat unchanged
-- `conntickat`: fast exit when no pending timeout and no reserved jobs
-- `MALLOC_ARENA_MAX=1` — single glibc arena (-39% RSS)
-- Periodic `malloc_trim` returns pages to OS
-- Inline `tube_dref`/`tube_iref`/`job_list_reset`/`job_list_is_empty`, `is_job_reserved_by_conn`, `remove_this_reserved_job`, `maybe_enqueue_incoming_job`, `conndeadlinesoon`, `conn_ready`
+**WAL:** per-worker directories; async fsync threads; writev records; fallocate prealloc; rate-limited compaction; lock-free error check; readahead on recovery.
 
-**WAL:**
-- Per-worker WAL directories with independent async fsync threads
-- `writev` for WAL records (was 2-4 separate writes)
-- `filewritev` fast path: single writev check before entering retry loop
-- `filewrjobshort` marked hot (called on every job state change)
-- `walresvput`: precomputed constant expression (was 6 separate additions)
-- `fallocate()` for O(1) preallocation
-- Rate-limited compaction (1ms throttle)
-- Async dirsync handoff to fsync thread
-- Lock-free error check via `__atomic_load_n`
-
-**Network:**
-- `SO_REUSEPORT` for kernel-level load balancing across workers
-- `TCP_FASTOPEN` (qlen 1024) — -1 RTT for new connections
-- `TCP_DEFER_ACCEPT` — kernel holds connection until client sends data, reducing empty accept events
-- `SO_INCOMING_CPU` — bind RX path to pinned CPU
-- CPU pinning via `sched_setaffinity` (`-t` flag)
+**Network:** SO_REUSEPORT; TCP_FASTOPEN(1024); TCP_DEFER_ACCEPT; TCP_NOTSENT_LOWAT(16KB); TCP_USER_TIMEOUT(30s); SO_INCOMING_CPU; sched_setaffinity.
 
 ## Configuration
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-b DIR` | disabled | WAL persistence (per-worker sharded) |
+| `-b DIR` | — | WAL directory (enables persistence) |
 | `-f MS` | 50 | fsync interval (0 = every write) |
 | `-F` | | Never fsync |
-| `-l ADDR` | 0.0.0.0 | Listen address (`unix:` prefix for Unix socket) |
+| `-l ADDR` | 0.0.0.0 | Listen address (`unix:` for Unix socket) |
 | `-p PORT` | 11300 | Listen port |
 | `-z BYTES` | 65535 | Max job body size |
 | `-s BYTES` | 10MB | WAL file size |
 | `-u USER` | | Drop privileges |
-| `-m SEC` | 60 | Memory trim interval (0 = disable) |
-| `-t CPU` | disabled | Pin to CPU core (forces single-process) |
-| `-w N` | auto | Workers (0/1 = single-process, auto = per CPU) |
-| `-V` | | Increase verbosity |
-
-## Benchmark
-
-A/B comparison, identical compiler flags (`gcc -O2 -DNDEBUG`), WAL enabled:
-
-```sh
-docker build -f Dockerfile.benchmark -t bench . && docker run --rm bench
-```
-
-### Bare metal results
-
-Server: Debian 12 (bookworm), kernel 6.1.0, 8 vCPU QEMU, 12GB RAM, SSD.
-Both binaries: `gcc -O2 -DNDEBUG`. Fork: `-w 1` (single-process mode).
-
-| Scenario | Metric | Upstream | Fork (`-w 1`) | Delta |
-|----------|--------|----------|---------------|-------|
-| Throughput (8 clients) | ops/s | 8,282 | 9,477 | **+14.4%** |
-| Throughput (8 clients) | PUT ops/s | 2,666 | 3,618 | **+35.7%** |
-| Multi-tube (20 tubes) | ops/s | 6,624 | 11,500 | **+73.6%** |
-| 500 tubes × 100 jobs | ops/s | 27,203 | 42,961 | **+57.9%** |
-| 500 tubes × 100 jobs | CPU time | 2.36s | 1.68s | **+28.8%** |
-| Latency (single client) | Avg | 245µs | 102µs | **+58% faster** |
-| Latency (single client) | P50 | 164µs | 95µs | **+42% faster** |
-| Latency (single client) | P99 | 1,969µs | 187µs | **10.5x lower** |
-| Latency (single client) | P99.9 | 11,721µs | 252µs | **46.5x lower** |
-| Connection storm | conn/s | 7,381 | 8,873 | **+20.2%** |
+| `-m SEC` | 60 | malloc_trim interval (0 = disable) |
+| `-t CPU` | — | Pin to CPU core (forces single-process) |
+| `-w N` | auto | Workers (0/1 = single, auto = per core) |
+| `-V` | | Verbose logging |
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
-
-Based on [beanstalkd](https://github.com/beanstalkd/beanstalkd) by Keith Rarick and contributors.
+MIT. See [LICENSE](LICENSE). Based on [beanstalkd](https://github.com/beanstalkd/beanstalkd) by Keith Rarick and contributors.

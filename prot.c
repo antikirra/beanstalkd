@@ -844,6 +844,9 @@ process_tube(Tube *t)
             twarnx("job not ready");
             break;
         }
+        // Prefetch new heap root for next iteration (hides L2/L3 latency).
+        if (t->ready.len > 0)
+            __builtin_prefetch(t->ready.data[0], 0, 1);
         Conn *c = ms_take(&t->waiting_conns);
         if (!c) {
             // Re-enqueue the orphaned job.
@@ -1373,19 +1376,26 @@ enqueue_incoming_job(Conn *c)
           } else {
             uint32 seq = pending_fwd_alloc(c->srv, c);
             if (seq) {
-                static struct PutFwdMsg pm;
+                // Header-only struct: body sent via iovec scatter-gather.
+                // Heap-allocated on first use to avoid 66KB static BSS
+                // that pollutes data cache in single-process mode.
+                static struct PutFwdMsg *pm;
+                if (!pm) {
+                    pm = malloc(sizeof(*pm));
+                    if (!pm) { twarnx("OOM"); goto fwd_undo; }
+                }
                 size_t hdr_size = offsetof(struct PutFwdMsg, body);
-                pm.magic = PUT_FWD_MAGIC;
-                pm.from_worker = c->srv->worker_id;
-                pm.seq = seq;
-                pm.pri = j->r.pri;
-                pm.delay = j->r.delay;
-                pm.ttr = j->r.ttr;
-                memcpy(pm.tube, j->tube->name, j->tube->name_len + 1);
-                pm.body_size = j->r.body_size;
+                pm->magic = PUT_FWD_MAGIC;
+                pm->from_worker = c->srv->worker_id;
+                pm->seq = seq;
+                pm->pri = j->r.pri;
+                pm->delay = j->r.delay;
+                pm->ttr = j->r.ttr;
+                memcpy(pm->tube, j->tube->name, j->tube->name_len + 1);
+                pm->body_size = j->r.body_size;
                 // sendmsg with iovec avoids memcpy of body (up to 64KB).
                 struct iovec iov[2] = {
-                    { .iov_base = &pm,     .iov_len = hdr_size },
+                    { .iov_base = pm,      .iov_len = hdr_size },
                     { .iov_base = j->body, .iov_len = j->r.body_size },
                 };
                 struct msghdr msg = {0};
@@ -1402,7 +1412,7 @@ enqueue_incoming_job(Conn *c)
                     return;
                 }
                 // Undo slot on failure.
-                {
+                fwd_undo: {
                     int idx = pending_fwd_find(c->srv, seq);
                     if (idx >= 0) {
                         c->srv->pending_fwd[idx].conn = NULL;

@@ -20,7 +20,7 @@
 
 #define MAX_CONNS     256
 #define PIPELINE_MAX  256
-#define BUF_SIZE      (1 << 16)
+#define BUF_SIZE      (1 << 20)  // 1MB: fits large body × deep pipeline
 #define MAX_LAT       (1 << 20)
 
 static int64_t
@@ -136,6 +136,15 @@ static void flush_send(Bench *b) {
 }
 
 static void fill_recv(Bench *b) {
+    // Compact: shift unconsumed data to front when read space is low.
+    // Prevents deadlock with large bodies: rpos > 0, rlen == BUF_SIZE,
+    // body_skip > available — no room to read, EPOLLET won't re-fire.
+    if (b->rpos > 0 && b->rlen - b->rpos < BUF_SIZE / 2) {
+        int rem = b->rlen - b->rpos;
+        memmove(b->rbuf, b->rbuf + b->rpos, rem);
+        b->rlen = rem;
+        b->rpos = 0;
+    }
     for (;;) {
         int space = BUF_SIZE - b->rlen;
         if (space <= 0) break;
@@ -168,7 +177,12 @@ static void fill_puts(Bench *b) {
 static const char res_cmd[] = "reserve-with-timeout 0\r\n";
 
 static void fill_reserves(Bench *b) {
-    while (b->sent < b->target && b->sent - b->recvd < b->pipeline) {
+    // Limit outstanding reserves so responses fit in recv buffer.
+    // Each RESERVED reply is ~(body_size + 64) bytes.
+    int max_inflight = BUF_SIZE / (body_size + 256);
+    if (max_inflight < 1) max_inflight = 1;
+    int pipe = b->pipeline < max_inflight ? b->pipeline : max_inflight;
+    while (b->sent < b->target && b->sent - b->recvd < pipe) {
         enqueue(b, res_cmd, sizeof(res_cmd) - 1);
         b->send_ts[b->sent % PIPELINE_MAX] = now_ns();
         b->sent++;

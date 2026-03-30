@@ -57,6 +57,7 @@ tube_find_name_h(const char *name, size_t len, uint h)
         if (t->name_hash == h && t->name_len == len
             && memcmp(t->name, name, len) == 0)
             return t;
+        if (t->ht_next) __builtin_prefetch(t->ht_next, 0, 1);
         t = t->ht_next;
     }
     return NULL;

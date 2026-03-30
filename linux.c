@@ -101,9 +101,9 @@ socknext(Socket **s, int64 timeout)
     if (ep_pos < ep_nready) {
         struct epoll_event *ev = &ep_buf[ep_pos++];
         *s = ev->data.ptr;
-        if (ev->events & (EPOLLERR|EPOLLHUP|EPOLLRDHUP)) {
+        if (unlikely(ev->events & (EPOLLERR|EPOLLHUP|EPOLLRDHUP))) {
             return 'h';
-        } else if (ev->events & EPOLLIN) {
+        } else if (likely(ev->events & EPOLLIN)) {
             return 'r';
         } else if (ev->events & EPOLLOUT) {
             return 'w';

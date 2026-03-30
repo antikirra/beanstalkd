@@ -242,32 +242,41 @@ struct Job {
     int64 walused;
 };
 
+// Tube struct layout: hot scheduling fields packed in first 4 cache lines
+// (256 bytes). name[201] and buried sentinel at end to avoid cache
+// pollution — process_tube and enqueue_job access ready/delay/waiting_conns
+// on every iteration without loading the name bytes.
 struct Tube {
+    // --- cache line 1 (0-63): identity, flags, counters ---
     uint refs;
-    char name[MAX_TUBE_NAME_LEN];
-    size_t name_len;                    // cached strlen(name)
-    uint   name_hash;                   // cached tube_name_hash(name)
-    int    owner;                       // name_hash % nworkers, or -1 if single-process
-    int    shard;                       // name_hash % nshards, or -1 if no sharding
-    Tube *ht_next; // hash table chain for global tube lookup
-    Heap ready;
-    Heap delay;
-    size_t delay_heap_index;    // position in global delay tube heap
-    int in_delay_heap;          // 1 if tube is in global delay heap
-    size_t pause_heap_index;    // position in global pause tube heap
-    int in_pause_heap;          // 1 if tube is in pause heap
-    Ms waiting_conns;           // conns waiting for the job at this moment
-    struct stats stat;
+    uint name_hash;                     // cached tube_name_hash(name)
+    int  owner;                         // name_hash % nworkers, or -1 if single-process
+    int  shard;                         // name_hash % nshards, or -1 if no sharding
+    int  in_delay_heap;                 // 1 if tube is in global delay heap
+    int  in_pause_heap;                 // 1 if tube is in pause heap
     uint using_ct;
     uint watching_ct;
+    Heap ready;                         // +32: job priority queue (40B, straddles CL1-2)
 
-    // pause is set to the duration of the current pause, otherwise 0, in nsec.
-    int64 pause;
+    // --- cache line 2 (64-127): delay heap, heap indices ---
+    Heap delay;                         // +72: delayed job queue
+    size_t delay_heap_index;            // position in global delay tube heap
+    size_t pause_heap_index;            // position in global pause tube heap
 
-    // unpause_at is a timestamp when to unpause the tube, in nsec.
-    int64 unpause_at;
+    // --- cache line 3 (128-191): pause, waiting conns ---
+    int64 pause;                        // duration of the current pause, or 0, in nsec
+    int64 unpause_at;                   // timestamp when to unpause, in nsec
+    Ms waiting_conns;                   // conns waiting for a job at this moment
 
-    Job buried;                 // linked list header
+    // --- cache line 4 (192-255): stats ---
+    struct stats stat;
+    // (8 bytes remaining in CL4)
+
+    // --- cold fields: lookup, list management ---
+    Tube *ht_next;                      // hash table chain for global tube lookup
+    size_t name_len;                    // cached strlen(name)
+    Job buried;                         // linked list header
+    char name[MAX_TUBE_NAME_LEN];       // tube name (cold: only on lookup/stats)
 };
 
 

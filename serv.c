@@ -162,14 +162,20 @@ handle_peer(struct PeerCtx *ctx, int ev)
     int fd = s->peer_fd[ctx->peer_idx];
 
     // Unified read: single recvmsg for all message types.
-    // PutFwdMsg is largest (~66KB) and already static.
+    // Heap-allocated on first use to avoid 66KB BSS pollution
+    // in single-process mode (handle_peer is never called).
     static union {
         uint32              magic;
         struct MigMsg       mig;
         struct CmdFwdMsg    cmd;
         struct PutFwdMsg    put;
         struct CmdReplyMsg  rpl;
-    } buf;
+    } *pbuf;
+    if (!pbuf) {
+        pbuf = malloc(sizeof(*pbuf));
+        if (!pbuf) return;
+    }
+    #define buf (*pbuf)
     char cmsgbuf[CMSG_SPACE(sizeof(int))];
 
     struct iovec iov = { .iov_base = &buf, .iov_len = sizeof(buf) };
@@ -295,6 +301,7 @@ handle_peer(struct PeerCtx *ctx, int ev)
         }
     }
     // Unknown magic — already consumed by recvmsg, nothing to drain.
+    #undef buf
 }
 
 // Register (or re-register) a peer socket in epoll.
