@@ -226,7 +226,7 @@ conn_ready(Conn *c)
 }
 
 
-int
+__attribute__((hot)) int
 conn_less(void *ca, void *cb)
 {
     Conn *a = (Conn *)ca;
@@ -235,7 +235,7 @@ conn_less(void *ca, void *cb)
 }
 
 
-void
+__attribute__((hot)) void
 conn_setpos(void *c, size_t i)
 {
     ((Conn *)c)->tickpos = i;

@@ -614,20 +614,18 @@ reply(Conn *c, char *line, int len, int state)
     if (likely(state == STATE_SEND_WORD)) {
         int r = write(c->sock.fd, line, len);
         if (likely(r == len)) {
-            c->reply = line;
-            c->reply_len = len;
-            c->reply_sent = 0;
+            // Fast path: skip c->reply* stores (only needed for retry).
             c->state = STATE_WANT_COMMAND;
-            if (c->out_job && c->out_job->r.state == Copy)
-                job_free(c->out_job);
-            c->out_job = NULL;
-            // Skip heap operations when connection has no pending timeouts.
-            // Pure producers (no reserved jobs, not waiting) don't need scheduling.
+            if (unlikely(c->out_job)) {
+                if (c->out_job->r.state == Copy)
+                    job_free(c->out_job);
+                c->out_job = NULL;
+            }
             if (c->in_conns || c->pending_timeout >= 0)
                 connsched(c);
             return;
         }
-        // Partial write: record progress, fall through to epoll.
+        // Partial write: record progress for retry via epoll.
         if (r > 0) {
             c->reply = line;
             c->reply_len = len;
@@ -654,11 +652,7 @@ reply(Conn *c, char *line, int len, int state)
         ssize_t total = len + c->out_job->r.body_size;
         ssize_t r = writev(c->sock.fd, iov, 2);
         if (r == total) {
-            // Fully sent header + body in one shot.
-            c->reply = line;
-            c->reply_len = len;
-            c->reply_sent = len;
-            c->out_job_sent = c->out_job->r.body_size;
+            // Fast path: skip c->reply* stores (conn_want_command resets state).
             if (verbose >= 2) {
                 printf(">%d job %"PRIu64"\n", c->sock.fd, c->out_job->r.id);
             }
@@ -762,14 +756,14 @@ reply_using(Conn *c, Tube *t)
 
 // reply_job tells the connection c which job to send.
 // Build "MSG ID SIZE\r\n" without vsnprintf.
+// Use the reply_job macro to compute msg length at compile time.
 static void
-reply_job(Conn *c, Job *j, const char *msg)
+reply_job_n(Conn *c, Job *j, const char *msg, int msglen)
 {
     c->out_job = j;
     c->out_job_sent = 0;
 
     char *buf = c->reply_buf;
-    int msglen = strlen(msg);
     memcpy(buf, msg, msglen);
     buf[msglen] = ' ';
     buf += msglen + 1;
@@ -791,6 +785,7 @@ reply_job(Conn *c, Job *j, const char *msg)
     *buf++ = '\n';
     reply(c, c->reply_buf, (int)(buf - c->reply_buf), STATE_SEND_JOB);
 }
+#define reply_job(c, j, msg) reply_job_n(c, j, msg, sizeof(msg) - 1)
 
 // remove_waiting_conn unsets CONN_TYPE_WAITING for the connection,
 // removes it from the waiting_conns set of every tube it's watching.
@@ -877,7 +872,7 @@ soonest_delayed_job()
 // enqueue_job inserts job j in the tube, returns 1 on success, otherwise 0.
 // If update_store then it writes an entry to WAL.
 // On success it processes the queue.
-static int
+__attribute__((hot)) static int
 enqueue_job(Server *s, Job *j, int64 delay, char update_store)
 {
     int r;
@@ -1070,7 +1065,7 @@ kick_jobs(Server *s, Tube *t, uint n)
 
 // remove_buried_job returns non-NULL value if job j was in the buried state.
 // It excludes the job from the buried list and updates counters.
-static Job *
+__attribute__((hot)) static Job *
 remove_buried_job(Job *j)
 {
     if (!j || j->r.state != Buried)
@@ -1085,7 +1080,7 @@ remove_buried_job(Job *j)
 
 // remove_delayed_job returns non-NULL value if job j was in the delayed state.
 // It removes the job from the tube delayed heap.
-static Job *
+__attribute__((hot)) static Job *
 remove_delayed_job(Job *j)
 {
     if (!j || j->r.state != Delayed)
@@ -1099,7 +1094,7 @@ remove_delayed_job(Job *j)
 
 // remove_ready_job returns non-NULL value if job j was in the ready state.
 // It removes the job from the tube ready heap and updates counters.
-static Job *
+__attribute__((hot)) static Job *
 remove_ready_job(Job *j)
 {
     if (!j || j->r.state != Ready)
@@ -1142,7 +1137,7 @@ check_err(Conn *c, const char *s)
 
 /* Scan the given string for the sequence "\r\n" and return the line length.
  * Always returns at least 2 if a match is found. Returns 0 if no match. */
-static size_t
+__attribute__((hot)) static size_t
 scan_line_end(const char *s, size_t size)
 {
     const char *p = s;
@@ -1166,7 +1161,7 @@ scan_line_end(const char *s, size_t size)
 }
 
 /* parse the command line */
-static int
+__attribute__((hot)) static int
 which_cmd(Conn *c)
 {
 #define TEST_CMD(s,c,o) if (strncmp((s), (c), CONSTSTRLEN(c)) == 0) return (o);
@@ -1233,7 +1228,7 @@ which_cmd(Conn *c)
 /* Copy up to body_size trailing bytes into the job, then the rest into the cmd
  * buffer. If c->in_job exists, this assumes that c->in_job->body is empty.
  * This function is idempotent(). */
-static void
+__attribute__((hot)) static void
 fill_extra_data(Conn *c)
 {
     if (!c->cmd_len)
@@ -1261,7 +1256,8 @@ fill_extra_data(Conn *c)
 
     /* how many bytes are left to go into the future cmd? */
     int64 cmd_bytes = extra_bytes - job_data_bytes;
-    memmove(c->cmd, c->cmd + c->cmd_len + job_data_bytes, cmd_bytes);
+    if (cmd_bytes > 0)
+        memmove(c->cmd, c->cmd + c->cmd_len + job_data_bytes, cmd_bytes);
     c->cmd_read = cmd_bytes;
     c->cmd_len = 0; /* we no longer know the length of the new command */
 }
@@ -1471,34 +1467,47 @@ fmt_stats(char *buf, size_t size, void *x)
             for (int i = 0; i < TOTAL_OPS && i < SHARED_STATS_OPS; i++)
                 agg_op[i] += ss->op_ct[i];
         }
-        // Deduplicate tube count across workers using hash-based seen set.
-        // Hash each tube name, check collisions with strcmp. O(W*T) expected.
-        static uint32 seen_hashes[SHARED_MAX_TUBES];
-        static const char *seen_names[SHARED_MAX_TUBES];
+        // Deduplicate tube count across workers using open-addressed hash set.
+        // O(W*T) expected with O(1) per probe instead of O(nseen) linear scan.
+        #define SEEN_CAP 2048  // power of 2, > SHARED_MAX_TUBES
+        #define SEEN_MASK (SEEN_CAP - 1)
+        static const char *seen_set[SEEN_CAP]; // open-addressed by name_hash
+        memset(seen_set, 0, sizeof(seen_set));
         int nseen = 0;
         for (int w = 0; w < s->nworkers; w++) {
             struct SharedStats *ss2 = &shared_stats[w];
             for (uint32 ti = 0; ti < ss2->tube_count; ti++) {
-                uint32 h = tube_name_hash(ss2->tube_names[ti]);
+                const char *name = ss2->tube_names[ti];
+                uint32 h = tube_name_hash(name);
                 int dup = 0;
-                for (int k = 0; k < nseen; k++) {
-                    if (seen_hashes[k] == h &&
-                        strcmp(seen_names[k], ss2->tube_names[ti]) == 0) {
+                for (int probe = 0; probe < SEEN_CAP; probe++) {
+                    int idx = (h + probe) & SEEN_MASK;
+                    if (!seen_set[idx]) {
+                        seen_set[idx] = name;
+                        nseen++;
+                        break;
+                    }
+                    if (strcmp(seen_set[idx], name) == 0) {
                         dup = 1;
                         break;
                     }
                 }
-                if (!dup && nseen < SHARED_MAX_TUBES) {
-                    seen_hashes[nseen] = h;
-                    seen_names[nseen] = ss2->tube_names[ti];
-                    nseen++;
-                }
+                (void)dup;
             }
         }
+        #undef SEEN_CAP
+        #undef SEEN_MASK
         agg_tubes = nseen;
     }
 
-    getrusage(RUSAGE_SELF, &ru); /* don't care if it fails */
+    // Cache rusage: refresh at most once per 100ms to avoid syscall per stats.
+    static struct rusage cached_ru;
+    static int64 last_ru_at;
+    if (now - last_ru_at > 100000000LL) {
+        getrusage(RUSAGE_SELF, &cached_ru);
+        last_ru_at = now;
+    }
+    ru = cached_ru;
     return snprintf(buf, size, STATS_FMT,
                     agg_urgent,
                     agg_ready,
@@ -1565,12 +1574,14 @@ read_uint(uintmax_t *out, uintmax_t max_val, const char *buf, char **end)
         return -1;
 
     // Inline base-10 parse (no locale/errno).
+    // Pre-computed overflow threshold: avoids per-digit division.
+    static const uintmax_t cutoff = UINTMAX_MAX / 10;
+    static const uintmax_t cutlim = UINTMAX_MAX % 10;
     uintmax_t tnum = 0;
     const char *p = buf;
     while (*p >= '0' && *p <= '9') {
         uintmax_t d = *p - '0';
-        // Overflow check: tnum * 10 + d > UINTMAX_MAX
-        if (tnum > (UINTMAX_MAX - d) / 10)
+        if (unlikely(tnum > cutoff || (tnum == cutoff && d > cutlim)))
             return -1;
         tnum = tnum * 10 + d;
         p++;
@@ -1812,7 +1823,7 @@ maybe_enqueue_incoming_job(Conn *c)
 }
 
 /* j can be NULL */
-static Job *
+__attribute__((hot)) static Job *
 remove_this_reserved_job(Conn *c, Job *j)
 {
     j = job_list_remove(j);
@@ -1869,7 +1880,7 @@ dispatch_cmd(Conn *c)
 
     /* Check for embedded NUL bytes (injection attack).
      * Use memchr instead of strlen to detect embedded NUL. */
-    if (memchr(c->cmd, '\0', c->cmd_len - 2) != NULL) {
+    if (unlikely(memchr(c->cmd, '\0', c->cmd_len - 2) != NULL)) {
         reply_msg(c, MSG_BAD_FORMAT);
         return;
     }
@@ -2083,13 +2094,12 @@ dispatch_cmd(Conn *c)
 
         {
             Job *jf = job_find(id);
-            j = remove_reserved_job(c, jf);
-            if (!j)
-                j = remove_ready_job(jf);
-            if (!j)
-                j = remove_buried_job(jf);
-            if (!j)
-                j = remove_delayed_job(jf);
+            if (jf) switch (jf->r.state) {
+            case Reserved: j = remove_reserved_job(c, jf); break;
+            case Ready:    j = remove_ready_job(jf); break;
+            case Buried:   j = remove_buried_job(jf); break;
+            case Delayed:  j = remove_delayed_job(jf); break;
+            }
         }
 
         if (!j) {
@@ -2847,7 +2857,7 @@ conn_process_io(Conn *c)
 __attribute__((hot)) static void
 h_conn(const int fd, const short which, Conn *c)
 {
-    if (fd != c->sock.fd) {
+    if (unlikely(fd != c->sock.fd)) {
         twarnx("Argh! event fd doesn't match conn fd.");
         close(fd);
         connclose(c);

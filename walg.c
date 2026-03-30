@@ -288,19 +288,22 @@ walsync(Wal *w)
     if (w->wantsync && now >= w->lastsync+w->syncrate) {
         w->lastsync = now;
         if (w->sync_on) {
-            int fd = dup(w->cur->fd);
-            if (fd == -1) {
-                twarn("dup for async fsync");
-                return 0;
-            }
+            // Check if sync thread is free before dup() to avoid
+            // wasted dup+close when thread is already busy.
             pthread_mutex_lock(&w->sync_mu);
             if (w->sync_fd >= 0) {
-                close(fd);
+                pthread_mutex_unlock(&w->sync_mu);
             } else {
+                int fd = dup(w->cur->fd);
+                if (fd == -1) {
+                    pthread_mutex_unlock(&w->sync_mu);
+                    twarn("dup for async fsync");
+                    return 0;
+                }
                 w->sync_fd = fd;
                 pthread_cond_signal(&w->sync_cond);
+                pthread_mutex_unlock(&w->sync_mu);
             }
-            pthread_mutex_unlock(&w->sync_mu);
         } else {
             if (durable_fsync(w->cur->fd) == -1) {
                 twarn("fsync");
@@ -316,7 +319,7 @@ walsync(Wal *w)
 // On failure, walwrite disables w and returns 0; on success, it returns 1.
 // Unlke walresv*, walwrite should never fail because of a full disk.
 // If w is disabled, then walwrite takes no action and returns 1.
-int
+__attribute__((hot)) int
 walwrite(Wal *w, Job *j)
 {
     int r = 0;
@@ -627,7 +630,6 @@ walread(Wal *w, Job *list, int min)
 
         f->fd = fd;
         posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
-        posix_fadvise(fd, 0, w->filesize, POSIX_FADV_WILLNEED);
         fileadd(f, w);
         err |= fileread(f, list);
         if (close(fd) == -1)

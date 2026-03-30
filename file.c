@@ -574,7 +574,7 @@ filewopen(File *f)
 
 // filewritev writes multiple buffers to f in a single writev syscall.
 // Updates WAL accounting on success. Returns 1 on success, 0 on failure.
-static int
+__attribute__((hot)) static int
 filewritev(File *f, Job *j, struct iovec *iov, int iovcnt)
 {
     int total = 0;

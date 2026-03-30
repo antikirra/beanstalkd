@@ -641,7 +641,7 @@ struct Server {
     // Each entry tracks the connection waiting for a reply, with generation
     // and sequence number to detect stale/reused Conn pointers.
     // Indexed by (seq & PENDING_FWD_MASK) with linear probing.
-    #define PENDING_FWD_SLOTS 64
+    #define PENDING_FWD_SLOTS 128
     #define PENDING_FWD_MASK  (PENDING_FWD_SLOTS - 1)
     struct {
         Conn   *conn;

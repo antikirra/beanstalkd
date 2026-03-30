@@ -26,23 +26,16 @@ static int     pool_len[POOL_NCLASS];
 static size_t  pool_mem;
 
 // pool_class returns the class index (0..POOL_NCLASS-1) for body_size,
-// or -1 if too large to pool.
-static int
+// or -1 if too large to pool. Uses CLZ for branchless size-class lookup.
+static inline int
 pool_class(int body_size)
 {
-    if (body_size < 0)      return -1;
+    if (body_size <= 0)     return body_size == 0 ? 0 : -1;
     if (body_size <= 64)    return 0;
-    if (body_size <= 128)   return 1;
-    if (body_size <= 256)   return 2;
-    if (body_size <= 512)   return 3;
-    if (body_size <= 1024)  return 4;
-    if (body_size <= 2048)  return 5;
-    if (body_size <= 4096)  return 6;
-    if (body_size <= 8192)  return 7;
-    if (body_size <= 16384) return 8;
-    if (body_size <= 32768) return 9;
-    if (body_size <= 65536) return 10;
-    return -1;
+    if (body_size > 65536)  return -1;
+    // Classes: 0=64, 1=128, ..., 10=65536.  class = ceil(log2(n)) - 6.
+    int bits = 32 - __builtin_clz((unsigned)(body_size - 1));
+    return bits - 6;
 }
 
 
@@ -113,7 +106,7 @@ rehash_start(int is_upscaling)
     cur_prime += d;
 }
 
-static void
+__attribute__((hot)) static void
 store_job(Job *j)
 {
     size_t index = j->r.id % all_jobs_cap;
@@ -153,7 +146,7 @@ job_find(uint64 job_id)
     return jh;
 }
 
-Job *
+__attribute__((hot)) Job *
 allocate_job(int body_size)
 {
     Job *j = NULL;
@@ -235,7 +228,7 @@ make_job_with_id(uint32 pri, int64 delay, int64 ttr,
     return j;
 }
 
-static void
+__attribute__((hot)) static void
 job_hash_free(Job *j)
 {
     Job **slot;
@@ -268,7 +261,7 @@ done:
         rehash_start(0);
 }
 
-void
+__attribute__((hot)) void
 job_free(Job *j)
 {
     if (!j) return;
