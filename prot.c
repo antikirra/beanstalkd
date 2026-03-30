@@ -608,7 +608,7 @@ reply(Conn *c, char *line, int len, int state)
     if (!c)
         return;
 
-    if (verbose >= 2) {
+    if (unlikely(verbose >= 2)) {
         printf(">%d reply %.*s\n", c->sock.fd, len-2, line);
     }
 
@@ -655,7 +655,7 @@ reply(Conn *c, char *line, int len, int state)
         ssize_t r = writev(c->sock.fd, iov, 2);
         if (r == total) {
             // Fast path: skip c->reply* stores (conn_want_command resets state).
-            if (verbose >= 2) {
+            if (unlikely(verbose >= 2)) {
                 printf(">%d job %"PRIu64"\n", c->sock.fd, c->out_job->r.id);
             }
             conn_want_command(c);
@@ -1163,12 +1163,19 @@ check_err(Conn *c, const char *s)
 }
 
 /* Scan the given string for the sequence "\r\n" and return the line length.
- * Always returns at least 2 if a match is found. Returns 0 if no match. */
+ * Always returns at least 2 if a match is found. Returns 0 if no match.
+ * start_offset: skip bytes already scanned in a previous call (must be
+ * at least 1 less than the buffer end to catch \r at the boundary). */
 __attribute__((hot)) static size_t
-scan_line_end(const char *s, size_t size)
+scan_line_end(const char *s, size_t size, size_t start_offset)
 {
-    const char *p = s;
-    size_t remaining = size > 0 ? size - 1 : 0;
+    if (size < 2)
+        return 0;
+    // Start from start_offset but back up 1 to catch \r that was the
+    // last byte of the previous read (whose \n just arrived).
+    size_t off = (start_offset > 0) ? start_offset - 1 : 0;
+    const char *p = s + off;
+    size_t remaining = size - 1 - off;
 
     while (remaining > 0) {
         char *match = memchr(p, '\r', remaining);
@@ -1343,7 +1350,7 @@ enqueue_incoming_job(Conn *c)
         return;
     }
 
-    if (verbose >= 2) {
+    if (unlikely(verbose >= 2)) {
         printf("<%d job %"PRIu64"\n", c->sock.fd, j->r.id);
     }
 
@@ -1936,7 +1943,7 @@ dispatch_cmd(Conn *c)
     }
 
     type = which_cmd(c);
-    if (verbose >= 2) {
+    if (unlikely(verbose >= 2)) {
         printf("<%d command %s\n", c->sock.fd, op_names[type]);
     }
 
@@ -2742,6 +2749,7 @@ conn_process_io(Conn *c)
         // Don't read more data while waiting for forwarded reply.
         if (unlikely(c->fwd_pending))
             return;
+        size_t prev_read = c->cmd_read;
         r = read(c->sock.fd, c->cmd + c->cmd_read, LINE_BUF_SIZE - c->cmd_read);
         if (unlikely(r == -1)) {
             check_err(c, "read()");
@@ -2753,7 +2761,8 @@ conn_process_io(Conn *c)
         }
 
         c->cmd_read += r;
-        c->cmd_len = scan_line_end(c->cmd, c->cmd_read);
+        // Start scan from prev_read to skip already-scanned bytes.
+        c->cmd_len = scan_line_end(c->cmd, c->cmd_read, prev_read);
         if (c->cmd_len) {
             // We found complete command line. Bail out to h_conn.
             return;
@@ -2771,7 +2780,8 @@ conn_process_io(Conn *c)
         // We have an incomplete line, so just keep waiting.
         return;
     }
-    case STATE_WANT_ENDLINE:
+    case STATE_WANT_ENDLINE: {
+        size_t prev_read2 = c->cmd_read;
         r = read(c->sock.fd, c->cmd + c->cmd_read, LINE_BUF_SIZE - c->cmd_read);
         if (r == -1) {
             check_err(c, "read()");
@@ -2783,7 +2793,7 @@ conn_process_io(Conn *c)
         }
 
         c->cmd_read += r;
-        c->cmd_len = scan_line_end(c->cmd, c->cmd_read);
+        c->cmd_len = scan_line_end(c->cmd, c->cmd_read, prev_read2);
         if (c->cmd_len) {
             // Found the EOL. Reply and reuse whatever was read afer the EOL.
             reply_msg(c, MSG_BAD_FORMAT);
@@ -2798,7 +2808,7 @@ conn_process_io(Conn *c)
             c->cmd_read = 0;
         }
         return;
-
+    }
     case STATE_BITBUCKET: {
         /* Invert the meaning of in_job_read while throwing away data -- it
          * counts the bytes that remain to be thrown away. */
@@ -2894,7 +2904,7 @@ conn_process_io(Conn *c)
 
         /* are we done? */
         if (c->out_job_sent == j->r.body_size) {
-            if (verbose >= 2) {
+            if (unlikely(verbose >= 2)) {
                 printf(">%d job %"PRIu64"\n", c->sock.fd, j->r.id);
             }
             conn_want_command(c);
@@ -2943,7 +2953,7 @@ h_conn(const int fd, const short which, Conn *c)
     // commands buffered), saving 2 setsockopt syscalls for non-pipelined case.
     int corked = 0;
     while (cmd_data_ready(c) && !c->fwd_pending
-           && (c->cmd_len = scan_line_end(c->cmd, c->cmd_read))) {
+           && (c->cmd_len = scan_line_end(c->cmd, c->cmd_read, 0))) {
         if (!corked && c->cmd_read > c->cmd_len) {
             int cork = 1;
             setsockopt(c->sock.fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof cork);
@@ -3234,7 +3244,7 @@ h_accept(const int fd, const short which, Server *s)
             // Dispatch loop matching h_conn's pipeline processing.
             while (c->state == STATE_WANT_COMMAND && c->cmd_read > 0
                    && !c->fwd_pending
-                   && (c->cmd_len = scan_line_end(c->cmd, c->cmd_read))) {
+                   && (c->cmd_len = scan_line_end(c->cmd, c->cmd_read, 0))) {
                 dispatch_cmd(c);
                 if (c->sock.fd < 0) break;
                 fill_extra_data(c);
@@ -3570,7 +3580,7 @@ h_accept_migrated(int cfd, Server *s, struct MigMsg *mm)
         c->cmd_read = mm->cmd_len;
         while (c->state == STATE_WANT_COMMAND && c->cmd_read > 0
                && !c->fwd_pending
-               && (c->cmd_len = scan_line_end(c->cmd, c->cmd_read))) {
+               && (c->cmd_len = scan_line_end(c->cmd, c->cmd_read, 0))) {
             dispatch_cmd(c);
             if (c->sock.fd < 0) break;
             fill_extra_data(c);
