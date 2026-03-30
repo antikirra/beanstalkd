@@ -1192,24 +1192,32 @@ __attribute__((hot)) static int
 which_cmd(Conn *c)
 {
 #define TEST_CMD(s,c,o) if (strncmp((s), (c), CONSTSTRLEN(c)) == 0) return (o);
-    /* Dispatch by first byte reduces average strncmp calls from 25 to 1-6. */
+    /* Two-level byte dispatch: first byte narrows to 1-6 commands,
+     * second byte (or later) resolves most without strncmp. */
     switch (c->cmd[0]) {
     case 'p':
-        TEST_CMD(c->cmd, CMD_PUT, OP_PUT);
-        TEST_CMD(c->cmd, CMD_PEEKJOB, OP_PEEKJOB);
-        TEST_CMD(c->cmd, CMD_PEEK_READY, OP_PEEK_READY);
-        TEST_CMD(c->cmd, CMD_PEEK_DELAYED, OP_PEEK_DELAYED);
-        TEST_CMD(c->cmd, CMD_PEEK_BURIED, OP_PEEK_BURIED);
-        TEST_CMD(c->cmd, CMD_PAUSE_TUBE, OP_PAUSE_TUBE);
+        switch (c->cmd[1]) {
+        case 'u': TEST_CMD(c->cmd, CMD_PUT, OP_PUT); break;
+        case 'e':
+            if (c->cmd[4] == ' ') return OP_PEEKJOB; // "peek "
+            // peek-ready, peek-delayed, peek-buried: disambiguate on byte 5
+            switch (c->cmd[5]) {
+            case 'r': TEST_CMD(c->cmd, CMD_PEEK_READY, OP_PEEK_READY); break;
+            case 'd': TEST_CMD(c->cmd, CMD_PEEK_DELAYED, OP_PEEK_DELAYED); break;
+            case 'b': TEST_CMD(c->cmd, CMD_PEEK_BURIED, OP_PEEK_BURIED); break;
+            }
+            break;
+        case 'a': TEST_CMD(c->cmd, CMD_PAUSE_TUBE, OP_PAUSE_TUBE); break;
+        }
         break;
     case 'r':
-        // Disambiguate: "release " vs "reserve-..." vs bare "reserve\r"
         if (c->cmd[2] == 'l') { // reLease
             TEST_CMD(c->cmd, CMD_RELEASE, OP_RELEASE);
         } else if (c->cmd_len > 8 && c->cmd[7] == '-') { // reserve-...
-            TEST_CMD(c->cmd, CMD_RESERVE_TIMEOUT, OP_RESERVE_TIMEOUT);
+            if (c->cmd[8] == 'w')
+                return OP_RESERVE_TIMEOUT; // reserve-with-timeout
             TEST_CMD(c->cmd, CMD_RESERVE_JOB, OP_RESERVE_JOB);
-        } else { // bare "reserve\r\n"
+        } else {
             TEST_CMD(c->cmd, CMD_RESERVE, OP_RESERVE);
         }
         break;
@@ -1220,15 +1228,18 @@ which_cmd(Conn *c)
         TEST_CMD(c->cmd, CMD_BURY, OP_BURY);
         break;
     case 'k':
-        TEST_CMD(c->cmd, CMD_KICK, OP_KICK);
-        TEST_CMD(c->cmd, CMD_KICKJOB, OP_KICKJOB);
+        if (c->cmd[4] == ' ') return OP_KICK;       // "kick "
+        TEST_CMD(c->cmd, CMD_KICKJOB, OP_KICKJOB);   // "kick-job "
         break;
     case 't':
         TEST_CMD(c->cmd, CMD_TOUCH, OP_TOUCH);
         break;
     case 's':
-        TEST_CMD(c->cmd, CMD_STATSJOB, OP_STATSJOB);
-        TEST_CMD(c->cmd, CMD_STATS_TUBE, OP_STATS_TUBE);
+        // stats, stats-job, stats-tube: disambiguate on byte 5
+        if (c->cmd_len <= 7 && c->cmd[5] == '\r')
+            return OP_STATS; // bare "stats\r\n"
+        if (c->cmd[6] == 'j') return OP_STATSJOB;    // "stats-job "
+        if (c->cmd[6] == 't') return OP_STATS_TUBE;  // "stats-tube "
         TEST_CMD(c->cmd, CMD_STATS, OP_STATS);
         break;
     case 'u':
@@ -1241,9 +1252,14 @@ which_cmd(Conn *c)
         TEST_CMD(c->cmd, CMD_IGNORE, OP_IGNORE);
         break;
     case 'l':
-        TEST_CMD(c->cmd, CMD_LIST_TUBES_WATCHED, OP_LIST_TUBES_WATCHED);
+        // list-tubes, list-tube-used, list-tubes-watched
+        if (c->cmd[9] == 's') {
+            // list-tubes or list-tubes-watched
+            if (c->cmd_len > 12)
+                return OP_LIST_TUBES_WATCHED; // "list-tubes-watched"
+            return OP_LIST_TUBES;             // "list-tubes"
+        }
         TEST_CMD(c->cmd, CMD_LIST_TUBE_USED, OP_LIST_TUBE_USED);
-        TEST_CMD(c->cmd, CMD_LIST_TUBES, OP_LIST_TUBES);
         break;
     case 'q':
         TEST_CMD(c->cmd, CMD_QUIT, OP_QUIT);
@@ -2923,9 +2939,8 @@ h_conn(const int fd, const short which, Conn *c)
 
     conn_process_io(c);
 
-    // Dispatch commands. Cork only if pipelining detected (multiple
-    // commands buffered), saving 2 setsockopt syscalls (~400ns) for the
-    // common non-pipelined case.
+    // Dispatch pipelined commands. Cork only if pipelining detected (multiple
+    // commands buffered), saving 2 setsockopt syscalls for non-pipelined case.
     int corked = 0;
     while (cmd_data_ready(c) && !c->fwd_pending
            && (c->cmd_len = scan_line_end(c->cmd, c->cmd_read))) {
