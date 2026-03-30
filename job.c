@@ -301,7 +301,7 @@ job_setpos(void *j, size_t pos)
     ((Job *)j)->heap_index = pos;
 }
 
-int
+__attribute__((hot)) int
 job_pri_less(void *ja, void *jb)
 {
     Job *a = (Job *)ja;
@@ -311,7 +311,7 @@ job_pri_less(void *ja, void *jb)
     return a->r.id < b->r.id;
 }
 
-int
+__attribute__((hot)) int
 job_delay_less(void *ja, void *jb)
 {
     Job *a = ja;

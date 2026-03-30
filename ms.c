@@ -28,7 +28,7 @@ grow(Ms *a)
     return 1;
 }
 
-int
+__attribute__((hot)) int
 ms_append(Ms *a, void *item)
 {
     if (unlikely(a->len >= a->cap) && !grow(a))
@@ -98,7 +98,7 @@ ms_contains(Ms *a, void *item)
     return 0;
 }
 
-void *
+__attribute__((hot)) void *
 ms_take(Ms *a)
 {
     void *item;

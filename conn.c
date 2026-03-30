@@ -153,15 +153,19 @@ conntickat(Conn *c)
 
 // Remove c from the c->srv heap and reschedule it using the value
 // returned by conntickat if there is an outstanding timeout in the c.
-void
+// Uses heapresift when conn stays in the heap — O(log n) vs 2*O(log n).
+__attribute__((hot)) void
 connsched(Conn *c)
 {
-    if (c->in_conns) {
-        heapremove(&c->srv->conns, c->tickpos);
-        c->in_conns = 0;
-    }
     c->tickat = conntickat(c);
-    if (c->tickat) {
+    if (c->in_conns) {
+        if (c->tickat) {
+            heapresift(&c->srv->conns, c->tickpos);
+        } else {
+            heapremove(&c->srv->conns, c->tickpos);
+            c->in_conns = 0;
+        }
+    } else if (c->tickat) {
         c->in_conns = heapinsert(&c->srv->conns, c);
     }
 }
@@ -191,7 +195,7 @@ connsoonestjob(Conn *c)
     return c->soonest_job;
 }
 
-void
+__attribute__((hot)) void
 conn_reserve_job(Conn *c, Job *j) {
     j->tube->stat.reserved_ct++;
     j->r.reserve_ct++;
@@ -250,8 +254,12 @@ connclose(Conn *c)
     }
 
     // Clear all pending forward slots referencing this conn.
-    if (c->srv) {
-        for (int i = 0; i < PENDING_FWD_SLOTS; i++) {
+    if (c->srv && c->srv->pending_fwd_used > 0) {
+        int remaining = c->srv->pending_fwd_used;
+        for (int i = 0; i < PENDING_FWD_SLOTS && remaining > 0; i++) {
+            if (!c->srv->pending_fwd[i].conn)
+                continue;
+            remaining--;
             if (c->srv->pending_fwd[i].conn == c) {
                 c->srv->pending_fwd[i].conn = NULL;
                 c->srv->pending_fwd[i].seq = 0;

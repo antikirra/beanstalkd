@@ -13,7 +13,7 @@ set(Heap *h, size_t k, void *x)
 
 
 // Siftdown using hole technique (half the setpos calls vs swap).
-static void
+__attribute__((hot)) static void
 siftdown(Heap *h, size_t k)
 {
     if (k == 0) return;
@@ -34,7 +34,7 @@ siftdown(Heap *h, size_t k)
 
 
 // Siftup using hole technique.
-static void
+__attribute__((hot)) static void
 siftup(Heap *h, size_t k)
 {
     void *x = h->data[k];
@@ -91,7 +91,7 @@ heapinsert(Heap *h, void *x)
 }
 
 
-void *
+__attribute__((hot)) void *
 heapremove(Heap *h, size_t k)
 {
     if (unlikely(k >= h->len)) {
@@ -115,7 +115,7 @@ heapremove(Heap *h, size_t k)
 
 
 // Reposition element at index k after its sort key changed.
-void
+__attribute__((hot)) void
 heapresift(Heap *h, size_t k)
 {
     if (k >= h->len)

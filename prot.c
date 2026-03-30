@@ -825,7 +825,7 @@ enqueue_waiting_conn(Conn *c)
 }
 
 // process_tube matches ready jobs with waiting connections in a single tube.
-static void
+__attribute__((hot)) static void
 process_tube(Tube *t)
 {
     while (t->ready.len > 0 && t->waiting_conns.len > 0 && !t->pause) {
@@ -902,7 +902,8 @@ enqueue_job(Server *s, Job *j, int64 delay, char update_store)
             global_stat.urgent_ct++;
             j->tube->stat.urgent_ct++;
         }
-        process_tube(j->tube);
+        if (j->tube->waiting_conns.len)
+            process_tube(j->tube);
     }
 
     if (update_store) {
@@ -1336,7 +1337,7 @@ enqueue_incoming_job(Conn *c)
             uint32 seq = pending_fwd_alloc(c->srv, c);
             if (seq) {
                 static struct PutFwdMsg pm;
-                size_t msg_size = offsetof(struct PutFwdMsg, body) + j->r.body_size;
+                size_t hdr_size = offsetof(struct PutFwdMsg, body);
                 pm.magic = PUT_FWD_MAGIC;
                 pm.from_worker = c->srv->worker_id;
                 pm.seq = seq;
@@ -1345,8 +1346,16 @@ enqueue_incoming_job(Conn *c)
                 pm.ttr = j->r.ttr;
                 memcpy(pm.tube, j->tube->name, j->tube->name_len + 1);
                 pm.body_size = j->r.body_size;
-                memcpy(pm.body, j->body, j->r.body_size);
-                ssize_t wr = write(c->srv->peer_fd[target], &pm, msg_size);
+                // sendmsg with iovec avoids memcpy of body (up to 64KB).
+                struct iovec iov[2] = {
+                    { .iov_base = &pm,     .iov_len = hdr_size },
+                    { .iov_base = j->body, .iov_len = j->r.body_size },
+                };
+                struct msghdr msg = {0};
+                msg.msg_iov = iov;
+                msg.msg_iovlen = 2;
+                ssize_t wr = sendmsg(c->srv->peer_fd[target], &msg, MSG_NOSIGNAL);
+                size_t msg_size = hdr_size + j->r.body_size;
                 if (wr == (ssize_t)msg_size) {
                     if (j->walresv) {
                         Wal *w = shard_wal(c->srv, j);
@@ -2612,8 +2621,8 @@ conn_timeout(Conn *c)
         int r = enqueue_job(c->srv, remove_this_reserved_job(c, j), 0, 0);
         if (r < 1)
             bury_job(c->srv, j, 0); /* out of memory, so bury it */
-        connsched(c);
     }
+    connsched(c);
 
     if (should_timeout) {
         remove_waiting_conn(c);
@@ -2961,24 +2970,28 @@ prottick(Server *s)
 
     // Timeout forwarded commands (5s). Prevents client hanging if peer is dead.
     if (s->pending_fwd_used > 0) {
-    for (int i = 0; i < PENDING_FWD_SLOTS; i++) {
-        if (s->pending_fwd[i].conn && now - s->pending_fwd[i].at > 5000000000LL) {
-            Conn *pc = s->pending_fwd[i].conn;
-            if (pc->gen == s->pending_fwd[i].gen && pc->sock.fd >= 0) {
-                pc->fwd_pending = 0;
-                if (write(pc->sock.fd, "NOT_FOUND\r\n", 11) <= 0) {
-                    sockwant(&pc->sock, 0);
-                } else {
-                    sockwant(&pc->sock, 'r');
-                    if (pc->cmd_read > 0)
-                        pc->sock.f(pc->sock.x, 'r');
+        int remaining = s->pending_fwd_used;
+        for (int i = 0; i < PENDING_FWD_SLOTS && remaining > 0; i++) {
+            if (!s->pending_fwd[i].conn)
+                continue;
+            remaining--;
+            if (now - s->pending_fwd[i].at > 5000000000LL) {
+                Conn *pc = s->pending_fwd[i].conn;
+                if (pc->gen == s->pending_fwd[i].gen && pc->sock.fd >= 0) {
+                    pc->fwd_pending = 0;
+                    if (write(pc->sock.fd, "NOT_FOUND\r\n", 11) <= 0) {
+                        sockwant(&pc->sock, 0);
+                    } else {
+                        sockwant(&pc->sock, 'r');
+                        if (pc->cmd_read > 0)
+                            pc->sock.f(pc->sock.x, 'r');
+                    }
                 }
+                s->pending_fwd[i].conn = NULL;
+                s->pending_fwd[i].seq = 0;
+                s->pending_fwd_used--;
             }
-            s->pending_fwd[i].conn = NULL;
-            s->pending_fwd[i].seq = 0;
-            s->pending_fwd_used--;
         }
-    }
     }
 
     // Publish stats to shared memory (1Hz).
@@ -3172,9 +3185,10 @@ h_accept(const int fd, const short which, Server *s)
 void
 prot_handle_forwarded_cmd(Server *s, struct CmdFwdMsg *fwd)
 {
-    struct CmdReplyMsg rpl = {0};
+    struct CmdReplyMsg rpl;
     rpl.magic = CMD_REPLY_MAGIC;
     rpl.seq = fwd->seq;
+    rpl.data_len = 0;
 
     // Parse the forwarded command.
     char *cmd = fwd->cmd;
@@ -3370,9 +3384,10 @@ prot_handle_forwarded_cmd(Server *s, struct CmdFwdMsg *fwd)
 void
 prot_handle_forwarded_put(Server *s, struct PutFwdMsg *pm)
 {
-    struct CmdReplyMsg rpl = {0};
+    struct CmdReplyMsg rpl;
     rpl.magic = CMD_REPLY_MAGIC;
     rpl.seq = pm->seq;
+    rpl.data_len = 0;
 
     if (drain_mode) {
         rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE, "DRAINING\r\n");
@@ -3416,7 +3431,6 @@ prot_handle_forwarded_put(Server *s, struct PutFwdMsg *pm)
     if (r == 1) {
         global_stat.total_jobs_ct++;
         t->stat.total_jobs_ct++;
-        process_tube(t);
         rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE,
                                 MSG_INSERTED_FMT, j->r.id);
     } else {

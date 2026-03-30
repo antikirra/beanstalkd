@@ -187,8 +187,10 @@ handle_peer(struct PeerCtx *ctx, int ev)
     if (r == 0 || (r == -1 && errno != EAGAIN)) {
         // Peer closed or broken — deregister to prevent busy loop.
         // Release all clients waiting for forwarded replies.
-        for (int i = 0; i < PENDING_FWD_SLOTS; i++) {
+        int remaining = s->pending_fwd_used;
+        for (int i = 0; i < PENDING_FWD_SLOTS && remaining > 0; i++) {
             if (s->pending_fwd[i].conn) {
+                remaining--;
                 Conn *pc = s->pending_fwd[i].conn;
                 if (pc->gen == s->pending_fwd[i].gen && pc->sock.fd >= 0) {
                     pc->fwd_pending = 0;
