@@ -930,6 +930,7 @@ kick_buried_job(Server *s, Job *j)
         return 1;
 
     /* ready queue is full, so bury it */
+    j->r.kick_ct--;
     walresvreturn(w, z);
     j->walresv -= z;
     bury_job(s, j, 0);
@@ -960,12 +961,14 @@ kick_delayed_job(Server *s, Job *j)
     /* ready queue is full, so delay it again */
     r = enqueue_job(s, j, j->r.delay, 0);
     if (r == 1) {
+        j->r.kick_ct--;
         walresvreturn(w, z);
         j->walresv -= z;
         return 0;
     }
 
     /* last resort */
+    j->r.kick_ct--;
     walresvreturn(w, z);
     j->walresv -= z;
     bury_job(s, j, 0);
@@ -977,8 +980,11 @@ static uint
 kick_buried_jobs(Server *s, Tube *t, uint n)
 {
     uint i;
-    for (i = 0; (i < n) && !job_list_is_empty(&t->buried); ++i) {
-        kick_buried_job(s, t->buried.next);
+    for (i = 0; (i < n) && !job_list_is_empty(&t->buried); ) {
+        if (kick_buried_job(s, t->buried.next))
+            i++;
+        else
+            break;
     }
     return i;
 }
@@ -988,8 +994,11 @@ static uint
 kick_delayed_jobs(Server *s, Tube *t, uint n)
 {
     uint i;
-    for (i = 0; (i < n) && (t->delay.len > 0); ++i) {
-        kick_delayed_job(s, (Job *)t->delay.data[0]);
+    for (i = 0; (i < n) && (t->delay.len > 0); ) {
+        if (kick_delayed_job(s, (Job *)t->delay.data[0]))
+            i++;
+        else
+            break;
     }
     return i;
 }
@@ -2006,12 +2015,17 @@ dispatch_cmd(Conn *c)
                 twarnx("walmaint failed after delete walwrite");
             }
         }
-        job_free(j);
 
         if (!r) {
+            /* WAL write failed — WAL is now disabled.
+             * Bury the job instead of freeing to prevent ghost
+             * jobs on restart (#536). */
+            j->tube->stat.total_delete_ct--;
+            bury_job(c->srv, j, 0);
             reply_serr(c, MSG_INTERNAL_ERROR);
             return;
         }
+        job_free(j);
         reply_msg(c, MSG_DELETED);
         return;
 
@@ -2031,40 +2045,35 @@ dispatch_cmd(Conn *c)
             return;
         }
 
-        /* We want to update the delay deadline on disk, so reserve space for
-         * that. */
+        /* Reserve WAL space unconditionally: even with delay=0, the new
+         * priority and release_ct must be persisted (#597). */
         int z = 0;
-        Wal *release_wal = NULL;
-        if (delay) {
-            release_wal = &c->srv->wal;
-            z = walresvupdate(release_wal);
-            if (!z) {
-                /* Undo remove_reserved_job: restore counters and re-link. */
-                global_stat.reserved_ct++;
-                j->tube->stat.reserved_ct++;
-                job_list_insert(&c->reserved_jobs, j);
-                j->reserver = c;
-                reply_serr(c, MSG_OUT_OF_MEMORY);
-                return;
-            }
-            j->walresv += z;
+        Wal *release_wal = &c->srv->wal;
+        z = walresvupdate(release_wal);
+        if (!z) {
+            /* Undo remove_reserved_job: restore counters and re-link. */
+            global_stat.reserved_ct++;
+            j->tube->stat.reserved_ct++;
+            job_list_insert(&c->reserved_jobs, j);
+            j->reserver = c;
+            reply_serr(c, MSG_OUT_OF_MEMORY);
+            return;
         }
+        j->walresv += z;
 
         j->r.pri = pri;
         j->r.delay = delay;
         j->r.release_ct++;
 
-        r = enqueue_job(c->srv, j, delay, !!delay);
+        r = enqueue_job(c->srv, j, delay, 1);
         if (r == 1) {
             reply_msg(c, MSG_RELEASED);
             return;
         }
 
         /* out of memory trying to grow the queue, so it gets buried */
-        if (z) {
-            walresvreturn(release_wal, z);
-            j->walresv -= z;
-        }
+        walresvreturn(release_wal, z);
+        j->walresv -= z;
         bury_job(c->srv, j, 0);
         reply_msg(c, MSG_BURIED);
         return;
@@ -2135,11 +2144,16 @@ dispatch_cmd(Conn *c)
             return;
         }
 
-        if ((j->r.state == Buried && kick_buried_job(c->srv, j)) ||
-            (j->r.state == Delayed && kick_delayed_job(c->srv, j))) {
-            reply_msg(c, MSG_KICKED);
-        } else {
-            reply_msg(c, MSG_NOTFOUND);
+        {
+            int kickable = (j->r.state == Buried || j->r.state == Delayed);
+            if ((j->r.state == Buried && kick_buried_job(c->srv, j)) ||
+                (j->r.state == Delayed && kick_delayed_job(c->srv, j))) {
+                reply_msg(c, MSG_KICKED);
+            } else if (kickable) {
+                reply_serr(c, MSG_INTERNAL_ERROR);
+            } else {
+                reply_msg(c, MSG_NOTFOUND);
+            }
         }
         return;
 
@@ -2882,7 +2896,12 @@ prot_replay(Server *s, Job *list)
         int64 delay = 0;
         switch (j->r.state) {
         case Buried: {
+            uint32 saved_bury_ct = j->r.bury_ct;
             bury_job(s, j, 0);
+            // bury_job increments bury_ct, but the WAL record already
+            // has the correct value. Restore it to prevent double
+            // increment on each restart (#668).
+            j->r.bury_ct = saved_bury_ct;
             break;
         }
         case Delayed:

@@ -24,8 +24,8 @@ Requires **Linux 6.1+**, glibc, gcc. Uses Linux APIs directly: `epoll`, `accept4
 | Job hash rehash | Stop-the-world | Incremental, 16 buckets/op |
 | Job pool | Exact size match | 11 size classes, O(1) reuse |
 | WAL | Single file chain, sync fsync | Single file chain, async fsync |
-| Crash/data bugs | 22 open | 35 fixed |
-| Tests | 100 unit | 200+ unit |
+| Crash/data bugs | 22 open | 48 fixed |
+| Tests | 100 unit | 219 unit + hostile WAL |
 | Platform | Linux, macOS, FreeBSD | Linux 6.1+ only |
 
 ## Build and test
@@ -73,6 +73,24 @@ docker build -f Dockerfile.benchmark .  # A/B benchmark vs upstream
 | `-m SEC` | 60 | malloc_trim interval (0 = disable) |
 | `-t CPU` | — | Pin to CPU core |
 | `-V` | | Verbose logging |
+
+## Docker benchmark results
+
+`docker build -f Dockerfile.benchmark .` — both binaries compiled with identical `gcc -O2 -DNDEBUG`, WAL enabled, fsync 50ms.
+
+| Scenario | Upstream | Fork | Delta |
+|---|---|---|---|
+| S1: Throughput (ops/s) | 123,783 | 205,503 | **+66.0%** |
+| S1: P50 latency (us) | 2,271 | 1,379 | **-39.3%** |
+| S1: P99.9 latency (us) | 11,986 | 4,981 | **-58.4%** |
+| S2: Latency (ops/s) | 38,326 | 41,678 | +8.7% |
+| S2: P50 latency (us) | 37.9 | 37.3 | -1.6% |
+| S3: Large body 16KB (ops/s) | 78,041 | 113,393 | **+45.3%** |
+| S4: 32 connections (ops/s) | 155,557 | 283,772 | **+82.4%** |
+| S5: Deep pipeline (ops/s) | 101,985 | 144,263 | **+41.5%** |
+| S6: 500 tubes (ops/s) | 43,022 | 42,115 | -2.1% |
+
+S1: 8 conn x 10K put+reserve+delete, 128B body, pipeline=64. S2: 1 conn x 5K ops, 4B body, pipeline=1 (round-trip). S3: 8 conn x 2K ops, 16KB body, pipeline=16. S4: 32 conn x 5K ops, 128B body, pipeline=32. S5: 1 conn x 20K ops, 128B body, pipeline=256. S6: 500 tubes x 100 jobs each, 4 clients, 16-256B mixed bodies.
 
 ## License
 

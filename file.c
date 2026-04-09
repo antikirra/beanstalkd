@@ -274,6 +274,13 @@ readrec(File *f, Job *l, int *err)
         {
         int32 old_body_size = j->r.body_size;
         j->r = jr;
+
+        // For short records, move job to tail of replay list to
+        // preserve WAL ordering. Ensures buried jobs maintain
+        // their burial order after restart (#668).
+        if (!namelen) {
+            job_list_remove(j);
+        }
         job_list_insert(l, j);
 
         // full record; read the job body
@@ -294,9 +301,13 @@ readrec(File *f, Job *l, int *err)
             // file, if any
             filermjob(j->file, j);
             fileaddjob(f, j);
+
+            // Only count full records toward alive/walused.
+            // Short records are redundant state updates; their bytes
+            // are dead space eligible for compaction (#622).
+            j->walused += sz;
+            f->w->alive += sz;
         }
-        j->walused += sz;
-        f->w->alive += sz;
 
         return 1;
         } /* end old_body_size scope */
@@ -422,6 +433,10 @@ readrec5(File *f, Job *l, int *err)
         j->r.bury_ct = jr.bury_ct;
         j->r.kick_ct = jr.kick_ct;
         j->r.state = jr.state;
+
+        if (!namelen) {
+            job_list_remove(j);
+        }
         job_list_insert(l, j);
 
         // full record; read the job body
@@ -442,9 +457,10 @@ readrec5(File *f, Job *l, int *err)
             // file, if any
             filermjob(j->file, j);
             fileaddjob(f, j);
+
+            j->walused += sz;
+            f->w->alive += sz;
         }
-        j->walused += sz;
-        f->w->alive += sz;
 
         return 1;
         } /* end old_body_size scope */
@@ -580,6 +596,7 @@ filewopen(File *f)
         twarn("write %s", f->path);
         if (close(fd) == -1)
             twarn("close");
+        unlink(f->path);
         return;
     }
 
@@ -660,6 +677,14 @@ filewrjobshort(File *f, Job *j)
 
     int r = filewritev(f, j, iov, 2);
     if (!r) return 0;
+
+    // Short records are state updates for an existing job whose
+    // authoritative data lives in a full record (in j->file).
+    // Undo the alive/walused accounting from filewritev to prevent
+    // phantom bytes that suppress compaction ratio (#622).
+    int total = sizeof(int) + sizeof(Jobrec);
+    j->walused -= total;
+    f->w->alive -= total;
 
     if (j->r.state == Invalid) {
         filermjob(j->file, j);

@@ -135,6 +135,25 @@ cksub(int fd, char *sub)
     assertf(strstr(got, sub), "\"%s\" not found in \"%s\"", sub, got);
 }
 
+// WAL-enabled server: start, kill, restart with same WAL dir.
+static int
+startsrv_wal(void)
+{
+    srv.wal.use = 1;
+    srv.wal.syncrate = 0;
+    srv.wal.wantsync = 1;
+    return startsrv();
+}
+
+static int
+restartsrv_wal(void)
+{
+    killsrv2();
+    close(srv.sock.fd);
+    srv.sock.fd = -1;
+    return startsrv_wal();
+}
+
 /* ============================================================
  * ANGRY PROTOCOL TESTS — hostile to the code
  * ============================================================ */
@@ -405,5 +424,201 @@ cttest_reserve_job_already_reserved_v2()
     /* reserve-job on already-reserved job must fail */
     snd(fd, "reserve-job 1\r\n");
     ck(fd, "NOT_FOUND\r\n");
+}
+
+/* ============================================================
+ * HOSTILE WAL TESTS — attack data durability guarantees
+ * ============================================================ */
+
+// Helper: check one stats-job field. Sends stats-job, reads OK line,
+// then reads YAML body and checks for substring.
+static void
+ckstatjob(int fd, int id, char *sub)
+{
+    char cmd[64];
+    snprintf(cmd, sizeof cmd, "stats-job %d\r\n", id);
+    snd(fd, cmd);
+    cksub(fd, "OK ");        // consume "OK <bytes>\r\n"
+    cksub(fd, sub);          // check YAML body
+}
+
+// #597: release with delay=0 must persist new priority to WAL.
+// Without fix, !!delay evaluates to 0, WAL write is skipped,
+// and the new priority is lost on restart.
+void
+cttest_wal_release_delay0_persists_priority()
+{
+    srv.wal.dir = ctdir();
+    int port = startsrv_wal();
+    int fd = diallocal(port);
+
+    snd(fd, "put 0 0 120 4\r\ntest\r\n");
+    ck(fd, "INSERTED 1\r\n");
+
+    snd(fd, "reserve-with-timeout 0\r\n");
+    cksub(fd, "RESERVED 1 4\r\n");
+    rd(fd);
+
+    // release with NEW priority 999 and delay=0
+    snd(fd, "release 1 999 0\r\n");
+    ck(fd, "RELEASED\r\n");
+
+    ckstatjob(fd, 1, "\npri: 999\n");
+    ckstatjob(fd, 1, "\nreleases: 1\n");
+
+    close(fd);
+
+    // CRASH AND RESTART — the moment of truth
+    port = restartsrv_wal();
+    fd = diallocal(port);
+
+    // priority MUST survive restart
+    ckstatjob(fd, 1, "\npri: 999\n");
+    ckstatjob(fd, 1, "\nreleases: 1\n");
+}
+
+// #668: bury_ct must NOT double-increment on WAL replay.
+// Without fix, each restart increments bury_ct by 1.
+void
+cttest_wal_bury_ct_stable_across_restarts()
+{
+    srv.wal.dir = ctdir();
+    int port = startsrv_wal();
+    int fd = diallocal(port);
+
+    snd(fd, "put 0 0 120 4\r\ntest\r\n");
+    ck(fd, "INSERTED 1\r\n");
+
+    snd(fd, "reserve-with-timeout 0\r\n");
+    cksub(fd, "RESERVED 1 4\r\n");
+    rd(fd);
+
+    snd(fd, "bury 1 0\r\n");
+    ck(fd, "BURIED\r\n");
+
+    ckstatjob(fd, 1, "\nburies: 1\n");
+
+    close(fd);
+
+    // First restart
+    port = restartsrv_wal();
+    fd = diallocal(port);
+
+    ckstatjob(fd, 1, "\nburies: 1\n"); // must be 1, not 2
+
+    close(fd);
+
+    // Second restart — stress the invariant
+    port = restartsrv_wal();
+    fd = diallocal(port);
+
+    ckstatjob(fd, 1, "\nburies: 1\n"); // must still be 1, not 3
+}
+
+// #668: buried jobs must preserve their burial ORDER across WAL replay.
+// Without fix, order was based on creation time, not burial time.
+void
+cttest_wal_buried_order_preserved_after_restart()
+{
+    srv.wal.dir = ctdir();
+    int port = startsrv_wal();
+    int fd = diallocal(port);
+
+    snd(fd, "put 0 0 120 1\r\nA\r\n");
+    ck(fd, "INSERTED 1\r\n");
+    snd(fd, "put 0 0 120 1\r\nB\r\n");
+    ck(fd, "INSERTED 2\r\n");
+    snd(fd, "put 0 0 120 1\r\nC\r\n");
+    ck(fd, "INSERTED 3\r\n");
+
+    // reserve all 3
+    snd(fd, "reserve-with-timeout 0\r\n");
+    cksub(fd, "RESERVED 1 1\r\n");
+    rd(fd);
+    snd(fd, "reserve-with-timeout 0\r\n");
+    cksub(fd, "RESERVED 2 1\r\n");
+    rd(fd);
+    snd(fd, "reserve-with-timeout 0\r\n");
+    cksub(fd, "RESERVED 3 1\r\n");
+    rd(fd);
+
+    // bury in order: 3 (C), then 1 (A), then 2 (B)
+    snd(fd, "bury 3 0\r\n");
+    ck(fd, "BURIED\r\n");
+    snd(fd, "bury 1 0\r\n");
+    ck(fd, "BURIED\r\n");
+    snd(fd, "bury 2 0\r\n");
+    ck(fd, "BURIED\r\n");
+
+    // peek-buried must return first buried: job 3
+    snd(fd, "peek-buried\r\n");
+    cksub(fd, "FOUND 3 1\r\n");
+    rd(fd);
+
+    close(fd);
+
+    // RESTART
+    port = restartsrv_wal();
+    fd = diallocal(port);
+
+    // peek-buried MUST still return job 3 (first buried)
+    snd(fd, "peek-buried\r\n");
+    cksub(fd, "FOUND 3 1\r\n");
+    rd(fd);
+
+    // kick 1 — removes job 3 from buried
+    snd(fd, "kick 1\r\n");
+    ck(fd, "KICKED 1\r\n");
+
+    // next peek-buried must be job 1 (second buried)
+    snd(fd, "peek-buried\r\n");
+    cksub(fd, "FOUND 1 1\r\n");
+    rd(fd);
+
+    // kick 1 — removes job 1
+    snd(fd, "kick 1\r\n");
+    ck(fd, "KICKED 1\r\n");
+
+    // next must be job 2 (third buried)
+    snd(fd, "peek-buried\r\n");
+    cksub(fd, "FOUND 2 1\r\n");
+    rd(fd);
+}
+
+// #597 stress: release-with-delay=0 across multiple priority changes.
+void
+cttest_wal_release_delay0_multi_priority_changes()
+{
+    srv.wal.dir = ctdir();
+    int port = startsrv_wal();
+    int fd = diallocal(port);
+
+    snd(fd, "put 0 0 120 4\r\ntest\r\n");
+    ck(fd, "INSERTED 1\r\n");
+
+    // cycle: reserve → release with new priority (delay=0) × 5
+    uint32_t priorities[] = {100, 200, 50, 999, 42};
+    for (int i = 0; i < 5; i++) {
+        snd(fd, "reserve-with-timeout 0\r\n");
+        cksub(fd, "RESERVED 1 4\r\n");
+        rd(fd);
+
+        char cmd[64];
+        snprintf(cmd, sizeof cmd, "release 1 %u 0\r\n", priorities[i]);
+        snd(fd, cmd);
+        ck(fd, "RELEASED\r\n");
+    }
+
+    ckstatjob(fd, 1, "\npri: 42\n");
+    ckstatjob(fd, 1, "\nreleases: 5\n");
+
+    close(fd);
+
+    // restart — verify last priority survives
+    port = restartsrv_wal();
+    fd = diallocal(port);
+
+    ckstatjob(fd, 1, "\npri: 42\n");
+    ckstatjob(fd, 1, "\nreleases: 5\n");
 }
 

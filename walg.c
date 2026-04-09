@@ -50,11 +50,12 @@ sync_thread_fn(void *arg)
         pthread_mutex_unlock(&w->sync_mu);
 
         int r = durable_fsync(fd);
+        int saved_errno = errno;
         close(fd);
 
         pthread_mutex_lock(&w->sync_mu);
         if (r == -1)
-            __atomic_store_n(&w->sync_err, 1, __ATOMIC_RELAXED);
+            __atomic_store_n(&w->sync_err, saved_errno ? saved_errno : 1, __ATOMIC_RELAXED);
     }
     pthread_mutex_unlock(&w->sync_mu);
     return NULL;
@@ -130,7 +131,10 @@ static void
 dirsync(Wal *w)
 {
     int fd = open(w->dir, O_RDONLY|O_CLOEXEC);
-    if (fd < 0) return;
+    if (fd < 0) {
+        twarn("dirsync open");
+        return;
+    }
 
     // Hand off to async fsync thread if running.
     if (w->sync_on) {
@@ -138,7 +142,9 @@ dirsync(Wal *w)
         if (w->sync_fd >= 0) {
             // Thread is busy — fall through to sync dirsync.
             pthread_mutex_unlock(&w->sync_mu);
-            durable_fsync(fd);
+            if (durable_fsync(fd) == -1) {
+                twarn("dirsync");
+            }
             close(fd);
         } else {
             w->sync_fd = fd;
@@ -147,7 +153,9 @@ dirsync(Wal *w)
             // fd is now owned by the sync thread; do not close.
         }
     } else {
-        durable_fsync(fd);
+        if (durable_fsync(fd) == -1) {
+            twarn("dirsync");
+        }
         close(fd);
     }
 }
@@ -279,9 +287,11 @@ walsync(Wal *w)
     if (w->sync_on) {
         if (__atomic_load_n(&w->sync_err, __ATOMIC_RELAXED)) {
             pthread_mutex_lock(&w->sync_mu);
+            int err = w->sync_err;
             w->sync_err = 0;
             pthread_mutex_unlock(&w->sync_mu);
-            twarnx("async fsync failed");
+            errno = err;
+            twarn("async fsync");
             return 0;
         }
     }

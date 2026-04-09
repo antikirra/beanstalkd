@@ -138,14 +138,12 @@ print(f'{total/wall:.0f}')
 # ── Run ──────────────────────────────────────────────────────
 
 run_suite "up" "$UPSTREAM" 11600 ""
-run_suite "fk" "$FORK"     11700 "-w 1"
-run_suite "mw" "$FORK"     11800 ""
+run_suite "fk" "$FORK"     11700 ""
 
 # ── Results ──────────────────────────────────────────────────
 
 export up_s1 up_s2 up_s3 up_s4 up_s5 up_s6
 export fk_s1 fk_s2 fk_s3 fk_s4 fk_s5 fk_s6
-export mw_s1 mw_s2 mw_s3 mw_s4 mw_s5 mw_s6
 
 python3 << PYEOF
 import os
@@ -163,36 +161,36 @@ def d(o, n, lb=False):
     if lb: p = -p
     return f'{"+" if p > 0 else ""}{p:.1f}%'
 
-up_s1 = e('up_s1'); fk_s1 = e('fk_s1'); mw_s1 = e('mw_s1')
-up_s2 = e('up_s2'); fk_s2 = e('fk_s2'); mw_s2 = e('mw_s2')
-up_s3 = e('up_s3'); fk_s3 = e('fk_s3'); mw_s3 = e('mw_s3')
-up_s4 = e('up_s4'); fk_s4 = e('fk_s4'); mw_s4 = e('mw_s4')
-up_s5 = e('up_s5'); fk_s5 = e('fk_s5'); mw_s5 = e('mw_s5')
-up_s6 = e('up_s6'); fk_s6 = e('fk_s6'); mw_s6 = e('mw_s6')
+up_s1 = e('up_s1'); fk_s1 = e('fk_s1')
+up_s2 = e('up_s2'); fk_s2 = e('fk_s2')
+up_s3 = e('up_s3'); fk_s3 = e('fk_s3')
+up_s4 = e('up_s4'); fk_s4 = e('fk_s4')
+up_s5 = e('up_s5'); fk_s5 = e('fk_s5')
+up_s6 = e('up_s6'); fk_s6 = e('fk_s6')
 
-fmt = '  {:<28s} {:>10s} {:>10s} {:>10s}  {:>8s}  {:>8s}'
+fmt = '  {:<28s} {:>10s} {:>10s}  {:>8s}'
 print()
-print('╔════════════════════════════════════════════════════════════════════════════════╗')
-print('║                              BENCHMARK RESULTS                               ║')
-print('║              gcc -O2 -DNDEBUG, WAL enabled, fsync 50ms                       ║')
-print('╠════════════════════════════════════════════════════════════════════════════════╣')
+print('╔══════════════════════════════════════════════════════════════╗')
+print('║                      BENCHMARK RESULTS                      ║')
+print('║          gcc -O2 -DNDEBUG, WAL enabled, fsync 50ms          ║')
+print('╠══════════════════════════════════════════════════════════════╣')
 print()
-print(fmt.format('Scenario', 'Upstream', 'Fork(1W)', 'Fork(MW)', '1W Δ', 'MW Δ'))
-print(fmt.format('-'*28, '-'*10, '-'*10, '-'*10, '-'*8, '-'*8))
+print(fmt.format('Scenario', 'Upstream', 'Fork', 'Δ'))
+print(fmt.format('-'*28, '-'*10, '-'*10, '-'*8))
 
-def row(name, u, f, m, lb=False):
-    print(fmt.format(name, u, f, m, d(u,f,lb), d(u,m,lb)))
+def row(name, u, f, lb=False):
+    print(fmt.format(name, u, f, d(u,f,lb)))
 
-row('S1: Throughput (ops/s)', v(up_s1,0), v(fk_s1,0), v(mw_s1,0))
-row('  P50 latency (μs)', v(up_s1,1), v(fk_s1,1), v(mw_s1,1), True)
-row('  P99.9 latency (μs)', v(up_s1,3), v(fk_s1,3), v(mw_s1,3), True)
-row('S2: Latency (ops/s)', v(up_s2,0), v(fk_s2,0), v(mw_s2,0))
-row('  P50 latency (μs)', v(up_s2,1), v(fk_s2,1), v(mw_s2,1), True)
-row('  P99.9 latency (μs)', v(up_s2,3), v(fk_s2,3), v(mw_s2,3), True)
-row('S3: Large body 16KB (ops/s)', v(up_s3,0), v(fk_s3,0), v(mw_s3,0))
-row('S4: 32 connections (ops/s)', v(up_s4,0), v(fk_s4,0), v(mw_s4,0))
-row('S5: Deep pipeline (ops/s)', v(up_s5,0), v(fk_s5,0), v(mw_s5,0))
-row('S6: 500 tubes (ops/s)', up_s6, fk_s6, mw_s6)
+row('S1: Throughput (ops/s)', v(up_s1,0), v(fk_s1,0))
+row('  P50 latency (μs)', v(up_s1,1), v(fk_s1,1), True)
+row('  P99.9 latency (μs)', v(up_s1,3), v(fk_s1,3), True)
+row('S2: Latency (ops/s)', v(up_s2,0), v(fk_s2,0))
+row('  P50 latency (μs)', v(up_s2,1), v(fk_s2,1), True)
+row('  P99.9 latency (μs)', v(up_s2,3), v(fk_s2,3), True)
+row('S3: Large body 16KB (ops/s)', v(up_s3,0), v(fk_s3,0))
+row('S4: 32 connections (ops/s)', v(up_s4,0), v(fk_s4,0))
+row('S5: Deep pipeline (ops/s)', v(up_s5,0), v(fk_s5,0))
+row('S6: 500 tubes (ops/s)', up_s6, fk_s6)
 
 print()
 print('  S1: 8 conn × 10K put+reserve+delete, 128B body, pipeline=64')
@@ -202,7 +200,7 @@ print('  S4: 32 conn × 5K put+reserve+delete, 128B body, pipeline=32')
 print('  S5: 1 conn × 20K put+reserve+delete, 128B body, pipeline=256')
 print('  S6: 500 tubes × 100 jobs each, 4 clients, 16-256B mixed bodies')
 print()
-print('╚════════════════════════════════════════════════════════════════════════════════╝')
+print('╚══════════════════════════════════════════════════════════════╝')
 PYEOF
 
 echo ""
