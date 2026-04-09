@@ -11,9 +11,9 @@ struct Ms tubes;
 static Tube *tube_ht[TUBE_HASH_SIZE];
 
 // tube_name_hash returns a finalized DJB2 hash of the tube name.
-// Used for tube hash table lookup, WAL shard routing, and worker ownership.
+// Used for tube hash table lookup.
 // Finalizer mixes high bits into low bits for better distribution
-// under power-of-2 modulo (TUBE_HASH_SIZE, nworkers, nshards).
+// under power-of-2 modulo (TUBE_HASH_SIZE).
 uint
 tube_name_hash(const char *name)
 {
@@ -71,22 +71,6 @@ tube_find_name(const char *name, size_t len)
 }
 
 
-// on_waiting_swap is called by ms_delete after swapping the last element
-// into position i. It updates the swapped-in conn's watch_idx to reflect
-// its new position in this tube's waiting_conns. This enables O(1) removal
-// via ms_remove_at.
-static void
-on_waiting_swap(Ms *a, void *removed_item, size_t i)
-{
-    UNUSED_PARAMETER(removed_item);
-    if (i >= a->len)
-        return; // removed the last element, no swap occurred
-    Conn *moved = a->items[i];
-    if (!conn_waiting(moved))
-        return;
-    moved->watch_idx = i;
-}
-
 Tube *
 make_tube(const char *name)
 {
@@ -103,8 +87,6 @@ make_tube(const char *name)
     t->name[nlen] = '\0';
     t->name_len = nlen;
     t->name_hash = tube_name_hash(t->name);
-    t->owner = srv.nworkers > 1 ? (int)(t->name_hash % srv.nworkers) : -1;
-    t->shard = srv.nshards > 0 ? (int)(t->name_hash % srv.nshards) : -1;
 
     t->ready.less = job_pri_less;
     t->delay.less = job_delay_less;
@@ -114,7 +96,7 @@ make_tube(const char *name)
     Job j = {.tube = NULL};
     t->buried = j;
     t->buried.prev = t->buried.next = &t->buried;
-    ms_init(&t->waiting_conns, NULL, (ms_event_fn)on_waiting_swap);
+    ms_init(&t->waiting_conns, NULL, NULL);
 
     return t;
 }

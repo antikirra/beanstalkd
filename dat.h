@@ -250,8 +250,6 @@ struct Tube {
     // --- cache line 1 (0-63): identity, flags, counters ---
     uint refs;
     uint name_hash;                     // cached tube_name_hash(name)
-    int  owner;                         // name_hash % nworkers, or -1 if single-process
-    int  shard;                         // name_hash % nshards, or -1 if no sharding
     int  in_delay_heap;                 // 1 if tube is in global delay heap
     int  in_pause_heap;                 // 1 if tube is in pause heap
     uint using_ct;
@@ -327,7 +325,6 @@ Job *allocate_job(int body_size);
 Job *make_job_with_id(uint pri, int64 delay, int64 ttr,
                       int body_size, Tube *tube, uint64 id);
 void job_free(Job *j);
-void job_init_id(int worker_id, int nworkers);
 
 /* Lookup a job by job ID */
 Job *job_find(uint64 job_id);
@@ -403,69 +400,7 @@ void enqueue_reserved_jobs(Conn *c);
 void enter_drain_mode(int sig);
 void h_accept(const int fd, const short which, Server *s);
 
-// Migration message sent alongside the fd via SCM_RIGHTS.
-#define MIG_MSG_MAGIC 0x4D494742  // "MIGB"
-struct MigMsg {
-    uint32 magic;
-    char   use_tube[MAX_TUBE_NAME_LEN];    // c->use->name
-    char   watch_tube[MAX_TUBE_NAME_LEN];  // c->watch->name
-    char   cmd[LINE_BUF_SIZE];             // buffered command data
-    size_t cmd_len;                         // bytes in cmd
-    char   pending_reply[LINE_BUF_SIZE];   // reply to send after migration
-    int    pending_reply_len;
-    byte   type;                            // CONN_TYPE_* flags
-};
-
-void h_accept_migrated(int cfd, Server *s, struct MigMsg *mm);
-
-// Command forwarding between workers for remote tube operations
-// (stats-tube, pause-tube). Sent WITHOUT fd (no SCM_RIGHTS needed).
-#define CMD_FWD_MAGIC  0x434D4446  // "CMDF"
-#define CMD_REPLY_MAGIC 0x52504C59 // "RPLY"
-
-struct CmdFwdMsg {
-    uint32 magic;
-    int    from_worker;           // who to send reply back to
-    uint32 seq;                   // sequence number for reply routing
-    size_t cmd_len;
-    char   cmd[LINE_BUF_SIZE];   // variable-length: only cmd_len bytes sent
-};
-
-#define CMD_FWD_REPLY_SIZE 4096
-struct CmdReplyMsg {
-    uint32 magic;
-    uint32 seq;                   // echo back sequence from CmdFwdMsg
-    int    data_len;
-    char   data[CMD_FWD_REPLY_SIZE]; // variable-length: only data_len bytes sent
-};
-// Put forwarding: forward a put command + body to the tube's owner worker.
-// Uses a flexible array member for the body.
-// Put forwarding body limit. AF_UNIX SOCK_SEQPACKET max message ~212KB
-// (SO_SNDBUF default). Use job_data_size_limit default (65535) as cap.
-#define PUT_FWD_MAGIC 0x50555446  // "PUTF"
-#define PUT_FWD_MAX_BODY 65535
-struct PutFwdMsg {
-    uint32 magic;
-    int    from_worker;
-    uint32 seq;
-    uint32 pri;
-    int64  delay;
-    int64  ttr;
-    char   tube[MAX_TUBE_NAME_LEN];
-    int    body_size;
-    char   body[PUT_FWD_MAX_BODY + 2];
-};
-
 int  prot_replay(Server *s, Job *list);
-int  pending_fwd_find(Server *s, uint32 seq);
-
-// Control message from master to worker: update peer_fd for a restarted worker.
-// Sent via ctl_fd with SCM_RIGHTS carrying the new socketpair end.
-#define CTL_PEER_UPDATE_MAGIC 0x50455552  // "PEER"
-struct CtlPeerUpdate {
-    uint32 magic;
-    int    peer_idx;    // which peer_fd slot to update
-};
 
 
 int make_server_socket(char *host, char *port);
@@ -488,7 +423,6 @@ struct Conn {
     char   state;       // see the STATE_* description
     char   type;        // combination of CONN_TYPE_* values
     byte   in_conns;    // 1 if the conn is in srv->conns heap, 0 otherwise
-    byte   fwd_pending; // 1 if waiting for forwarded command reply
     int    rw;          // currently want: 'r', 'w', or 'h'
     int    pending_timeout; // -1 = forever
     Tube   *use;        // tube currently in use
@@ -513,8 +447,7 @@ struct Conn {
     Job   *in_job;              // a job to be read from the client
 
     // --- cache line 4+: watch, reserved jobs ---
-    Tube   *watch;              // the single watched tube
-    size_t  watch_idx;          // position in watch->waiting_conns for O(1) removal
+    Ms     watch;               // set of watched tubes (upstream-compatible)
     Job reserved_jobs;          // linked list header
 
     // --- large buffers at end to avoid cache pollution ---
@@ -563,7 +496,7 @@ struct Wal {
     int64  lastcompact;
 
     // Per-Wal async fsync thread state.
-    // Moved from walg.c statics to support multiple Wal instances (sharding).
+    // Async fsync thread state.
     pthread_t       sync_thread;
     pthread_mutex_t sync_mu;
     pthread_cond_t  sync_cond;
@@ -620,8 +553,6 @@ int  filewrjobfull(File*, Job*);
 
 #define Portdef "11300"
 
-#define MAX_WORKERS 64
-
 struct Server {
     char *port;
     char *addr;
@@ -633,67 +564,7 @@ struct Server {
 
     // Connections that must produce deadline or timeout, ordered by the time.
     Heap   conns;
-
-    // Per-shard WAL instances. Jobs are routed to shards by tube name hash.
-    // Parallelizes disk I/O (writes + fsync) across CPU count threads.
-    // NULL and nshards=0 when WAL is disabled or legacy single-WAL mode.
-    Wal    *shards;
-    int    nshards;
-
-    // Multi-process workers. Master forks nworkers children, each with own
-    // SO_REUSEPORT socket, epoll loop, tubes, and WAL shard.
-    int    nworkers;          // 0 = legacy single-process mode
-    int    worker_id;         // -1 for master, 0..N-1 for workers
-    pid_t  worker_pids[MAX_WORKERS]; // master: child PIDs
-    int    peer_fd[MAX_WORKERS];     // Unix sockets to peer workers
-    int    ctl_fd;                   // control pipe from master (recv new peer fds)
-
-    // Pending forwarded commands: hash table for concurrent in-flight forwards.
-    // Each entry tracks the connection waiting for a reply, with generation
-    // and sequence number to detect stale/reused Conn pointers.
-    // Indexed by (seq & PENDING_FWD_MASK) with linear probing.
-    #define PENDING_FWD_SLOTS 128
-    #define PENDING_FWD_MASK  (PENDING_FWD_SLOTS - 1)
-    struct {
-        Conn   *conn;
-        uint64  gen;      // conn generation at time of forward
-        uint32  seq;      // sequence number sent with the forward
-        int64   at;       // nanoseconds when forward was sent
-    } pending_fwd[PENDING_FWD_SLOTS];
-    uint32  pending_fwd_seq;        // next sequence number to assign
-    int     pending_fwd_used;       // number of occupied slots (for scan skip)
 };
 void srv_acquire_wal(Server *s);
-int  detect_ncpu(void);
 void srvserve(Server *s);
 void srvaccept(Server *s, int ev);
-
-// SCM_RIGHTS fd passing for connection migration between workers.
-int  send_fd(int sock, int fd, void *buf, size_t buflen);
-int  recv_fd(int sock, void *buf, size_t buflen);
-
-// Shared memory stats for cross-worker aggregation.
-// Each worker writes its own slot; stats command sums all slots.
-#define SHARED_STATS_OPS 26
-#define SHARED_MAX_TUBES 1024
-struct SharedStats {
-    uint32 version;               // seqlock: odd = write in progress
-    uint64 ready_ct;
-    uint64 delayed_ct;
-    uint64 buried_ct;
-    uint64 reserved_ct;
-    uint64 urgent_ct;
-    uint64 waiting_ct;
-    uint64 timeout_ct;
-    uint64 total_jobs_ct;
-    uint64 op_ct[SHARED_STATS_OPS];
-    uint32 cur_conn_ct;
-    uint32 cur_producer_ct;
-    uint32 cur_worker_ct;
-    uint32 tot_conn_ct;
-    uint32 tube_count;
-    char   tube_names[SHARED_MAX_TUBES][MAX_TUBE_NAME_LEN];
-};
-
-// Pointer to mmap'd array of nworkers SharedStats entries.
-extern struct SharedStats *shared_stats;

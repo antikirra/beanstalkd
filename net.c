@@ -180,7 +180,6 @@ make_inet_socket(char *host, char *port)
 
         // Defer accept until client sends data. Reduces empty accept
         // events — kernel holds the connection until data arrives.
-        // Synergizes with h_accept speculative read in multi-worker mode.
         {
             int val = 1;
             setsockopt(fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &val, sizeof val);
@@ -252,72 +251,6 @@ make_unix_socket(char *path)
         return -1;
     }
 
-    return fd;
-}
-
-// Send a file descriptor and auxiliary data over a Unix socket via SCM_RIGHTS.
-// buf/buflen carry the migration message alongside the fd.
-// Returns 0 on success, -1 on error.
-int
-send_fd(int sock, int fd, void *buf, size_t buflen)
-{
-    struct msghdr msg = {0};
-    struct iovec iov = { .iov_base = buf, .iov_len = buflen };
-    char cmsgbuf[CMSG_SPACE(sizeof(int))];
-
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cmsgbuf;
-    msg.msg_controllen = sizeof(cmsgbuf);
-
-    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-    cmsg->cmsg_level = SOL_SOCKET;
-    cmsg->cmsg_type = SCM_RIGHTS;
-    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-    memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
-
-    ssize_t r;
-    do {
-        r = sendmsg(sock, &msg, MSG_NOSIGNAL);
-    } while (r == -1 && errno == EINTR);
-    if (r == -1) {
-        twarn("send_fd");
-        return -1;
-    }
-    if ((size_t)r != buflen) {
-        twarnx("send_fd: short write %zd/%zu", r, buflen);
-        return -1;
-    }
-    return 0;
-}
-
-// Receive a file descriptor and auxiliary data from a Unix socket via SCM_RIGHTS.
-// buf/buflen receive the migration message.
-// Returns the received fd, or -1 on error.
-int
-recv_fd(int sock, void *buf, size_t buflen)
-{
-    struct msghdr msg = {0};
-    struct iovec iov = { .iov_base = buf, .iov_len = buflen };
-    char cmsgbuf[CMSG_SPACE(sizeof(int))];
-
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cmsgbuf;
-    msg.msg_controllen = sizeof(cmsgbuf);
-
-    ssize_t r;
-    do {
-        r = recvmsg(sock, &msg, 0);
-    } while (r == -1 && errno == EINTR);
-    if (r <= 0 || (size_t)r < buflen) return -1;
-
-    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-    if (!cmsg || cmsg->cmsg_type != SCM_RIGHTS
-        || cmsg->cmsg_len < CMSG_LEN(sizeof(int))) return -1;
-
-    int fd;
-    memcpy(&fd, CMSG_DATA(cmsg), sizeof(int));
     return fd;
 }
 

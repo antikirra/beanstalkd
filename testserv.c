@@ -794,11 +794,13 @@ cttest_multi_tube()
     mustsend(fd, "\r\n");
     ckresp(fd, "INSERTED 2\r\n");
     mustsend(fd, "watch abc\r\n");
-    ckresp(fd, "WATCHING 1\r\n");
+    ckresp(fd, "WATCHING 2\r\n");
     mustsend(fd, "watch def\r\n");
-    ckresp(fd, "WATCHING 1\r\n");
+    ckresp(fd, "WATCHING 3\r\n");
+    // With multi-tube watch, reserve scans tubes in order.
+    // First ready tube is abc (added first), so job 1 is reserved.
     mustsend(fd, "reserve\r\n");
-    ckresp(fd, "RESERVED 2 0\r\n");
+    ckresp(fd, "RESERVED 1 0\r\n");
 }
 
 void
@@ -1109,10 +1111,10 @@ cttest_reserve_with_timeout_2conns()
     fd0 = mustdiallocal(port);
     fd1 = mustdiallocal(port);
     mustsend(fd0, "watch foo\r\n");
-    ckresp(fd0, "WATCHING 1\r\n");
+    ckresp(fd0, "WATCHING 2\r\n");
     mustsend(fd0, "reserve-with-timeout 1\r\n");
     mustsend(fd1, "watch foo\r\n");
-    ckresp(fd1, "WATCHING 1\r\n");
+    ckresp(fd1, "WATCHING 2\r\n");
     timeout = 1100000000; // 1.1s
     ckresp(fd0, "TIMED_OUT\r\n");
 }
@@ -1454,7 +1456,7 @@ cttest_list_tube()
     int fd0 = mustdiallocal(port);
 
     mustsend(fd0, "watch w\r\n");
-    ckresp(fd0, "WATCHING 1\r\n");
+    ckresp(fd0, "WATCHING 2\r\n");
 
     mustsend(fd0, "use u\r\n");
     ckresp(fd0, "USING u\r\n");
@@ -1474,6 +1476,7 @@ cttest_list_tube()
     ckrespsub(fd0, "OK ");
     ckresp(fd0,
            "---\n"
+           "- default\n"
            "- w\n\r\n");
 
     mustsend(fd0, "ignore default\r\n");
@@ -1655,7 +1658,7 @@ cttest_binlog_read()
     mustsend(fd, "tes1\r\n");
     ckresp(fd, "INSERTED 2\r\n");
     mustsend(fd, "watch test\r\n");
-    ckresp(fd, "WATCHING 1\r\n");
+    ckresp(fd, "WATCHING 2\r\n");
     mustsend(fd, "reserve\r\n");
     ckresp(fd, "RESERVED 1 4\r\n");
     ckresp(fd, "test\r\n");
@@ -1672,7 +1675,7 @@ cttest_binlog_read()
     port = SERVER();
     fd = mustdiallocal(port);
     mustsend(fd, "watch test\r\n");
-    ckresp(fd, "WATCHING 1\r\n");
+    ckresp(fd, "WATCHING 2\r\n");
     mustsend(fd, "reserve\r\n");
     ckresp(fd, "RESERVED 1 4\r\n");
     ckresp(fd, "test\r\n");

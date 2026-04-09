@@ -6,13 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
-#include <sys/mman.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/wait.h>
 #include <unistd.h>
 #include <pwd.h>
-#include <fcntl.h>
 #include <sched.h>
 
 static void
@@ -46,24 +41,6 @@ static void
 handle_sigterm_pid1(int _unused)
 {
     _exit(143);
-}
-
-// Master: forward SIGTERM to all workers.
-static volatile sig_atomic_t got_sigterm = 0;
-static volatile sig_atomic_t got_sigusr1 = 0;
-
-static void
-master_sigterm(int _unused)
-{
-    UNUSED_PARAMETER(_unused);
-    got_sigterm = 1;
-}
-
-static void
-master_sigusr1(int _unused)
-{
-    UNUSED_PARAMETER(_unused);
-    got_sigusr1 = 1;
 }
 
 static void
@@ -105,24 +82,6 @@ set_sig_handlers()
     }
 }
 
-// Set master-specific signal handlers.
-static void
-set_master_sig_handlers()
-{
-    struct sigaction sa;
-    sa.sa_flags = 0;
-    sigemptyset(&sa.sa_mask);
-
-    sa.sa_handler = SIG_IGN;
-    sigaction(SIGPIPE, &sa, 0);
-
-    sa.sa_handler = master_sigterm;
-    sigaction(SIGTERM, &sa, 0);
-
-    sa.sa_handler = master_sigusr1;
-    sigaction(SIGUSR1, &sa, 0);
-}
-
 // Pin process to a specific CPU core.
 static void
 pin_to_cpu(int cpu)
@@ -135,192 +94,29 @@ pin_to_cpu(int cpu)
     } else {
         srv.cpu = cpu; // SO_INCOMING_CPU in make_server_socket uses this
         if (verbose)
-            printf("worker %d pinned to CPU %d\n", srv.worker_id, cpu);
+            printf("pinned to CPU %d\n", cpu);
     }
 }
 
-// Start a single worker process. Returns child PID to master,
-// does not return in child (calls srvserve then _exit).
-// ctl_fd: control pipe from master for peer updates (-1 to disable).
-__attribute__((cold)) static pid_t
-spawn_worker(int id, int nworkers, int mesh[MAX_WORKERS][MAX_WORKERS], int ctl_fd)
+int
+main(int argc, char **argv)
 {
-    pid_t pid = fork();
-    if (pid == -1) {
-        twarn("fork worker %d", id);
-        return -1;
-    }
-    if (pid > 0)
-        return pid; // master
+    UNUSED_PARAMETER(argc);
 
-    // === CHILD: become worker ===
-    srv.worker_id = id;
-    srv.ctl_fd = ctl_fd;
+    progname = argv[0];
+    setlinebuf(stdout);
 
-    // Keep only our row of the mesh; close everything else.
-    for (int i = 0; i < nworkers; i++) {
-        srv.peer_fd[i] = mesh[id][i]; // our fd to talk to worker i (-1 for self)
-        for (int j = 0; j < nworkers; j++) {
-            if (i == id) continue; // keep our row
-            if (mesh[i][j] >= 0)
-                close(mesh[i][j]);
-        }
-    }
+    // Single arena; single-threaded server.
+    setenv("MALLOC_ARENA_MAX", "1", 0);
 
-    // Pin to CPU core (round-robin if more workers than cores).
-    int ncpu = detect_ncpu();
-    pin_to_cpu(id % ncpu);
+    optparse(&srv, argv+1);
 
-    // Fresh per-process protocol state (tubes, heaps, counters).
-    prot_init();
-    job_init_id(id, srv.nworkers);
+    if (srv.user)
+        su(srv.user);
 
-    // Worker-specific WAL: each worker owns one shard directory.
-    // Replay WAL BEFORE binding socket so clients don't connect
-    // to a worker with incomplete state.
-    if (srv.wal.use) {
-        char *wdir = fmtalloc("%s/w%d", srv.wal.dir, id);
-        if (!wdir) {
-            twarnx("worker %d: OOM wal dir", id);
-            _exit(111);
-        }
-        mkdir(wdir, 0700);
-        srv.wal.dir = wdir;
-        srv.nshards = 0;
-        srv_acquire_wal(&srv);
-        if (srv.wal.wantsync)
-            walsyncstart(&srv.wal);
-    }
+    if (verbose)
+        printf("pid %d\n", getpid());
 
-    // Bind socket AFTER WAL recovery — no connections accepted before state is ready.
-    int r = make_server_socket(srv.addr, srv.port);
-    if (r == -1) {
-        twarnx("worker %d: make_server_socket failed", id);
-        _exit(111);
-    }
-    srv.sock.fd = r;
-
-    set_sig_handlers();
-    srvserve(&srv);
-
-    if (srv.wal.use && srv.wal.wantsync)
-        walsyncstop(&srv.wal);
-    _exit(0);
-}
-
-// Master-held control pipe write ends (one per worker).
-static int master_ctl_fd[MAX_WORKERS];
-
-// Restart a crashed worker: create new peer socketpairs,
-// push new fds to surviving workers via control pipe.
-__attribute__((cold)) static void
-restart_worker(int id, int nworkers)
-{
-    // Create new mesh row for the restarted worker.
-    int mesh[MAX_WORKERS][MAX_WORKERS];
-    memset(mesh, -1, sizeof(mesh));
-
-    for (int j = 0; j < nworkers; j++) {
-        if (j == id) continue;
-        int sv[2];
-        if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, sv) == -1) {
-            twarn("socketpair for workers %d↔%d", id, j);
-            continue;
-        }
-        mesh[id][j] = sv[0]; // new worker's end
-        mesh[j][id] = sv[1]; // surviving worker's end
-
-        // Send the surviving worker's end via control pipe.
-        if (master_ctl_fd[j] >= 0) {
-            struct CtlPeerUpdate msg = { CTL_PEER_UPDATE_MAGIC, id };
-            if (send_fd(master_ctl_fd[j], sv[1], &msg, sizeof(msg)) == 0) {
-                close(sv[1]); // master's copy; worker got its own via SCM_RIGHTS
-                mesh[j][id] = -1; // don't pass to new worker
-            } else {
-                // Failed to notify surviving worker — close both ends.
-                // Worker j keeps its stale peer_fd[id]; it will detect
-                // the dead peer via EOF on the next epoll cycle.
-                twarnx("restart_worker: failed to send new peer fd to worker %d", j);
-                close(sv[0]);
-                close(sv[1]);
-                mesh[id][j] = -1;
-                mesh[j][id] = -1;
-            }
-        }
-    }
-
-    // Create new control pipe for the restarted worker.
-    int ctl[2];
-    if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, ctl) == -1) {
-        twarn("control pipe for worker %d", id);
-        ctl[0] = ctl[1] = -1;
-    }
-
-    pid_t newpid = spawn_worker(id, nworkers, mesh, ctl[0]);
-    if (newpid > 0) {
-        srv.worker_pids[id] = newpid;
-        if (ctl[0] >= 0) close(ctl[0]); // child's end
-        if (master_ctl_fd[id] >= 0) close(master_ctl_fd[id]);
-        master_ctl_fd[id] = ctl[1]; // master's write end
-    } else {
-        if (ctl[0] >= 0) close(ctl[0]);
-        if (ctl[1] >= 0) close(ctl[1]);
-    }
-
-    // Close master's copies of new worker's mesh fds.
-    for (int j = 0; j < nworkers; j++) {
-        if (mesh[id][j] >= 0) close(mesh[id][j]);
-    }
-}
-
-// Master process: monitor workers, restart on crash, forward signals.
-static void
-master_loop(int nworkers)
-{
-    set_master_sig_handlers();
-
-    for (;;) {
-        int status;
-        pid_t pid = waitpid(-1, &status, 0);
-
-        if (got_sigterm) {
-            for (int i = 0; i < nworkers; i++) {
-                if (srv.worker_pids[i] > 0)
-                    kill(srv.worker_pids[i], SIGTERM);
-            }
-            for (int i = 0; i < nworkers; i++) {
-                if (srv.worker_pids[i] > 0)
-                    waitpid(srv.worker_pids[i], NULL, 0);
-            }
-            exit(0);
-        }
-        if (got_sigusr1) {
-            got_sigusr1 = 0;
-            for (int i = 0; i < nworkers; i++) {
-                if (srv.worker_pids[i] > 0)
-                    kill(srv.worker_pids[i], SIGUSR1);
-            }
-        }
-
-        if (pid > 0) {
-            do {
-                for (int i = 0; i < nworkers; i++) {
-                    if (srv.worker_pids[i] == pid) {
-                        twarnx("worker %d (pid %d) exited status %d, restarting",
-                               i, (int)pid, status);
-                        restart_worker(i, nworkers);
-                        break;
-                    }
-                }
-            } while ((pid = waitpid(-1, &status, WNOHANG)) > 0);
-        }
-    }
-}
-
-// Legacy single-process mode (nworkers == 0).
-static void
-run_single_process()
-{
     if (srv.cpu >= 0)
         pin_to_cpu(srv.cpu);
 
@@ -333,130 +129,16 @@ run_single_process()
 
     prot_init();
 
-    if (srv.wal.use)
-        srv.nshards = detect_ncpu();
-
     srv_acquire_wal(&srv);
 
-    if (srv.wal.use && srv.wal.wantsync) {
-        if (srv.nshards > 0) {
-            for (int i = 0; i < srv.nshards; i++)
-                walsyncstart(&srv.shards[i]);
-        } else {
-            walsyncstart(&srv.wal);
-        }
-    }
+    if (srv.wal.use && srv.wal.wantsync)
+        walsyncstart(&srv.wal);
 
     set_sig_handlers();
     srvserve(&srv);
 
-    if (srv.nshards > 0) {
-        for (int i = 0; i < srv.nshards; i++)
-            walsyncstop(&srv.shards[i]);
-    } else {
+    if (srv.wal.use && srv.wal.wantsync)
         walsyncstop(&srv.wal);
-    }
-}
 
-int
-main(int argc, char **argv)
-{
-    UNUSED_PARAMETER(argc);
-
-    progname = argv[0];
-    setlinebuf(stdout);
-
-    // Single arena; workers are single-threaded.
-    setenv("MALLOC_ARENA_MAX", "1", 0);
-
-    optparse(&srv, argv+1);
-
-    if (srv.user)
-        su(srv.user);
-
-    if (verbose)
-        printf("pid %d\n", getpid());
-
-    int nworkers;
-
-    // -w flag overrides auto-detection. -w 0 or -w 1 = single-process.
-    if (srv.nworkers > 0) {
-        nworkers = srv.nworkers;
-    } else {
-        nworkers = detect_ncpu();
-    }
-
-    // Legacy single-process mode when pinned to specific CPU (-t flag),
-    // explicitly set -w 0 or -w 1, or when only 1 CPU is available.
-    if (srv.cpu >= 0 || nworkers <= 1) {
-        srv.nworkers = 0;
-        srv.worker_id = 0;
-        run_single_process();
-        exit(0);
-    }
-
-    // Multi-process mode: master forks N workers.
-    srv.nworkers = nworkers;
-    srv.worker_id = -1;
-
-    if (verbose)
-        printf("starting %d workers\n", nworkers);
-
-    // Allocate shared memory for cross-worker stats aggregation.
-    size_t shm_size = sizeof(struct SharedStats) * nworkers;
-    shared_stats = mmap(NULL, shm_size, PROT_READ | PROT_WRITE,
-                        MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    if (shared_stats == MAP_FAILED) {
-        twarn("mmap shared stats");
-        shared_stats = NULL;
-    } else {
-        memset(shared_stats, 0, shm_size);
-    }
-
-    // Create socketpair mesh for direct worker-to-worker fd migration.
-    // mesh[i][j] = fd that worker i uses to communicate with worker j.
-    int mesh[MAX_WORKERS][MAX_WORKERS];
-    memset(mesh, -1, sizeof(mesh));
-    for (int i = 0; i < nworkers; i++) {
-        for (int j = i + 1; j < nworkers; j++) {
-            int sv[2];
-            // SOCK_SEQPACKET: message boundaries + SCM_RIGHTS support.
-            // Prevents partial reads that corrupt message framing on SOCK_STREAM.
-            if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, sv) == -1) {
-                twarn("socketpair for workers %d↔%d", i, j);
-                exit(111);
-            }
-            mesh[i][j] = sv[0]; // worker i's end
-            mesh[j][i] = sv[1]; // worker j's end
-        }
-    }
-
-    // Create control pipes (master → worker) for peer fd updates.
-    memset(master_ctl_fd, -1, sizeof(master_ctl_fd));
-    for (int i = 0; i < nworkers; i++) {
-        int ctl[2];
-        if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, ctl) == -1) {
-            twarn("control pipe for worker %d", i);
-            exit(111);
-        }
-        master_ctl_fd[i] = ctl[1]; // master's write end
-
-        pid_t pid = spawn_worker(i, nworkers, mesh, ctl[0]);
-        if (pid == -1) {
-            twarnx("failed to spawn worker %d", i);
-            exit(111);
-        }
-        close(ctl[0]); // child inherited its copy
-        srv.worker_pids[i] = pid;
-    }
-
-    // Close master's copies of mesh fds (workers inherited via fork).
-    for (int i = 0; i < nworkers; i++)
-        for (int j = i + 1; j < nworkers; j++) {
-            if (mesh[i][j] >= 0) close(mesh[i][j]);
-            if (mesh[j][i] >= 0) close(mesh[j][i]);
-        }
-
-    master_loop(nworkers);
     exit(0);
 }

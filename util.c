@@ -221,15 +221,6 @@ optparse(Server *s, char **argv)
                     s->cpu = cpu;
                     break;
                 }
-                case 'w': {
-                    int w = (int)parse_size_t(EARGF(flagusage("-w")));
-                    if (w < 0 || w > 64) {
-                        warnx("-w %d: workers out of range (0..64)", w);
-                        usage(5);
-                    }
-                    s->nworkers = w;
-                    break;
-                }
                 case 'h':
                     usage(0);
                 case 'v':

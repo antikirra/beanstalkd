@@ -303,7 +303,7 @@ cttest_use_watch_ignore_sequence()
     ck(fd, "USING alpha\r\n");
 
     snd(fd, "watch alpha\r\n");
-    ck(fd, "WATCHING 1\r\n");
+    ck(fd, "WATCHING 2\r\n");
 
     snd(fd, "ignore default\r\n");
     ck(fd, "WATCHING 1\r\n");
@@ -407,59 +407,3 @@ cttest_reserve_job_already_reserved_v2()
     ck(fd, "NOT_FOUND\r\n");
 }
 
-void
-cttest_shard_wal_write_and_recover()
-{
-    /* Write jobs across multiple tubes (hitting different WAL shards),
-     * kill the server, restart, verify all jobs survive. */
-    srv.wal.dir = ctdir();
-    srv.wal.use = 1;
-    srv.wal.syncrate = 0;
-    srv.wal.wantsync = 0;
-    srv.nshards = 4;
-
-    int port = startsrv();
-    int fd = diallocal(port);
-
-    /* Put 5 jobs in each of 4 tubes = 20 jobs across shards. */
-    int t, i;
-    for (t = 0; t < 4; t++) {
-        char cmd[64];
-        snprintf(cmd, sizeof(cmd), "use shard-tube-%d\r\n", t);
-        snd(fd, cmd);
-        cksub(fd, "USING");
-        for (i = 0; i < 5; i++) {
-            snd(fd, "put 0 0 60 4\r\ntest\r\n");
-            cksub(fd, "INSERTED");
-        }
-    }
-    close(fd);
-
-    /* Kill server, restart with same WAL dir and shard count. */
-    killsrv2();
-    srv.nshards = 4;
-    port = startsrv();
-    fd = diallocal(port);
-
-    /* Verify all 20 jobs recovered: use one connection per tube.
-     * Single-tube watch means we can only watch one tube at a time. */
-    int total = 0;
-    for (t = 0; t < 4; t++) {
-        int tfd = diallocal(port);
-        char cmd[64];
-        snprintf(cmd, sizeof(cmd), "watch shard-tube-%d\r\n", t);
-        snd(tfd, cmd);
-        cksub(tfd, "WATCHING");
-        for (i = 0; i < 5; i++) {
-            snd(tfd, "reserve-with-timeout 0\r\n");
-            cksub(tfd, "RESERVED");
-            rd(tfd); /* drain body */
-            total++;
-        }
-        /* No more jobs in this tube. */
-        snd(tfd, "reserve-with-timeout 0\r\n");
-        ck(tfd, "TIMED_OUT\r\n");
-        close(tfd);
-    }
-    assertf(total == 20, "expected 20 recovered jobs, got %d", total);
-}

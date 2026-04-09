@@ -674,7 +674,7 @@ cttest_job_hash_no_downscale_at_initial()
     tube_dref(t);
 }
 
-/* --- WAL shard routing --- */
+/* --- Tube hash --- */
 
 void
 cttest_tube_name_hash_deterministic()
@@ -695,101 +695,34 @@ cttest_tube_name_hash_deterministic()
     assertf(h4 != h1, "empty must differ from email");
 }
 
-void
-cttest_shard_wal_routing()
-{
-    /* Verify that shard index is always in bounds and deterministic. */
-    int nshards = 4;
-    int i;
-    const char *names[] = {
-        "a","b","c","default","email","video","x.y.z",
-        "queue-0","queue-1","queue-2","queue-3",NULL
-    };
-    for (i = 0; names[i]; i++) {
-        uint h1 = tube_name_hash(names[i]) % nshards;
-        uint h2 = tube_name_hash(names[i]) % nshards;
-        assertf(h1 == h2, "'%s' routing not deterministic", names[i]);
-        assertf(h1 < (uint)nshards, "shard %u out of bounds for '%s'", h1, names[i]);
-    }
-
-    /* Stress: 200 tube names, all route in bounds. */
-    for (i = 0; i < 200; i++) {
-        char name[32];
-        snprintf(name, sizeof(name), "tube-%d", i);
-        uint h = tube_name_hash(name) % nshards;
-        assertf(h < (uint)nshards, "shard %u out of bounds for '%s'", h, name);
-    }
-}
+// ─── Hash distribution fairness ────────────────────────────
+// 1000 random tube names across 8 buckets must not all land
+// in the same bucket. This catches degenerate hash functions.
 
 void
-cttest_shard_wal_ncpu()
+cttest_hash_distribution_fairness()
 {
-    int n = detect_ncpu();
-    assertf(n >= 1, "ncpu must be >= 1, got %d", n);
-    assertf(n <= 64, "ncpu must be <= 64, got %d", n);
-}
-
-void
-cttest_shard_wal_init_creates_dirs()
-{
-    /* When nshards > 0, srv_acquire_wal must create shard subdirectories
-     * with independent WAL instances. */
-    char *dir = ctdir();
-
-    srv.wal.dir = dir;
-    srv.wal.use = 1;
-    srv.wal.filesize = Filesizedef;
-    srv.wal.syncrate = 0;
-    srv.wal.wantsync = 0;
-    srv.nshards = 3;
-
-    srv_acquire_wal(&srv);
-
-    assertf(srv.shards != NULL, "shards must be allocated");
-    int i;
-    for (i = 0; i < 3; i++) {
-        assertf(srv.shards[i].use == 1, "shard %d must be active", i);
-        assertf(srv.shards[i].dir != NULL, "shard %d dir must be set", i);
-        assertf(srv.shards[i].cur != NULL, "shard %d must have cur file", i);
-    }
-
-    /* Clean up. */
-    srv.nshards = 0;
-    srv.shards = NULL;
-    srv.wal.use = 0;
-}
-
-// ─── Shard distribution fairness ────────────────────────────
-// 1000 random tube names across 8 shards must not all land
-// in the same shard. This catches degenerate hash functions.
-
-void
-cttest_shard_distribution_fairness()
-{
-    int nshards = 8;
+    int nbuckets = 8;
     int counts[8] = {0};
     int i;
 
     for (i = 0; i < 1000; i++) {
         char name[64];
         snprintf(name, sizeof(name), "workload-%d-task-%d", i / 10, i % 10);
-        uint h = tube_name_hash(name) % nshards;
-        assertf(h < (uint)nshards, "shard out of bounds");
+        uint h = tube_name_hash(name) % nbuckets;
+        assertf(h < (uint)nbuckets, "bucket out of bounds");
         counts[h]++;
     }
 
-    // Each shard should get at least 5% (50 of 1000). If any shard
-    // gets 0, the hash function is pathologically bad.
-    for (i = 0; i < nshards; i++) {
+    for (i = 0; i < nbuckets; i++) {
         assertf(counts[i] > 20,
-                "shard %d got only %d of 1000 tubes — hash is degenerate",
+                "bucket %d got only %d of 1000 tubes — hash is degenerate",
                 i, counts[i]);
     }
 
-    // No shard should get more than 30% (300 of 1000).
-    for (i = 0; i < nshards; i++) {
+    for (i = 0; i < nbuckets; i++) {
         assertf(counts[i] < 300,
-                "shard %d got %d of 1000 tubes — hash is heavily skewed",
+                "bucket %d got %d of 1000 tubes — hash is heavily skewed",
                 i, counts[i]);
     }
 }

@@ -20,6 +20,27 @@ int verbose = 0;
 static Conn *conn_pool = NULL;
 static int conn_pool_len = 0;
 
+// Callbacks for c->watch Ms: manage tube refcount and watching_ct.
+static void
+on_watch_insert(Ms *a, void *item, size_t i)
+{
+    UNUSED_PARAMETER(a);
+    UNUSED_PARAMETER(i);
+    Tube *t = item;
+    tube_iref(t);
+    t->watching_ct++;
+}
+
+static void
+on_watch_remove(Ms *a, void *item, size_t i)
+{
+    UNUSED_PARAMETER(a);
+    UNUSED_PARAMETER(i);
+    Tube *t = item;
+    t->watching_ct--;
+    tube_dref(t);
+}
+
 Conn *
 make_conn(int fd, char start_state, Tube *use, Tube *watch)
 {
@@ -42,8 +63,8 @@ make_conn(int fd, char start_state, Tube *use, Tube *watch)
 
     c->sock.fd = fd;
 
-    TUBE_ASSIGN(c->watch, watch);
-    c->watch->watching_ct++;
+    ms_init(&c->watch, on_watch_insert, on_watch_remove);
+    ms_append(&c->watch, watch); // callback: iref + watching_ct++
 
     TUBE_ASSIGN(c->use, use);
     use->using_ct++;
@@ -206,7 +227,12 @@ conndeadlinesoon(Conn *c)
 inline int
 conn_ready(Conn *c)
 {
-    return c->watch && c->watch->ready.len && !c->watch->pause;
+    for (size_t i = 0; i < c->watch.len; i++) {
+        Tube *t = c->watch.items[i];
+        if (t->ready.len > 0 && !t->pause)
+            return 1;
+    }
+    return 0;
 }
 
 
@@ -240,21 +266,6 @@ connclose(Conn *c)
         return; // already closed — guard against double-close/double-pool
     }
 
-    // Clear all pending forward slots referencing this conn.
-    if (c->srv && c->srv->pending_fwd_used > 0) {
-        int remaining = c->srv->pending_fwd_used;
-        for (int i = 0; i < PENDING_FWD_SLOTS && remaining > 0; i++) {
-            if (!c->srv->pending_fwd[i].conn)
-                continue;
-            remaining--;
-            if (c->srv->pending_fwd[i].conn == c) {
-                c->srv->pending_fwd[i].conn = NULL;
-                c->srv->pending_fwd[i].seq = 0;
-                c->srv->pending_fwd_used--;
-            }
-        }
-    }
-
     job_free(c->in_job);
 
     /* was this a peek or stats command? */
@@ -273,10 +284,8 @@ connclose(Conn *c)
     if (has_reserved_job(c))
         enqueue_reserved_jobs(c);
 
-    if (c->watch) {
-        c->watch->watching_ct--;
-        TUBE_ASSIGN(c->watch, NULL);
-    }
+    ms_clear(&c->watch); // on_watch_remove callback: watching_ct-- + tube_dref
+
     if (c->use) {
         c->use->using_ct--;
         TUBE_ASSIGN(c->use, NULL);

@@ -5,14 +5,6 @@
 
 static uint64 next_id = 1;
 
-void
-job_init_id(int worker_id, int nworkers)
-{
-    if (nworkers > 1) {
-        next_id = (uint64)worker_id + 1;
-    }
-}
-
 // Size-classed free list for O(1) job reuse across varied body sizes.
 // Jobs are allocated at power-of-2 boundaries (64, 128, ..., 65536).
 // Any body_size within a class reuses entries from that class.
@@ -203,21 +195,10 @@ make_job_with_id(uint32 pri, int64 delay, int64 ttr,
 
     if (unlikely(id)) {
         j->r.id = id;
-        // Advance next_id past recovered ID, maintaining interleaving stride.
-        int step = srv.nworkers > 1 ? srv.nworkers : 1;
-        if (id >= next_id) {
-            // Round up to next valid ID for this worker.
-            uint64 base = (srv.worker_id >= 0 ? srv.worker_id : 0) + 1;
-            next_id = id + step - ((id - base) % step);
-            if (next_id <= id) next_id = id + step; // overflow guard
-        }
-        if (!next_id) next_id = (srv.worker_id >= 0 ? srv.worker_id : 0) + 1;
+        if (id >= next_id)
+            next_id = id + 1;
     } else {
-        j->r.id = next_id;
-        // Interleaved IDs: worker K gets K+1, K+N+1, K+2N+1, ...
-        int step = srv.nworkers > 1 ? srv.nworkers : 1;
-        next_id += step;
-        if (!next_id) next_id = (srv.worker_id >= 0 ? srv.worker_id : 0) + 1;
+        j->r.id = next_id++;
     }
     j->r.pri = pri;
     j->r.delay = delay;

@@ -8,7 +8,6 @@
 #include <string.h>
 #include <errno.h>
 #include <dirent.h>
-#include <sys/uio.h>
 #include <sys/stat.h>
 #include <limits.h>
 #include <pthread.h>
@@ -23,11 +22,10 @@ durable_fsync(int fd)
     return fdatasync(fd);
 }
 
-// --- Per-Wal async fsync thread ---
+// --- Async fsync thread ---
 //
 // Moves fsync() off the event loop thread. Main thread passes a dup()'d fd;
-// the thread owns and closes it after fsync. Per-Wal state (not static globals)
-// allows multiple independent fsync threads for WAL sharding.
+// the thread owns and closes it after fsync.
 //
 // Thread safety contract:
 //   w->sync_fd, w->sync_stop, w->sync_err — shared, protected by w->sync_mu

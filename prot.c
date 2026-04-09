@@ -26,131 +26,7 @@ size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
 
 int64 mem_trim_rate = 60000000000LL; /* 60 seconds in nanoseconds */
 
-// shard_wal returns the WAL instance for a job based on its tube name.
-// With sharding enabled, jobs are distributed across per-CPU WAL instances
-// by tube name hash, parallelizing disk I/O (writes + fsync).
-// Falls back to the single legacy WAL when sharding is not active.
-static inline Wal *
-shard_wal(Server *s, Job *j)
-{
-    if (s->nshards > 0 && s->shards && j->tube) {
-        return &s->shards[j->tube->shard];
-    }
-    return &s->wal;
-}
-
 static void epollq_add(Conn *c, char rw);
-
-// Allocate a pending forward slot and return its sequence number.
-// Uses hash-based indexing: seq & PENDING_FWD_MASK with linear probing.
-// Returns 0 if no slot available (all busy).
-static uint32
-pending_fwd_alloc(Server *s, Conn *c)
-{
-    uint32 seq = ++s->pending_fwd_seq;
-    if (!seq) seq = ++s->pending_fwd_seq; // skip 0
-    int base = seq & PENDING_FWD_MASK;
-    for (int probe = 0; probe < PENDING_FWD_SLOTS; probe++) {
-        int i = (base + probe) & PENDING_FWD_MASK;
-        if (!s->pending_fwd[i].conn) {
-            s->pending_fwd[i].conn = c;
-            s->pending_fwd[i].gen = c->gen;
-            s->pending_fwd[i].seq = seq;
-            s->pending_fwd[i].at = now;
-            s->pending_fwd_used++;
-            return seq;
-        }
-    }
-    return 0;
-}
-
-// Look up a pending forward slot by sequence number.
-// Returns the slot index, or -1 if not found.
-int
-pending_fwd_find(Server *s, uint32 seq)
-{
-    if (!seq) return -1;
-    int base = seq & PENDING_FWD_MASK;
-    for (int probe = 0; probe < PENDING_FWD_SLOTS; probe++) {
-        int i = (base + probe) & PENDING_FWD_MASK;
-        if (s->pending_fwd[i].seq == seq && s->pending_fwd[i].conn)
-            return i;
-        if (!s->pending_fwd[i].conn && !s->pending_fwd[i].seq)
-            return -1; // empty slot — not found
-    }
-    return -1;
-}
-
-// Forward the current command to the worker that owns job_id.
-// Returns 1 if forwarded (caller should return), 0 if local or forwarding failed.
-static int
-try_forward_job_cmd(Conn *c, uint64 job_id)
-{
-    Server *s = c->srv;
-    if (s->nworkers <= 1)
-        return 0;
-    int target = (int)((job_id - 1) % s->nworkers);
-    if (target == s->worker_id || s->peer_fd[target] < 0)
-        return 0;
-    uint32 seq = pending_fwd_alloc(s, c);
-    if (!seq) return 0;
-    struct CmdFwdMsg fwd;
-    fwd.magic = CMD_FWD_MAGIC;
-    fwd.from_worker = s->worker_id;
-    fwd.seq = seq;
-    fwd.cmd_len = c->cmd_len;
-    memcpy(fwd.cmd, c->cmd, c->cmd_len);
-    // Variable-length send: header + actual cmd bytes only.
-    size_t msg_len = offsetof(struct CmdFwdMsg, cmd) + c->cmd_len;
-    ssize_t wr = write(s->peer_fd[target], &fwd, msg_len);
-    if (wr != (ssize_t)msg_len) {
-        int idx = pending_fwd_find(s, seq);
-        if (idx >= 0) {
-            s->pending_fwd[idx].conn = NULL;
-            s->pending_fwd[idx].seq = 0;
-            s->pending_fwd_used--;
-        }
-        return 0;
-    }
-    c->fwd_pending = 1;
-    epollq_add(c, 0); // suspend until reply
-    return 1;
-}
-
-// Forward the current command to the worker owning the given tube hash.
-// Returns 1 if forwarded, 0 if local or failed.
-static int
-try_forward_tube_cmd(Conn *c, uint32 name_hash)
-{
-    Server *s = c->srv;
-    if (s->nworkers <= 1)
-        return 0;
-    int target = name_hash % s->nworkers;
-    if (target == s->worker_id || s->peer_fd[target] < 0)
-        return 0;
-    uint32 seq = pending_fwd_alloc(s, c);
-    if (!seq) return 0;
-    struct CmdFwdMsg fwd;
-    fwd.magic = CMD_FWD_MAGIC;
-    fwd.from_worker = s->worker_id;
-    fwd.seq = seq;
-    fwd.cmd_len = c->cmd_len;
-    memcpy(fwd.cmd, c->cmd, c->cmd_len);
-    size_t msg_len = offsetof(struct CmdFwdMsg, cmd) + c->cmd_len;
-    ssize_t wr = write(s->peer_fd[target], &fwd, msg_len);
-    if (wr != (ssize_t)msg_len) {
-        int idx = pending_fwd_find(s, seq);
-        if (idx >= 0) {
-            s->pending_fwd[idx].conn = NULL;
-            s->pending_fwd[idx].seq = 0;
-            s->pending_fwd_used--;
-        }
-        return 0;
-    }
-    c->fwd_pending = 1;
-    epollq_add(c, 0); // suspend until reply
-    return 1;
-}
 
 // Valid tube name characters (lookup table replaces strspn).
 static const char valid_name_char[256] __attribute__((aligned(64))) = {
@@ -233,7 +109,6 @@ static const char valid_name_char[256] __attribute__((aligned(64))) = {
 #define MSG_BURIED_FMT "BURIED %"PRIu64"\r\n"
 #define MSG_INSERTED_FMT "INSERTED %"PRIu64"\r\n"
 #define MSG_NOT_IGNORED "NOT_IGNORED\r\n"
-#define MSG_WATCHING_1  "WATCHING 1\r\n"
 
 #define MSG_OUT_OF_MEMORY "OUT_OF_MEMORY\r\n"
 #define MSG_INTERNAL_ERROR "INTERNAL_ERROR\r\n"
@@ -376,7 +251,6 @@ static uint64 ready_ct = 0;
 static uint64 delayed_ct = 0;
 static uint64 paused_ct = 0;
 static uint64 timeout_ct = 0;
-static int tubes_dirty = 1; // set when tube list changes, cleared after stats sync
 
 int64 now = 0;
 static uint64 op_ct[TOTAL_OPS] = {0};
@@ -493,7 +367,6 @@ prot_remove_tube(Tube *t)
         heapremove(&pause_tube_heap, t->pause_heap_index);
         t->in_pause_heap = 0;
     }
-    tubes_dirty = 1;
 }
 
 static Tube *default_tube;
@@ -777,6 +650,20 @@ reply_job_n(Conn *c, Job *j, const char *msg, int msglen)
 }
 #define reply_job(c, j, msg) reply_job_n(c, j, msg, sizeof(msg) - 1)
 
+// reply "WATCHING <count>\r\n" without vsnprintf.
+static void
+reply_watching(Conn *c, size_t count)
+{
+    char *end = c->reply_buf + LINE_BUF_SIZE;
+    *--end = '\n';
+    *--end = '\r';
+    char *p = u64toa(end, (uint64)count);
+    *--p = ' ';
+    p -= 8;
+    memcpy(p, "WATCHING", 8);
+    reply(c, p, (int)(c->reply_buf + LINE_BUF_SIZE - p), STATE_SEND_WORD);
+}
+
 // reply "KICKED <count>\r\n" without vsnprintf.
 static void
 reply_kicked(Conn *c, uint64 count)
@@ -830,22 +717,32 @@ remove_waiting_conn(Conn *c)
 
     c->type &= ~CONN_TYPE_WAITING;
     global_stat.waiting_ct--;
-    Tube *t = c->watch;
-    if (!t) return;
-    t->stat.waiting_ct--;
-    ms_remove_at(&t->waiting_conns, c->watch_idx, c);
+    for (size_t i = 0; i < c->watch.len; i++) {
+        Tube *t = c->watch.items[i];
+        t->stat.waiting_ct--;
+        ms_remove(&t->waiting_conns, c);
+    }
 }
 
 // enqueue_waiting_conn sets CONN_TYPE_WAITING for the connection,
-// adds it to the waiting_conns of the single watched tube.
+// adds it to the waiting_conns of every watched tube.
 static int
 enqueue_waiting_conn(Conn *c)
 {
-    Tube *t = c->watch;
-    if (!ms_append(&t->waiting_conns, c))
-        return 0;
-    c->watch_idx = t->waiting_conns.len - 1;
-    t->stat.waiting_ct++;
+    size_t i;
+    for (i = 0; i < c->watch.len; i++) {
+        Tube *t = c->watch.items[i];
+        if (!ms_append(&t->waiting_conns, c)) {
+            // OOM rollback: undo already-appended tubes.
+            for (size_t j = 0; j < i; j++) {
+                Tube *u = c->watch.items[j];
+                ms_remove(&u->waiting_conns, c);
+                u->stat.waiting_ct--;
+            }
+            return 0;
+        }
+        t->stat.waiting_ct++;
+    }
     c->type |= CONN_TYPE_WAITING;
     global_stat.waiting_ct++;
     return 1;
@@ -880,12 +777,17 @@ process_tube(Tube *t)
         }
         global_stat.reserved_ct++;
 
-        // Clear waiting state directly — ms_take already removed c
-        // from this tube's waiting_conns. Calling remove_waiting_conn()
-        // would try to remove c again (double-removal bug).
+        // ms_take already removed c from THIS tube's waiting_conns.
+        // Remove c from all OTHER watched tubes' waiting_conns too.
+        t->stat.waiting_ct--;
         c->type &= ~CONN_TYPE_WAITING;
         global_stat.waiting_ct--;
-        t->stat.waiting_ct--;
+        for (size_t i = 0; i < c->watch.len; i++) {
+            Tube *other = c->watch.items[i];
+            if (other == t) continue;
+            other->stat.waiting_ct--;
+            ms_remove(&other->waiting_conns, c);
+        }
 
         conn_reserve_job(c, j);
         reply_job(c, j, MSG_RESERVED);
@@ -912,7 +814,7 @@ __attribute__((hot)) static int
 enqueue_job(Server *s, Job *j, int64 delay, char update_store)
 {
     int r;
-    Wal *w = shard_wal(s, j);
+    Wal *w = &s->wal;
 
     // j->reserver is already NULL: new jobs from memset(0) in allocate_job,
     // re-enqueued jobs from remove_this_reserved_job.
@@ -967,7 +869,7 @@ enqueue_job(Server *s, Job *j, int64 delay, char update_store)
 __attribute__((cold)) static int
 bury_job(Server *s, Job *j, char update_store)
 {
-    Wal *w = shard_wal(s, j);
+    Wal *w = &s->wal;
     if (update_store) {
         int z = walresvupdate(w);
         if (!z)
@@ -1013,7 +915,7 @@ kick_buried_job(Server *s, Job *j)
 {
     int r;
     int z;
-    Wal *w = shard_wal(s, j);
+    Wal *w = &s->wal;
 
     z = walresvupdate(w);
     if (!z)
@@ -1041,7 +943,7 @@ kick_delayed_job(Server *s, Job *j)
 {
     int r;
     int z;
-    Wal *w = shard_wal(s, j);
+    Wal *w = &s->wal;
 
     z = walresvupdate(w);
     if (!z)
@@ -1376,71 +1278,12 @@ enqueue_incoming_job(Conn *c)
         reply_serr(c, MSG_INTERNAL_ERROR);
         return;
     }
-    Wal *put_wal = shard_wal(c->srv, j);
+    Wal *put_wal = &c->srv->wal;
     j->walresv = walresvput(put_wal, j);
     if (!j->walresv) {
         job_free(j);
         reply_serr(c, MSG_OUT_OF_MEMORY);
         return;
-    }
-
-    // In multi-worker mode, forward put to the tube's owner worker.
-    if (c->srv->nworkers > 1) {
-        int target = j->tube->owner;
-        if (target != c->srv->worker_id && c->srv->peer_fd[target] >= 0) {
-          if (j->r.body_size > PUT_FWD_MAX_BODY + 2) {
-            twarnx("put forwarding: body %d exceeds %d, enqueue local",
-                   j->r.body_size, PUT_FWD_MAX_BODY);
-          } else {
-            uint32 seq = pending_fwd_alloc(c->srv, c);
-            if (seq) {
-                // Header-only struct: body sent via iovec scatter-gather.
-                // Heap-allocated on first use to avoid 66KB static BSS
-                // that pollutes data cache in single-process mode.
-                static struct PutFwdMsg *pm;
-                if (!pm) {
-                    pm = malloc(sizeof(*pm));
-                    if (!pm) { twarnx("OOM"); goto fwd_undo; }
-                }
-                size_t hdr_size = offsetof(struct PutFwdMsg, body);
-                pm->magic = PUT_FWD_MAGIC;
-                pm->from_worker = c->srv->worker_id;
-                pm->seq = seq;
-                pm->pri = j->r.pri;
-                pm->delay = j->r.delay;
-                pm->ttr = j->r.ttr;
-                memcpy(pm->tube, j->tube->name, j->tube->name_len + 1);
-                pm->body_size = j->r.body_size;
-                // sendmsg with iovec avoids memcpy of body (up to 64KB).
-                struct iovec iov[2] = {
-                    { .iov_base = pm,      .iov_len = hdr_size },
-                    { .iov_base = j->body, .iov_len = j->r.body_size },
-                };
-                struct msghdr msg = {0};
-                msg.msg_iov = iov;
-                msg.msg_iovlen = 2;
-                ssize_t wr = sendmsg(c->srv->peer_fd[target], &msg, MSG_NOSIGNAL);
-                size_t msg_size = hdr_size + j->r.body_size;
-                if (wr == (ssize_t)msg_size) {
-                    walresvreturn(put_wal, j->walresv);
-                    j->walresv = 0;
-                    job_free(j);
-                    c->fwd_pending = 1;
-                    epollq_add(c, 0);
-                    return;
-                }
-                // Undo slot on failure.
-                fwd_undo: {
-                    int idx = pending_fwd_find(c->srv, seq);
-                    if (idx >= 0) {
-                        c->srv->pending_fwd[idx].conn = NULL;
-                        c->srv->pending_fwd[idx].seq = 0;
-                        c->srv->pending_fwd_used--;
-                    }
-                }
-            }
-          }
-        }
     }
 
     /* we have a complete job, so let's stick it in the pqueue */
@@ -1481,12 +1324,6 @@ fmt_stats(char *buf, size_t size, void *x)
         wcur = s->wal.cur->seq;
     }
 
-    for (int i = 0; i < s->nshards; i++) {
-        total_nmig += s->shards[i].nmig;
-        total_nrec += s->shards[i].nrec;
-    }
-
-    // In multi-worker mode, aggregate stats from all workers via shared memory.
     uint64 agg_urgent = global_stat.urgent_ct;
     uint64 agg_ready = ready_ct;
     uint64 agg_reserved = global_stat.reserved_ct;
@@ -1503,75 +1340,6 @@ fmt_stats(char *buf, size_t size, void *x)
     uint agg_workers = count_cur_workers();
     uint agg_tot_conns = count_tot_conns();
     size_t agg_tubes = tubes.len;
-
-    if (shared_stats && s->nworkers > 1) {
-        // Sum stats from ALL workers (including self via shared_stats).
-        agg_urgent = 0; agg_ready = 0; agg_reserved = 0;
-        agg_delayed = 0; agg_buried = 0; agg_waiting = 0;
-        agg_timeout = 0; agg_total_jobs = 0;
-        agg_conns = 0; agg_producers = 0; agg_workers = 0;
-        agg_tot_conns = 0; agg_tubes = 0;
-        for (int i = 0; i < TOTAL_OPS; i++)
-            agg_op[i] = 0;
-
-        for (int w = 0; w < s->nworkers; w++) {
-            struct SharedStats *ss = &shared_stats[w];
-            // Seqlock read: snapshot counters, retry if writer was active.
-            uint32 v1, v2;
-            uint64 su, sr, sres, sd, sb, sw2, sto, stj;
-            uint32 scc, scp, scw, stc;
-            uint64 sop[SHARED_STATS_OPS];
-            do {
-                v1 = __atomic_load_n(&ss->version, __ATOMIC_ACQUIRE);
-                su = ss->urgent_ct; sr = ss->ready_ct;
-                sres = ss->reserved_ct; sd = ss->delayed_ct;
-                sb = ss->buried_ct; sw2 = ss->waiting_ct;
-                sto = ss->timeout_ct; stj = ss->total_jobs_ct;
-                scc = ss->cur_conn_ct; scp = ss->cur_producer_ct;
-                scw = ss->cur_worker_ct; stc = ss->tot_conn_ct;
-                for (int i = 0; i < TOTAL_OPS && i < SHARED_STATS_OPS; i++)
-                    sop[i] = ss->op_ct[i];
-                v2 = __atomic_load_n(&ss->version, __ATOMIC_ACQUIRE);
-            } while ((v1 & 1) || v1 != v2);
-            agg_urgent += su; agg_ready += sr;
-            agg_reserved += sres; agg_delayed += sd;
-            agg_buried += sb; agg_waiting += sw2;
-            agg_timeout += sto; agg_total_jobs += stj;
-            agg_conns += scc; agg_producers += scp;
-            agg_workers += scw; agg_tot_conns += stc;
-            for (int i = 0; i < TOTAL_OPS && i < SHARED_STATS_OPS; i++)
-                agg_op[i] += sop[i];
-        }
-        // Deduplicate tube count across workers using open-addressed hash set.
-        // O(W*T) expected with O(1) per probe. Hash-first filter skips strcmp.
-        #define SEEN_CAP 2048  // power of 2, > SHARED_MAX_TUBES
-        #define SEEN_MASK (SEEN_CAP - 1)
-        static const char *seen_name[SEEN_CAP];
-        static uint32 seen_hash[SEEN_CAP];
-        memset(seen_name, 0, sizeof(seen_name));
-        int nseen = 0;
-        for (int w = 0; w < s->nworkers; w++) {
-            struct SharedStats *ss2 = &shared_stats[w];
-            for (uint32 ti = 0; ti < ss2->tube_count; ti++) {
-                const char *tname = ss2->tube_names[ti];
-                uint32 h = tube_name_hash(tname);
-                for (int probe = 0; probe < SEEN_CAP; probe++) {
-                    int idx = (h + probe) & SEEN_MASK;
-                    if (!seen_name[idx]) {
-                        seen_name[idx] = tname;
-                        seen_hash[idx] = h;
-                        nseen++;
-                        break;
-                    }
-                    if (seen_hash[idx] == h && strcmp(seen_name[idx], tname) == 0)
-                        break;
-                }
-            }
-        }
-        #undef SEEN_CAP
-        #undef SEEN_MASK
-        agg_tubes = nseen;
-    }
 
     // Cache rusage: refresh at most once per 100ms to avoid syscall per stats.
     static struct rusage cached_ru;
@@ -2055,7 +1823,6 @@ dispatch_cmd(Conn *c)
         }
 
         if (!j) {
-            if (try_forward_tube_cmd(c, c->use->name_hash)) return;
             reply_msg(c, MSG_NOTFOUND);
             return;
         }
@@ -2074,7 +1841,6 @@ dispatch_cmd(Conn *c)
         }
 
         if (!j) {
-            if (try_forward_tube_cmd(c, c->use->name_hash)) return;
             reply_msg(c, MSG_NOTFOUND);
             return;
         }
@@ -2095,7 +1861,6 @@ dispatch_cmd(Conn *c)
             j = NULL;
 
         if (!j) {
-            if (try_forward_tube_cmd(c, c->use->name_hash)) return;
             reply_msg(c, MSG_NOTFOUND);
             return;
         }
@@ -2115,7 +1880,6 @@ dispatch_cmd(Conn *c)
         j = job_copy(job_find(id));
 
         if (!j) {
-            if (try_forward_job_cmd(c, id)) return;
             reply_msg(c, MSG_NOTFOUND);
             return;
         }
@@ -2146,21 +1910,26 @@ dispatch_cmd(Conn *c)
             return;
         }
 
-        /* Fast path: if tube has a ready job, reserve directly without
-         * enqueueing into waiting_conns (saves ms_append+ms_take round-trip). */
-        if (likely(c->watch->ready.len > 0) && !c->watch->pause) {
-            j = remove_ready_job(c->watch->ready.data[0]);
-            if (likely(j)) {
-                global_stat.reserved_ct++;
-                conn_reserve_job(c, j);
-                reply_job(c, j, MSG_RESERVED);
-                return;
+        /* Fast path: scan watched tubes for a ready job. */
+        for (size_t wi = 0; wi < c->watch.len; wi++) {
+            Tube *wt = c->watch.items[wi];
+            if (wt->ready.len > 0 && !wt->pause) {
+                j = remove_ready_job(wt->ready.data[0]);
+                if (likely(j)) {
+                    global_stat.reserved_ct++;
+                    conn_reserve_job(c, j);
+                    reply_job(c, j, MSG_RESERVED);
+                    return;
+                }
             }
         }
 
         /* Slow path: no ready job, enqueue and wait. */
         wait_for_job(c, timeout);
-        process_tube(c->watch);
+        for (size_t wi = 0; wi < c->watch.len; wi++) {
+            if (!conn_waiting(c)) break;
+            process_tube(c->watch.items[wi]);
+        }
         return;
 
     case OP_RESERVE_JOB:
@@ -2223,7 +1992,6 @@ dispatch_cmd(Conn *c)
         }
 
         if (!j) {
-            if (try_forward_job_cmd(c, id)) return;
             reply_msg(c, MSG_NOTFOUND);
             return;
         }
@@ -2232,7 +2000,7 @@ dispatch_cmd(Conn *c)
 
         j->r.state = Invalid;
         {
-            Wal *w = shard_wal(c->srv, j);
+            Wal *w = &c->srv->wal;
             r = walwrite(w, j);
             if (r && !walmaint(w)) {
                 twarnx("walmaint failed after delete walwrite");
@@ -2268,7 +2036,7 @@ dispatch_cmd(Conn *c)
         int z = 0;
         Wal *release_wal = NULL;
         if (delay) {
-            release_wal = shard_wal(c->srv, j);
+            release_wal = &c->srv->wal;
             z = walresvupdate(release_wal);
             if (!z) {
                 /* Undo remove_reserved_job: restore counters and re-link. */
@@ -2350,7 +2118,6 @@ dispatch_cmd(Conn *c)
         op_ct[type]++;
 
         i = kick_jobs(c->srv, c->use, count);
-        if (i == 0 && try_forward_tube_cmd(c, c->use->name_hash)) return;
         reply_kicked(c, (uint64)i);
         return;
 
@@ -2364,7 +2131,6 @@ dispatch_cmd(Conn *c)
 
         j = job_find(id);
         if (!j) {
-            if (try_forward_job_cmd(c, id)) return;
             reply_msg(c, MSG_NOTFOUND);
             return;
         }
@@ -2411,7 +2177,6 @@ dispatch_cmd(Conn *c)
 
         j = job_find(id);
         if (!j) {
-            if (try_forward_job_cmd(c, id)) return;
             reply_msg(c, MSG_NOTFOUND);
             return;
         }
@@ -2433,16 +2198,8 @@ dispatch_cmd(Conn *c)
         }
         op_ct[type]++;
 
-        uint32 sth = tube_name_hash(name);
-        t = tube_find_name_h(name, namelen, sth);
+        t = tube_find_name(name, namelen);
         if (!t) {
-            // In multi-worker mode, forward to the worker that owns this tube.
-            if (c->srv->nworkers > 1) {
-                int target = sth % c->srv->nworkers;
-                if (target != c->srv->worker_id && c->srv->peer_fd[target] >= 0) {
-                    if (try_forward_tube_cmd(c, sth)) return;
-                }
-            }
             reply_msg(c, MSG_NOTFOUND);
             return;
         }
@@ -2459,63 +2216,7 @@ dispatch_cmd(Conn *c)
         }
         op_ct[type]++;
 
-        // In multi-worker mode, build YAML from all workers' tube names
-        // via shared memory. Avoids creating phantom tube objects.
-        if (shared_stats && c->srv->nworkers > 1) {
-            // Collect unique tube names using open-addressed hash dedup.
-            #define LT_CAP 2048
-            #define LT_MASK (LT_CAP - 1)
-            static const char *lt_set[LT_CAP];
-            memset(lt_set, 0, sizeof(lt_set));
-            const char *names[SHARED_MAX_TUBES];
-            int count = 0;
-            for (int w = 0; w < c->srv->nworkers; w++) {
-                struct SharedStats *ss = &shared_stats[w];
-                for (uint32 ti = 0; ti < ss->tube_count && count < SHARED_MAX_TUBES; ti++) {
-                    const char *name = ss->tube_names[ti];
-                    uint32 h = tube_name_hash(name);
-                    int dup = 0;
-                    for (int probe = 0; probe < LT_CAP; probe++) {
-                        int idx = (h + probe) & LT_MASK;
-                        if (!lt_set[idx]) {
-                            lt_set[idx] = name;
-                            names[count++] = name;
-                            break;
-                        }
-                        if (strcmp(lt_set[idx], name) == 0) {
-                            dup = 1;
-                            break;
-                        }
-                    }
-                    (void)dup;
-                }
-            }
-            #undef LT_CAP
-            #undef LT_MASK
-            // Format YAML manually.
-            size_t maxsz = 6 + count * (3 + MAX_TUBE_NAME_LEN);
-            c->out_job = allocate_job(maxsz);
-            if (!c->out_job) {
-                reply_serr(c, MSG_OUT_OF_MEMORY);
-                return;
-            }
-            c->out_job->r.state = Copy;
-            char *buf = c->out_job->body;
-            memcpy(buf, "---\n", 4); buf += 4;
-            for (int i = 0; i < count; i++) {
-                *buf++ = '-'; *buf++ = ' ';
-                size_t nl = strlen(names[i]);
-                memcpy(buf, names[i], nl); buf += nl;
-                *buf++ = '\n';
-            }
-            size_t body_z = buf - c->out_job->body;
-            memcpy(buf, "\r\n", 2);
-            c->out_job->r.body_size = body_z + 2;
-            c->out_job_sent = 0;
-            reply_ok_size(c, (uint64)body_z);
-        } else {
-            do_list_tubes(c, &tubes);
-        }
+        do_list_tubes(c, &tubes);
         return;
 
     case OP_LIST_TUBE_USED:
@@ -2535,24 +2236,7 @@ dispatch_cmd(Conn *c)
             return;
         }
         op_ct[type]++;
-        {
-            // Format: "---\n- <name>\n\r\n"
-            size_t nl = c->watch->name_len;
-            size_t body_z = 4 + 2 + nl + 1; // "---\n" + "- " + name + "\n"
-            c->out_job = allocate_job(body_z + 2); // +2 for "\r\n"
-            if (!c->out_job) {
-                reply_serr(c, MSG_OUT_OF_MEMORY);
-                return;
-            }
-            c->out_job->r.state = Copy;
-            char *buf = c->out_job->body;
-            memcpy(buf, "---\n- ", 6); buf += 6;
-            memcpy(buf, c->watch->name, nl); buf += nl;
-            *buf++ = '\n';
-            memcpy(buf, "\r\n", 2);
-            c->out_job_sent = 0;
-            reply_ok_size(c, (uint64)body_z);
-        }
+        do_list_tubes(c, &c->watch);
         return;
 
     case OP_USE: {
@@ -2564,7 +2248,6 @@ dispatch_cmd(Conn *c)
         }
         op_ct[type]++;
 
-        // use is always local — no migration. Put forwarding handles remote tubes.
         TUBE_ASSIGN(t, tube_find_or_make_n(name, use_namelen));
         if (!t) {
             reply_serr(c, MSG_OUT_OF_MEMORY);
@@ -2590,63 +2273,27 @@ dispatch_cmd(Conn *c)
         }
         op_ct[type]++;
 
-        // In multi-worker mode, check if this tube belongs to another worker.
-        if (c->srv->nworkers > 1) {
-            int target = tube_name_hash(name) % c->srv->nworkers;
-            if (target != c->srv->worker_id && c->srv->peer_fd[target] >= 0) {
-                // Cannot migrate if connection has reserved jobs.
-                if (!job_list_is_empty(&c->reserved_jobs))
-                    goto watch_local;
-
-                // Prepare migration message with pending reply.
-                struct MigMsg mm = {0};
-                mm.magic = MIG_MSG_MAGIC;
-                memcpy(mm.watch_tube, name, watch_namelen);
-                memcpy(mm.use_tube, c->use->name, c->use->name_len);
-                mm.type = c->type;
-
-                // Include pending reply so client sees WATCHING 1.
-                memcpy(mm.pending_reply, "WATCHING 1\r\n", 12);
-                mm.pending_reply_len = 12;
-
-                // Copy any pipelined data remaining in cmd buffer.
-                size_t consumed = c->cmd_len;
-                size_t leftover = c->cmd_read > consumed ? c->cmd_read - consumed : 0;
-                if (leftover > 0 && leftover <= sizeof(mm.cmd)) {
-                    memcpy(mm.cmd, c->cmd + consumed, leftover);
-                    mm.cmd_len = leftover;
-                }
-
-                if (send_fd(c->srv->peer_fd[target], c->sock.fd, &mm, sizeof(mm)) == 0) {
-                    sockwant(&c->sock, 0); // deregister from epoll before giving away fd
-                    c->sock.fd = -1;
-                    remove_waiting_conn(c);
-                    c->state = STATE_CLOSE;
-                    return;
-                }
-                // send_fd failed — fall through to local handling.
-            }
-        }
-
-watch_local:
         TUBE_ASSIGN(t, tube_find_or_make_n(name, watch_namelen));
         if (!t) {
             reply_serr(c, MSG_OUT_OF_MEMORY);
             return;
         }
 
-        if (c->watch != t) {
-            if (verbose && strcmp(c->watch->name, "default") != 0)
-                printf("watch %d: %s → %s (single-tube mode)\n",
-                       c->sock.fd, c->watch->name, t->name);
-            remove_waiting_conn(c);
-            c->watch->watching_ct--;
-            TUBE_ASSIGN(c->watch, t);
-            c->watch->watching_ct++;
+        if (!ms_contains(&c->watch, t)) {
+            if (conn_waiting(c))
+                remove_waiting_conn(c);
+            if (!ms_append(&c->watch, t)) {
+                TUBE_ASSIGN(t, NULL);
+                reply_serr(c, MSG_OUT_OF_MEMORY);
+                return;
+            }
+            // on_watch_insert callback handles iref + watching_ct++
+            if (conn_waiting(c))
+                enqueue_waiting_conn(c);
         }
 
         TUBE_ASSIGN(t, NULL);
-        reply_msg(c, MSG_WATCHING_1);
+        reply_watching(c, c->watch.len);
         return;
     }
 
@@ -2658,13 +2305,21 @@ watch_local:
         }
         op_ct[type]++;
 
-        // Cannot ignore the only watched tube.
-        if (c->watch && strncmp(c->watch->name, name, MAX_TUBE_NAME_LEN) == 0) {
+        if (c->watch.len <= 1) {
             reply_msg(c, MSG_NOT_IGNORED);
             return;
         }
-        // Tube not watched — no-op.
-        reply_msg(c, MSG_WATCHING_1);
+
+        t = tube_find(&c->watch, name);
+        if (t) {
+            if (conn_waiting(c)) {
+                t->stat.waiting_ct--;
+                ms_remove(&t->waiting_conns, c);
+            }
+            ms_remove(&c->watch, t);
+            // on_watch_remove callback handles watching_ct-- + tube_dref
+        }
+        reply_watching(c, c->watch.len);
         return;
 
     case OP_QUIT:
@@ -2686,16 +2341,8 @@ watch_local:
             reply_msg(c, MSG_BAD_FORMAT);
             return;
         }
-        uint32 pth = tube_name_hash(name);
-        t = tube_find_name_h(name, namelen, pth);
+        t = tube_find_name(name, namelen);
         if (!t) {
-            // In multi-worker mode, forward to the owner worker.
-            if (c->srv->nworkers > 1) {
-                int target = pth % c->srv->nworkers;
-                if (target != c->srv->worker_id && c->srv->peer_fd[target] >= 0) {
-                    if (try_forward_tube_cmd(c, pth)) return;
-                }
-            }
             reply_msg(c, MSG_NOTFOUND);
             return;
         }
@@ -2809,9 +2456,6 @@ conn_process_io(Conn *c)
 
     switch (c->state) {
     case STATE_WANT_COMMAND: {
-        // Don't read more data while waiting for forwarded reply.
-        if (unlikely(c->fwd_pending))
-            return;
         size_t prev_read = c->cmd_read;
         r = read(c->sock.fd, c->cmd + c->cmd_read, LINE_BUF_SIZE - c->cmd_read);
         if (unlikely(r == -1)) {
@@ -3015,7 +2659,7 @@ h_conn(const int fd, const short which, Conn *c)
     // Dispatch pipelined commands. Cork only if pipelining detected (multiple
     // commands buffered), saving 2 setsockopt syscalls for non-pipelined case.
     int corked = 0;
-    while (cmd_data_ready(c) && !c->fwd_pending
+    while (cmd_data_ready(c)
            && (c->cmd_len || (c->cmd_len = scan_line_end(c->cmd, c->cmd_read, 0)))) {
         if (!corked && c->cmd_read > c->cmd_len) {
             int cork = 1;
@@ -3112,91 +2756,9 @@ prottick(Server *s)
         }
     }
 
-    // Timeout forwarded commands (5s). Prevents client hanging if peer is dead.
-    if (s->pending_fwd_used > 0) {
-        int remaining = s->pending_fwd_used;
-        for (int i = 0; i < PENDING_FWD_SLOTS && remaining > 0; i++) {
-            if (!s->pending_fwd[i].conn)
-                continue;
-            remaining--;
-            if (now - s->pending_fwd[i].at > 5000000000LL) {
-                Conn *pc = s->pending_fwd[i].conn;
-                if (pc->gen == s->pending_fwd[i].gen && pc->sock.fd >= 0) {
-                    pc->fwd_pending = 0;
-                    if (write(pc->sock.fd, "NOT_FOUND\r\n", 11) <= 0) {
-                        sockwant(&pc->sock, 0);
-                    } else {
-                        sockwant(&pc->sock, 'r');
-                        if (pc->cmd_read > 0)
-                            pc->sock.f(pc->sock.x, 'r');
-                    }
-                }
-                s->pending_fwd[i].conn = NULL;
-                s->pending_fwd[i].seq = 0;
-                s->pending_fwd_used--;
-            }
-        }
-    }
-
-    // Publish stats to shared memory (1Hz) with seqlock for torn-read protection.
-    if (shared_stats && s->worker_id >= 0) {
-        static int64 last_stats_sync;
-        if (now - last_stats_sync >= 1000000000LL) { // 1 second
-            last_stats_sync = now;
-            struct SharedStats *ss = &shared_stats[s->worker_id];
-            __atomic_add_fetch(&ss->version, 1, __ATOMIC_RELEASE); // odd = writing
-            ss->ready_ct = ready_ct;
-            ss->delayed_ct = delayed_ct;
-            ss->buried_ct = global_stat.buried_ct;
-            ss->reserved_ct = global_stat.reserved_ct;
-            ss->urgent_ct = global_stat.urgent_ct;
-            ss->waiting_ct = global_stat.waiting_ct;
-            ss->timeout_ct = timeout_ct;
-            ss->total_jobs_ct = global_stat.total_jobs_ct;
-            ss->cur_conn_ct = count_cur_conns();
-            ss->cur_producer_ct = count_cur_producers();
-            ss->cur_worker_ct = count_cur_workers();
-            ss->tot_conn_ct = count_tot_conns();
-            if (tubes_dirty || ss->tube_count != (tubes.len < SHARED_MAX_TUBES ? tubes.len : SHARED_MAX_TUBES)) {
-                ss->tube_count = tubes.len < SHARED_MAX_TUBES ? tubes.len : SHARED_MAX_TUBES;
-                for (size_t ti = 0; ti < ss->tube_count; ti++) {
-                    Tube *tt = tubes.items[ti];
-                    memcpy(ss->tube_names[ti], tt->name, tt->name_len + 1);
-                }
-                tubes_dirty = 0;
-            }
-            for (int i = 0; i < TOTAL_OPS && i < SHARED_STATS_OPS; i++)
-                ss->op_ct[i] = op_ct[i];
-            __atomic_add_fetch(&ss->version, 1, __ATOMIC_RELEASE); // even = done
-        }
-    }
-
     epollq_apply();
 
     return period;
-}
-
-// Try to extract tube name from a command buffer.
-// Returns pointer to tube name within buf (NUL-terminated in place), or NULL.
-static char *
-parse_tube_from_first_cmd(char *buf, size_t len)
-{
-    // Find \r\n to ensure we have a complete command.
-    size_t i;
-    for (i = 1; i < len; i++) {
-        if (buf[i-1] == '\r' && buf[i] == '\n')
-            break;
-    }
-    if (i >= len)
-        return NULL; // incomplete command
-
-    buf[i-1] = '\0'; // NUL-terminate command (overwrite \r)
-
-    // Only watch triggers accept-time migration.
-    // use is local — put forwarding handles remote tubes.
-    if (strncmp(buf, CMD_WATCH, CMD_WATCH_LEN) == 0)
-        return buf + CMD_WATCH_LEN;
-    return NULL;
 }
 
 void
@@ -3206,8 +2768,6 @@ h_accept(const int fd, const short which, Server *s)
     struct sockaddr_storage addr;
 
     // Drain all pending connections from the accept queue.
-    // With level-triggered epoll each pending conn would otherwise
-    // cost a full epoll_wait + prottick round-trip.
     for (;;) {
         socklen_t addrlen = sizeof addr;
         int cfd = accept4(fd, (struct sockaddr *)&addr, &addrlen, SOCK_NONBLOCK|SOCK_CLOEXEC);
@@ -3228,67 +2788,7 @@ h_accept(const int fd, const short which, Server *s)
         setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &flags, sizeof flags);
         setsockopt(cfd, IPPROTO_TCP, TCP_QUICKACK, &flags, sizeof flags);
 
-        // In multi-worker mode, speculatively read the first command
-        // to determine which worker should own this connection.
-        char first_buf[LINE_BUF_SIZE];
-        ssize_t nr = 0;
-        char *tube_name = NULL;
-
-        if (s->nworkers > 1) {
-            nr = read(cfd, first_buf, sizeof(first_buf) - 1);
-            if (nr > 0) {
-                first_buf[nr] = '\0';
-                // Parse in-place, then restore the \r that was overwritten.
-                tube_name = parse_tube_from_first_cmd(first_buf, nr);
-                // Restore \r: parse_tube_from_first_cmd replaced \r with \0.
-                for (ssize_t ri = 0; ri < nr - 1; ri++) {
-                    if (first_buf[ri] == '\0' && first_buf[ri+1] == '\n') {
-                        first_buf[ri] = '\r';
-                        break;
-                    }
-                }
-
-                if (tube_name && is_valid_tube(tube_name, MAX_TUBE_NAME_LEN - 1)) {
-                    size_t tnlen = strlen(tube_name);
-                    int target = tube_name_hash(tube_name) % s->nworkers;
-                    if (target != s->worker_id && s->peer_fd[target] >= 0) {
-                        // Migrate fd to the correct worker.
-                        struct MigMsg mm = {0};
-                        mm.magic = MIG_MSG_MAGIC;
-                        memcpy(mm.watch_tube, tube_name, tnlen);
-                        memcpy(mm.use_tube, "default", 7);
-                        memcpy(mm.cmd, first_buf, nr);
-                        mm.cmd_len = nr;
-                        if (send_fd(s->peer_fd[target], cfd, &mm, sizeof(mm)) == 0) {
-                            close(cfd);
-                            continue;
-                        }
-                        // send_fd failed — fall through to local handling.
-                    }
-                }
-            }
-            // nr <= 0 or tube not parsed or target == self: handle locally.
-        }
-
-        // Route "default" tube connections deterministically to one worker.
-        if (s->nworkers > 1 && nr <= 0) {
-            int dtarget = tube_name_hash("default") % s->nworkers;
-            if (dtarget != s->worker_id && s->peer_fd[dtarget] >= 0) {
-                struct MigMsg mm = {0};
-                mm.magic = MIG_MSG_MAGIC;
-                memcpy(mm.watch_tube, "default", 7);
-                memcpy(mm.use_tube, "default", 7);
-                if (send_fd(s->peer_fd[dtarget], cfd, &mm, sizeof(mm)) == 0) {
-                    close(cfd);
-                    continue;
-                }
-            }
-        }
-
-        Tube *use_tube = default_tube;
-        Tube *watch_tube = default_tube;
-
-        Conn *c = make_conn(cfd, STATE_WANT_COMMAND, use_tube, watch_tube);
+        Conn *c = make_conn(cfd, STATE_WANT_COMMAND, default_tube, default_tube);
         if (!c) {
             twarnx("make_conn() failed");
             close(cfd);
@@ -3302,376 +2802,11 @@ h_accept(const int fd, const short which, Server *s)
         c->sock.f = (Handle)prothandle;
         c->sock.fd = cfd;
 
-        // If we already read data, copy it into the connection's cmd buffer
-        // Replay pre-read data — kernel buffer is already drained.
-        if (nr > 0) {
-            size_t to_copy = (size_t)nr < sizeof(c->cmd) ? (size_t)nr : sizeof(c->cmd);
-            memcpy(c->cmd, first_buf, to_copy);
-            c->cmd_read = to_copy;
-
-            // Dispatch loop matching h_conn's pipeline processing.
-            while (c->state == STATE_WANT_COMMAND && c->cmd_read > 0
-                   && !c->fwd_pending
-                   && (c->cmd_len = scan_line_end(c->cmd, c->cmd_read, 0))) {
-                dispatch_cmd(c);
-                if (c->sock.fd < 0) break;
-                fill_extra_data(c);
-            }
-            if (c->sock.fd < 0 || c->state == STATE_CLOSE) {
-                connclose(c);
-                continue;
-            }
-        }
-
         if (sockwant(&c->sock, 'r') == -1) {
             twarn("sockwant");
             connclose(c);
             continue;
         }
-    }
-    epollq_apply();
-}
-
-// Handle a forwarded command from a peer worker.
-// Executes stats-tube or pause-tube locally, sends reply back via peer socket.
-void
-prot_handle_forwarded_cmd(Server *s, struct CmdFwdMsg *fwd)
-{
-    struct CmdReplyMsg rpl;
-    rpl.magic = CMD_REPLY_MAGIC;
-    rpl.seq = fwd->seq;
-    rpl.data_len = 0;
-
-    // Parse the forwarded command.
-    char *cmd = fwd->cmd;
-    size_t len = fwd->cmd_len;
-
-    // NUL-terminate for string ops.
-    if (unlikely(len >= LINE_BUF_SIZE)) {
-        twarnx("forwarded cmd truncated: %zu >= %d", len, LINE_BUF_SIZE);
-        len = LINE_BUF_SIZE - 1;
-    }
-    cmd[len] = '\0';
-
-    if (strncmp(cmd, "stats-tube ", 11) == 0) {
-        char *name = cmd + 11;
-        // Strip \r\n
-        size_t nl = strlen(name);
-        if (nl >= 2 && name[nl-2] == '\r') { name[nl-2] = '\0'; nl -= 2; }
-
-        Tube *t = tube_find_name(name, nl);
-        if (t) {
-            char buf[STATS_BUF_SIZE];
-            int n = fmt_stats_tube(buf, sizeof(buf), t);
-            if (n > 0 && n < CMD_FWD_REPLY_SIZE - 32) {
-                // fmt_stats_tube output already ends with \r\n.
-                rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE,
-                    "OK %d\r\n%s", n, buf);
-            }
-        } else {
-            rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE, "NOT_FOUND\r\n");
-        }
-    } else if (strncmp(cmd, "pause-tube ", 11) == 0) {
-        // Parse: pause-tube <name> <delay>\r\n
-        char *name = cmd + 11;
-        char *sp = strchr(name, ' ');
-        if (sp) {
-            *sp = '\0';
-            char *delay_str = sp + 1;
-            Tube *t = tube_find_name(name, sp - name);
-            if (t) {
-                // Parse delay and apply pause.
-                int64 delay = 0;
-                if (read_duration(&delay, delay_str, NULL) == 0) {
-                    if (delay == 0) delay = 1;
-                    t->unpause_at = nanoseconds() + delay;
-                    if (!t->pause) paused_ct++;
-                    t->pause = delay;
-                    t->stat.pause_ct++;
-                    pause_tube_update(t);
-                }
-                rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE, "PAUSED\r\n");
-            } else {
-                rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE, "NOT_FOUND\r\n");
-            }
-        } else {
-            rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE, "BAD_FORMAT\r\n");
-        }
-    } else if (strncmp(cmd, "peek ", 5) == 0 ||
-               strncmp(cmd, "stats-job ", 10) == 0 ||
-               strncmp(cmd, "kick-job ", 9) == 0 ||
-               strncmp(cmd, "delete ", 7) == 0) {
-        // ID-based commands: parse ID and execute locally.
-        char *idstr = strchr(cmd, ' ') + 1;
-        // Strip \r\n
-        size_t il = strlen(idstr);
-        if (il >= 2 && idstr[il-2] == '\r') idstr[il-2] = '\0';
-        uint64 jid = 0;
-        if (read_uint((uintmax_t*)&jid, UINT64_MAX, idstr, NULL) == 0) {
-            Job *j = job_find(jid);
-            if (strncmp(cmd, "peek ", 5) == 0) {
-                if (j) {
-                    // Format: FOUND <id> <size>\r\n<body>\r\n
-                    int n = snprintf(rpl.data, CMD_FWD_REPLY_SIZE,
-                        "FOUND %"PRIu64" %u\r\n", j->r.id, j->r.body_size - 2);
-                    if (n > 0 && n + j->r.body_size < CMD_FWD_REPLY_SIZE) {
-                        memcpy(rpl.data + n, j->body, j->r.body_size);
-                        rpl.data_len = n + j->r.body_size;
-                    } else {
-                        rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE, "NOT_FOUND\r\n");
-                    }
-                } else {
-                    rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE, "NOT_FOUND\r\n");
-                }
-            } else if (strncmp(cmd, "stats-job ", 10) == 0) {
-                if (j && j->tube) {
-                    char buf[STATS_BUF_SIZE];
-                    int n = fmt_job_stats(buf, sizeof(buf), j);
-                    if (n > 0 && n < CMD_FWD_REPLY_SIZE - 32) {
-                        rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE,
-                            "OK %d\r\n%s", n, buf);
-                    } else {
-                        rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE, "NOT_FOUND\r\n");
-                    }
-                } else {
-                    rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE, "NOT_FOUND\r\n");
-                }
-            } else if (strncmp(cmd, "kick-job ", 9) == 0) {
-                if (j && ((j->r.state == Buried && kick_buried_job(s, j)) ||
-                          (j->r.state == Delayed && kick_delayed_job(s, j)))) {
-                    rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE, "KICKED\r\n");
-                } else {
-                    rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE, "NOT_FOUND\r\n");
-                }
-            } else { // delete
-                if (!j) {
-                    rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE, "NOT_FOUND\r\n");
-                } else {
-                    // Only delete non-reserved jobs (reserved = local to reserver).
-                    Job *dj = NULL;
-                    if (j->r.state == Ready) dj = remove_ready_job(j);
-                    else if (j->r.state == Buried) dj = remove_buried_job(j);
-                    else if (j->r.state == Delayed) dj = remove_delayed_job(j);
-                    if (dj) {
-                        dj->tube->stat.total_delete_ct++;
-                        dj->r.state = Invalid;
-                        Wal *w = shard_wal(s, dj);
-                        walwrite(w, dj);
-                        walmaint(w);
-                        job_free(dj);
-                        rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE, "DELETED\r\n");
-                    } else {
-                        rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE, "NOT_FOUND\r\n");
-                    }
-                }
-            }
-        } else {
-            rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE, "NOT_FOUND\r\n");
-        }
-    } else if (strncmp(cmd, "peek-ready", 10) == 0 ||
-               strncmp(cmd, "peek-delayed", 12) == 0 ||
-               strncmp(cmd, "peek-buried", 11) == 0 ||
-               strncmp(cmd, "kick ", 5) == 0) {
-        // Tube-based commands forwarded from remote use tube.
-        // Determine tube from the use tube of the originating client.
-        // These commands arrive with the full command line; we need the tube
-        // that the sending worker's client was using. Since we can't know it
-        // from the command alone, we look for local tubes that match the hash.
-        // Simpler: execute against all local tubes.
-        if (strncmp(cmd, "kick ", 5) == 0) {
-            char *kstr = cmd + 5;
-            size_t kl = strlen(kstr);
-            if (kl >= 2 && kstr[kl-2] == '\r') kstr[kl-2] = '\0';
-            uint32 count = 0;
-            if (read_uint((uintmax_t*)&count, UINT32_MAX, kstr, NULL) == 0) {
-                // Kick from all local tubes (best effort).
-                uint kicked = 0;
-                for (size_t ti = 0; ti < tubes.len && kicked < count; ti++) {
-                    Tube *t = tubes.items[ti];
-                    kicked += kick_jobs(s, t, count - kicked);
-                }
-                rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE,
-                    "KICKED %u\r\n", kicked);
-            } else {
-                rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE, "BAD_FORMAT\r\n");
-            }
-        } else {
-            // peek-ready/delayed/buried: determine variant once, then search.
-            int peek_type = 0; // 1=ready, 2=delayed, 3=buried
-            if (strncmp(cmd, "peek-ready", 10) == 0) peek_type = 1;
-            else if (strncmp(cmd, "peek-delayed", 12) == 0) peek_type = 2;
-            else if (strncmp(cmd, "peek-buried", 11) == 0) peek_type = 3;
-            Job *found = NULL;
-            for (size_t ti = 0; ti < tubes.len && !found; ti++) {
-                Tube *t = tubes.items[ti];
-                if (peek_type == 1 && t->ready.len)
-                    found = job_copy(t->ready.data[0]);
-                else if (peek_type == 2 && t->delay.len)
-                    found = job_copy(t->delay.data[0]);
-                else if (peek_type == 3 && !job_list_is_empty(&t->buried))
-                    found = job_copy(t->buried.next);
-            }
-            if (found) {
-                int n = snprintf(rpl.data, CMD_FWD_REPLY_SIZE,
-                    "FOUND %"PRIu64" %u\r\n", found->r.id, found->r.body_size - 2);
-                if (n > 0 && n + found->r.body_size < CMD_FWD_REPLY_SIZE) {
-                    memcpy(rpl.data + n, found->body, found->r.body_size);
-                    rpl.data_len = n + found->r.body_size;
-                } else {
-                    rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE, "NOT_FOUND\r\n");
-                }
-                job_free(found);
-            } else {
-                rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE, "NOT_FOUND\r\n");
-            }
-        }
-    } else {
-        rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE, "UNKNOWN_COMMAND\r\n");
-    }
-
-    // Send reply back to originating worker (variable-length: header + data).
-    if (fwd->from_worker >= 0 && fwd->from_worker < s->nworkers
-        && s->peer_fd[fwd->from_worker] >= 0) {
-        size_t rpl_len = offsetof(struct CmdReplyMsg, data) + rpl.data_len;
-        if (write(s->peer_fd[fwd->from_worker], &rpl, rpl_len) <= 0) {
-            twarnx("fwd_cmd reply write to peer %d failed", fwd->from_worker);
-        }
-    }
-}
-
-// Handle a forwarded put from a peer worker.
-// Creates the job locally and sends reply back.
-void
-prot_handle_forwarded_put(Server *s, struct PutFwdMsg *pm)
-{
-    struct CmdReplyMsg rpl;
-    rpl.magic = CMD_REPLY_MAGIC;
-    rpl.seq = pm->seq;
-    rpl.data_len = 0;
-
-    if (drain_mode) {
-        rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE, "DRAINING\r\n");
-        goto reply;
-    }
-
-    // Validate forwarded put fields.
-    if (pm->body_size < 2 || pm->body_size > PUT_FWD_MAX_BODY + 2) {
-        rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE, "BAD_FORMAT\r\n");
-        goto reply;
-    }
-    pm->tube[MAX_TUBE_NAME_LEN - 1] = '\0'; // ensure NUL-terminated
-    if (pm->delay < 0) pm->delay = 0;
-
-    Tube *t = tube_find_or_make(pm->tube);
-    if (!t) {
-        rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE, MSG_OUT_OF_MEMORY);
-        goto reply;
-    }
-
-    int64 ttr = pm->ttr;
-    if (ttr < 1000000000) ttr = 1000000000;
-
-    Job *j = make_job(pm->pri, pm->delay, ttr, pm->body_size, t);
-    if (!j) {
-        rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE, MSG_OUT_OF_MEMORY);
-        goto reply;
-    }
-    memcpy(j->body, pm->body, pm->body_size);
-
-    // Reserve WAL space before enqueue (same as normal put path).
-    Wal *w = shard_wal(s, j);
-    j->walresv = walresvput(w, j);
-    if (!j->walresv) {
-        job_free(j);
-        rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE, MSG_OUT_OF_MEMORY);
-        goto reply;
-    }
-
-    int r = enqueue_job(s, j, j->r.delay, 1);
-    if (r == 1) {
-        global_stat.total_jobs_ct++;
-        t->stat.total_jobs_ct++;
-        rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE,
-                                MSG_INSERTED_FMT, j->r.id);
-    } else {
-        global_stat.total_jobs_ct++;
-        t->stat.total_jobs_ct++;
-        bury_job(s, j, 0);
-        rpl.data_len = snprintf(rpl.data, CMD_FWD_REPLY_SIZE,
-                                MSG_BURIED_FMT, j->r.id);
-    }
-
-reply:
-    if (pm->from_worker >= 0 && pm->from_worker < s->nworkers
-        && s->peer_fd[pm->from_worker] >= 0) {
-        size_t rpl_len = offsetof(struct CmdReplyMsg, data) + rpl.data_len;
-        if (write(s->peer_fd[pm->from_worker], &rpl, rpl_len) <= 0) {
-            twarnx("fwd_put reply write to peer %d failed", pm->from_worker);
-        }
-    }
-}
-
-// Accept a migrated connection from a peer worker.
-// Creates a Conn, sets up tubes from MigMsg, replays buffered command.
-void
-h_accept_migrated(int cfd, Server *s, struct MigMsg *mm)
-{
-    mm->use_tube[MAX_TUBE_NAME_LEN - 1] = '\0';
-    mm->watch_tube[MAX_TUBE_NAME_LEN - 1] = '\0';
-    Tube *use = tube_find_or_make(mm->use_tube);
-    if (!use) use = default_tube;
-    Tube *watch = tube_find_or_make(mm->watch_tube);
-    if (!watch) watch = default_tube;
-
-    Conn *c = make_conn(cfd, STATE_WANT_COMMAND, use, watch);
-    if (!c) {
-        close(cfd);
-        return;
-    }
-    c->srv = s;
-    c->sock.x = c;
-    c->sock.f = (Handle)prothandle;
-    c->sock.fd = cfd;
-
-    // Flush pending reply (e.g. "WATCHING 1\r\n").
-    if (mm->pending_reply_len > 0 && mm->pending_reply_len <= (int)sizeof(mm->pending_reply)) {
-        ssize_t wr = write(cfd, mm->pending_reply, mm->pending_reply_len);
-        if (wr == -1 && errno != EAGAIN) {
-            connclose(c);
-            return;
-        }
-    }
-
-    // Replay ALL buffered commands (not just the first one).
-    // Without a full dispatch loop, pipelined commands are stranded:
-    // the kernel buffer is empty (data forwarded in MigMsg), epoll
-    // won't fire, and remaining commands never get processed.
-    if (mm->cmd_len > 0 && mm->cmd_len <= sizeof(c->cmd)) {
-        memcpy(c->cmd, mm->cmd, mm->cmd_len);
-        c->cmd_read = mm->cmd_len;
-        while (c->state == STATE_WANT_COMMAND && c->cmd_read > 0
-               && !c->fwd_pending
-               && (c->cmd_len = scan_line_end(c->cmd, c->cmd_read, 0))) {
-            dispatch_cmd(c);
-            if (c->sock.fd < 0) break;
-            fill_extra_data(c);
-        }
-        if (c->sock.fd < 0 || c->state == STATE_CLOSE) {
-            connclose(c);
-            epollq_apply();
-            return;
-        }
-    }
-
-    if (c->state == STATE_CLOSE) {
-        connclose(c);
-        epollq_apply();
-        return;
-    }
-
-    if (sockwant(&c->sock, 'r') == -1) {
-        twarn("sockwant migrated fd");
-        connclose(c);
     }
     epollq_apply();
 }
@@ -3735,7 +2870,7 @@ prot_replay(Server *s, Job *list)
     for (j = list->next ; j != list ; j = nj) {
         nj = j->next;
         job_list_remove(j);
-        Wal *w = shard_wal(s, j);
+        Wal *w = &s->wal;
         int z = walresvupdate(w);
         if (!z) {
             twarnx("failed to reserve space for job %"PRIu64", burying", j->r.id);
