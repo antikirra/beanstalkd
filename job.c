@@ -10,6 +10,7 @@ static uint64 next_id = 1;
 // Any body_size within a class reuses entries from that class.
 // Entries linked via ht_next (safe: job is removed from hash before pooling).
 #define POOL_NCLASS     11          // classes: 64, 128, 256, ..., 65536
+_Static_assert((64 << (POOL_NCLASS - 1)) == 65536, "POOL_NCLASS must cover classes up to 65536");
 #define POOL_PER_CLASS  512         // max entries per class
 #define POOL_MEM_MAX    (8 << 20)   // 8MB total across all classes
 
@@ -138,7 +139,7 @@ job_find(uint64 job_id)
     return jh;
 }
 
-__attribute__((hot)) Job *
+__attribute__((hot, malloc)) Job *
 allocate_job(int body_size)
 {
     Job *j = NULL;

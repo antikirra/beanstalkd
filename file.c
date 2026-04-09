@@ -51,6 +51,7 @@ enum
 {
     Jobrec5size = offsetof(Jobrec5, pad)
 };
+_Static_assert(Jobrec5size == 77, "Jobrec5 layout changed — breaks v5 WAL compatibility");
 
 // rawfalloc allocates disk space of len bytes.
 // It expects fd's offset to be 0; may also reset fd's offset to 0.

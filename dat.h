@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <pthread.h>
 
 typedef unsigned char uchar;
@@ -221,6 +222,8 @@ struct Jobrec {
     uint32 kick_ct;
     byte   state;
 };
+_Static_assert(sizeof(Jobrec) == 80, "Jobrec size changed — increment Walver");
+_Static_assert(sizeof(int) == 4, "WAL format assumes 4-byte int for namelen");
 
 struct Job {
     // persistent fields; these get written to the wal
@@ -502,7 +505,7 @@ struct Wal {
     pthread_cond_t  sync_cond;
     int             sync_fd;
     int             sync_stop;
-    int             sync_err;
+    _Atomic int     sync_err;
     int             sync_on;
 };
 int  waldirlock(Wal*);

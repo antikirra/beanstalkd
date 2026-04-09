@@ -93,8 +93,7 @@ warn_systemd_ignored_option(char *opt, char *arg)
 }
 
 
-static void usage(int code) __attribute__ ((noreturn));
-static void
+_Noreturn static void
 usage(int code)
 {
     fprintf(stderr, "Use: %s [OPTIONS]\n"

@@ -37,7 +37,7 @@ su(const char *user)
     }
 }
 
-static void
+_Noreturn static void
 handle_sigterm_pid1(int _unused)
 {
     _exit(143);

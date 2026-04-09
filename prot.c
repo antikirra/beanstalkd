@@ -29,7 +29,7 @@ int64 mem_trim_rate = 60000000000LL; /* 60 seconds in nanoseconds */
 static void epollq_add(Conn *c, char rw);
 
 // Valid tube name characters (lookup table replaces strspn).
-static const char valid_name_char[256] __attribute__((aligned(64))) = {
+static const char _Alignas(64) valid_name_char[256] = {
     ['A']=1,['B']=1,['C']=1,['D']=1,['E']=1,['F']=1,['G']=1,['H']=1,
     ['I']=1,['J']=1,['K']=1,['L']=1,['M']=1,['N']=1,['O']=1,['P']=1,
     ['Q']=1,['R']=1,['S']=1,['T']=1,['U']=1,['V']=1,['W']=1,['X']=1,
@@ -568,7 +568,7 @@ reply(Conn *c, char *line, int len, int state)
 
 // Two-digit lookup table: "00", "01", ..., "99".
 // Halves the number of divisions in decimal conversion.
-static const char digits[200] __attribute__((aligned(64))) = {
+static const char _Alignas(64) digits[200] = {
     '0','0','0','1','0','2','0','3','0','4','0','5','0','6','0','7','0','8','0','9',
     '1','0','1','1','1','2','1','3','1','4','1','5','1','6','1','7','1','8','1','9',
     '2','0','2','1','2','2','2','3','2','4','2','5','2','6','2','7','2','8','2','9',
@@ -2484,7 +2484,7 @@ conn_process_io(Conn *c)
         c->cmd_read += r;
         // Start scan from prev_read to skip already-scanned bytes.
         c->cmd_len = scan_line_end(c->cmd, c->cmd_read, prev_read);
-        if (c->cmd_len) {
+        if (likely(c->cmd_len)) {
             // We found complete command line. Bail out to h_conn.
             return;
         }
@@ -2659,7 +2659,7 @@ h_conn(const int fd, const short which, Conn *c)
         return;
     }
 
-    if (which == 'h') {
+    if (unlikely(which == 'h')) {
         c->halfclosed = 1;
     }
 

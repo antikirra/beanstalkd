@@ -18,6 +18,6 @@ RUN make clean && make check \
 # cppcheck: zero false-positive static analysis
 RUN cppcheck --error-exitcode=1 --enable=warning,performance \
     --suppress=missingIncludeSystem --quiet \
-    --std=c99 -I. \
+    --std=c11 -I. \
     conn.c file.c heap.c job.c linux.c main.c ms.c net.c \
     primes.c prot.c serv.c time.c tube.c util.c walg.c
