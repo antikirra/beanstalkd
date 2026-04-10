@@ -58,7 +58,8 @@ fmtalloc(char *fmt, ...)
 
     // find out how much space is needed
     va_start(ap, fmt);
-    n = vsnprintf(0, 0, fmt, ap) + 1; // include space for trailing NUL
+    char dummy;
+    n = vsnprintf(&dummy, 0, fmt, ap) + 1; // include space for trailing NUL
     va_end(ap);
 
     buf = malloc(n);

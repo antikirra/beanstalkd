@@ -18,7 +18,7 @@ cttest_tube_make_and_verify()
     assertf(t->using_ct == 0, "using_ct must be 0");
     assertf(t->watching_ct == 0, "watching_ct must be 0");
     assertf(t->pause == 0, "pause must be 0");
-    /* tube with refs=0 — dref frees it */
+    tube_iref(t);
     tube_dref(t);
 }
 
@@ -149,6 +149,7 @@ cttest_tube_name_truncation()
 
     Tube *t = make_tube(name);
     assertf(t, "make_tube with long name");
+    tube_iref(t);
     assertf(strlen(t->name) == MAX_TUBE_NAME_LEN - 1,
             "name must be truncated to %d, got %zu", MAX_TUBE_NAME_LEN - 1, strlen(t->name));
     assertf(t->name[MAX_TUBE_NAME_LEN - 1] == '\0', "must be NUL-terminated");

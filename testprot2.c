@@ -207,6 +207,7 @@ void
 cttest_tube_delay_heap_flag_init()
 {
     Tube *t = make_tube("flag-test");
+    tube_iref(t);
     assertf(t->in_delay_heap == 0,
             "fresh tube: in_delay_heap must be 0, got %d", t->in_delay_heap);
     assertf(t->delay_heap_index == 0,
@@ -736,7 +737,7 @@ void
 cttest_job_hash_large_scale_rehash()
 {
     Tube *t = make_tube("rehash-tube");
-    TUBE_ASSIGN(t, t);
+    tube_iref(t);
 
     int N = 60000;
     uint64 *ids = malloc(N * sizeof(uint64));

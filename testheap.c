@@ -256,7 +256,8 @@ ctbench_heap_remove(int n)
         assertf(j, "allocate job");
         heapinsert(&h, j);
     }
-    Job **jj = calloc(n, sizeof(Job *)); // temp storage to deallocate jobs later
+    assertf(n > 0, "n must be positive");
+    Job **jj = calloc((unsigned)n, sizeof(Job *)); // temp storage to deallocate jobs later
 
     ctresettimer();
     for (i = 0; i < n; i++) {
