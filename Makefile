@@ -124,3 +124,25 @@ vers.c:
 
 doc/beanstalkd.1 doc/beanstalkd.1.html: doc/beanstalkd.ronn
 	ronn $<
+
+# Profile-Guided Optimization (PGO)
+#
+# Usage:
+#   make pgo-instrument PGO_REMOTE_DIR=/var/lib/beanstalkd/pgo
+#     -> deploy, run under real load, then systemctl stop (SIGTERM flushes gcda)
+#   scp remote:PGO_REMOTE_DIR/*.gcda pgo/
+#     -> strip path prefix: for f in pgo/*.gcda; do mv "$f" "pgo/$$(echo "$f" | sed 's/.*#//')"; done
+#   make pgo
+#
+
+PGO_DIR = pgo
+PGO_REMOTE_DIR ?= /var/lib/beanstalkd/pgo
+
+.PHONY: pgo-instrument
+pgo-instrument:
+	$(MAKE) CFLAGS="-O2 -fprofile-generate=$(PGO_REMOTE_DIR) -fprofile-prefix-path=$(CURDIR)" \
+	        LDFLAGS="-fprofile-generate=$(PGO_REMOTE_DIR)"
+
+.PHONY: pgo
+pgo:
+	$(MAKE) CFLAGS="-O2 -flto=auto -fprofile-use=$(CURDIR)/$(PGO_DIR) -fprofile-prefix-path=$(CURDIR) -fprofile-correction -Wno-missing-profile"
