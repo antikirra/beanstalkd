@@ -766,7 +766,10 @@ process_tube(Tube *t)
         if (!c) {
             // Re-enqueue the orphaned job.
             twarnx("waiting_conns is empty");
-            heapinsert(&j->tube->ready, j);
+            if (!heapinsert(&j->tube->ready, j)) {
+                twarnx("OOM re-enqueuing orphaned job");
+                break;
+            }
             j->r.state = Ready;
             ready_ct++;
             if (j->r.pri < URGENT_THRESHOLD) {
@@ -836,8 +839,6 @@ enqueue_job(Server *s, Job *j, int64 delay, char update_store)
             global_stat.urgent_ct++;
             j->tube->stat.urgent_ct++;
         }
-        if (j->tube->waiting_conns.len)
-            process_tube(j->tube);
     }
 
     if (update_store) {
@@ -862,6 +863,13 @@ enqueue_job(Server *s, Job *j, int64 delay, char update_store)
             twarnx("walmaint failed after walwrite");
         }
     }
+
+    // Match ready jobs with waiting connections AFTER successful commit.
+    // Must be after walwrite: process_tube changes job state to Reserved
+    // via conn_reserve_job, which would make the rollback above corrupt
+    // the heap and double-decrement counters.
+    if (!delay && j->tube->waiting_conns.len)
+        process_tube(j->tube);
 
     return 1;
 }
@@ -922,7 +930,11 @@ kick_buried_job(Server *s, Job *j)
         return 0;
     j->walresv += z;
 
-    remove_buried_job(j);
+    if (!remove_buried_job(j)) {
+        walresvreturn(w, z);
+        j->walresv -= z;
+        return 0;
+    }
 
     j->r.kick_ct++;
     r = enqueue_job(s, j, 0, 1);
@@ -951,7 +963,11 @@ kick_delayed_job(Server *s, Job *j)
         return 0;
     j->walresv += z;
 
-    remove_delayed_job(j);
+    if (!remove_delayed_job(j)) {
+        walresvreturn(w, z);
+        j->walresv -= z;
+        return 0;
+    }
 
     j->r.kick_ct++;
     r = enqueue_job(s, j, 0, 1);
@@ -1033,7 +1049,8 @@ remove_delayed_job(Job *j)
 {
     if (!j || j->r.state != Delayed)
         return NULL;
-    heapremove(&j->tube->delay, j->heap_index);
+    if (!heapremove(&j->tube->delay, j->heap_index))
+        return NULL;
     delayed_ct--;
     delay_tube_update(j->tube);
 
@@ -1047,7 +1064,8 @@ remove_ready_job(Job *j)
 {
     if (!j || j->r.state != Ready)
         return NULL;
-    heapremove(&j->tube->ready, j->heap_index);
+    if (!heapremove(&j->tube->ready, j->heap_index))
+        return NULL;
     ready_ct--;
     if (j->r.pri < URGENT_THRESHOLD) {
         global_stat.urgent_ct--;
@@ -1975,6 +1993,10 @@ dispatch_cmd(Conn *c)
             reply_serr(c, MSG_INTERNAL_ERROR);
             return;
         }
+        if (!j) {
+            reply_serr(c, MSG_INTERNAL_ERROR);
+            return;
+        }
 
         CONNSETWORKER(c);
         global_stat.reserved_ct++;
@@ -2294,15 +2316,18 @@ dispatch_cmd(Conn *c)
         }
 
         if (!ms_contains(&c->watch, t)) {
-            if (conn_waiting(c))
+            char was_waiting = conn_waiting(c);
+            if (was_waiting)
                 remove_waiting_conn(c);
             if (!ms_append(&c->watch, t)) {
                 TUBE_ASSIGN(t, NULL);
+                if (was_waiting)
+                    enqueue_waiting_conn(c);
                 reply_serr(c, MSG_OUT_OF_MEMORY);
                 return;
             }
             // on_watch_insert callback handles iref + watching_ct++
-            if (conn_waiting(c))
+            if (was_waiting)
                 enqueue_waiting_conn(c);
         }
 
@@ -2557,7 +2582,7 @@ conn_process_io(Conn *c)
     case STATE_WANT_DATA: {
         j = c->in_job;
 
-        r = read(c->sock.fd, j->body + c->in_job_read, j->r.body_size -c->in_job_read);
+        r = read(c->sock.fd, j->body + c->in_job_read, j->r.body_size - c->in_job_read);
         if (unlikely(r == -1)) {
             check_err(c, "read()");
             return;
@@ -2569,13 +2594,13 @@ conn_process_io(Conn *c)
 
         c->in_job_read += r; /* we got some bytes */
 
-        /* (j->in_job_read > j->r.body_size) can't happen */
+        /* (c->in_job_read > j->r.body_size) can't happen */
 
         maybe_enqueue_incoming_job(c);
         return;
     }
     case STATE_SEND_WORD:
-        r= write(c->sock.fd, c->reply + c->reply_sent, c->reply_len - c->reply_sent);
+        r = write(c->sock.fd, c->reply + c->reply_sent, c->reply_len - c->reply_sent);
         if (unlikely(r == -1)) {
             check_err(c, "write()");
             return;
@@ -2723,7 +2748,8 @@ prottick(Server *s)
             period = min(period, d);
             break;
         }
-        remove_delayed_job(j);
+        if (!remove_delayed_job(j))
+            break; // heap inconsistency — stop to avoid infinite loop
         int r = enqueue_job(s, j, 0, 0);
         if (r < 1)
             bury_job(s, j, 0);  /* out of memory */

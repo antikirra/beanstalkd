@@ -7,6 +7,8 @@
 #include <unistd.h>
 #include <errno.h>
 
+volatile sig_atomic_t shutdown_requested = 0;
+
 struct Server srv = {
     .port = Portdef,
     .cpu = -1,
@@ -60,6 +62,9 @@ srvserve(Server *s)
     }
 
     for (;;) {
+        if (unlikely(shutdown_requested))
+            break;
+
         int64 period = prottick(s);
 
         // Drain all ready events before next prottick.

@@ -73,12 +73,6 @@ make_inet_socket(char *host, char *port)
             close(fd);
             continue;
         }
-        r = setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &flags, sizeof flags);
-        if (r == -1) {
-            twarn("setting SO_REUSEPORT on fd %d", fd);
-            close(fd);
-            continue;
-        }
         r = setsockopt(fd, SOL_SOCKET, SO_LINGER, &linger, sizeof linger);
         if (r == -1) {
             twarn("setting SO_LINGER on fd %d", fd);

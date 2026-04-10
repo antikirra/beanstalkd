@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdatomic.h>
+#include <signal.h>
 #include <pthread.h>
 
 typedef unsigned char uchar;
@@ -71,6 +72,7 @@ extern const char version[];
 extern int verbose;
 
 extern struct Server srv;
+extern volatile sig_atomic_t shutdown_requested;
 
 // Replaced by tests to simulate failures.
 extern FAlloc falloc;

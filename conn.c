@@ -64,7 +64,19 @@ make_conn(int fd, char start_state, Tube *use, Tube *watch)
     c->sock.fd = fd;
 
     ms_init(&c->watch, on_watch_insert, on_watch_remove);
-    ms_append(&c->watch, watch); // callback: iref + watching_ct++
+    if (!ms_append(&c->watch, watch)) { // callback: iref + watching_ct++
+        twarn("OOM");
+        // Don't close fd — caller is responsible for cleanup.
+        if (conn_pool_len < CONN_POOL_MAX) {
+            c->sock.fd = -1;
+            c->next = conn_pool;
+            conn_pool = c;
+            conn_pool_len++;
+        } else {
+            free(c);
+        }
+        return NULL;
+    }
 
     TUBE_ASSIGN(c->use, use);
     use->using_ct++;

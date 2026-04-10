@@ -37,10 +37,11 @@ su(const char *user)
     }
 }
 
-_Noreturn static void
+static void
 handle_sigterm(int _unused)
 {
-    exit(0);
+    UNUSED_PARAMETER(_unused);
+    shutdown_requested = 1;
 }
 
 static void

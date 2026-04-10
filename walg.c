@@ -43,9 +43,12 @@ sync_thread_fn(void *arg)
         while (w->sync_fd < 0 && !w->sync_stop)
             pthread_cond_wait(&w->sync_cond, &w->sync_mu);
 
-        if (w->sync_stop) break;
-
         int fd = w->sync_fd;
+        if (fd < 0) {
+            // woken by walsyncstop with no pending fd
+            if (w->sync_stop) break;
+            continue;
+        }
         w->sync_fd = -1;
         pthread_mutex_unlock(&w->sync_mu);
 
@@ -256,9 +259,17 @@ moveone(Wal *w)
         return 1; // it will not fit, try again later
     }
 
+    // Hold a ref on the source file to prevent walgc from unlinking
+    // it between filermjob (which decrements refs) and walwrite.
+    // If walwrite fails, the source file still has the data on disk
+    // for recovery. Without this, the last job migration could
+    // trigger unlink before the write to the new file completes.
+    fileincref(w->head);
     filermjob(w->head, j);
     w->nmig++;
-    return walwrite(w, j);
+    int r = walwrite(w, j);
+    filedecref(w->head);
+    return r;
 }
 
 
@@ -552,16 +563,30 @@ walresvupdate(Wal *w)
 
 // walresvreturn returns n previously reserved bytes back to the WAL.
 // Used when a planned walwrite will not happen (e.g. enqueue_job failed).
+// reserve() may allocate from w->tail when w->cur is full, so return
+// from cur first, then overflow to tail.
 void
 walresvreturn(Wal *w, int n)
 {
     if (!w->use) return;
     if (n <= 0) return;
-    // Clamp to actual reservation to prevent underflow from caller bugs.
-    if (n > w->cur->resv) n = w->cur->resv;
-    w->resv -= n;
-    w->cur->resv -= n;
-    w->cur->free += n;
+
+    int from_cur = n;
+    if (from_cur > w->cur->resv)
+        from_cur = w->cur->resv;
+    w->cur->resv -= from_cur;
+    w->cur->free += from_cur;
+
+    int rest = n - from_cur;
+    if (rest > 0 && w->tail != w->cur) {
+        if (rest > w->tail->resv)
+            rest = w->tail->resv;
+        w->tail->resv -= rest;
+        w->tail->free += rest;
+        from_cur += rest;
+    }
+
+    w->resv -= from_cur;
 }
 
 

@@ -48,13 +48,10 @@ sockwant(Socket *s, int rw)
                 return 0;
             op = EPOLL_CTL_MOD;
         } else {
-            s->added = 0;
-            s->rw_cached = 0;
             op = EPOLL_CTL_DEL;
         }
     } else {
         if (!rw) return 0;
-        s->added = 1;
         op = EPOLL_CTL_ADD;
     }
 
@@ -67,12 +64,14 @@ sockwant(Socket *s, int rw)
         ev.events = EPOLLOUT;
         break;
     }
-    ev.events |= EPOLLRDHUP | EPOLLPRI;
+    ev.events |= EPOLLRDHUP;
     ev.data.ptr = s;
 
     int r = epoll_ctl(epfd, op, s->fd, &ev);
-    if (r == 0)
+    if (r == 0) {
+        s->added = !!rw;
         s->rw_cached = rw;
+    }
     return r;
 }
 

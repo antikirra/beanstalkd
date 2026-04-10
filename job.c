@@ -109,7 +109,7 @@ store_job(Job *j)
 
     if (unlikely(rehash_old)) rehash_step();
 
-    /* accept a load factor of 4 */
+    /* accept a load factor of 2 */
     if (unlikely(!rehash_old && all_jobs_used > (all_jobs_cap << 1)))
         rehash_start(1);
 }
