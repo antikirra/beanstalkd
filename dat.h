@@ -206,7 +206,6 @@ enum
 // v8 (current): per-record CRC32C trailer (Castagnoli, 4 bytes LE) for
 // silent-corruption detection. See crc32c.c.
 // v7: per-record layout without checksum, ns-resolution timestamps.
-// v5: legacy, us-resolution timestamps.
 
 // WAL CRC32C (Castagnoli, SSE4.2 hardware-accelerated).
 // Usage: c = WAL_CRC32C_INIT; c = wal_crc32c(c, buf, n); ... ; c ^= WAL_CRC32C_XOR;

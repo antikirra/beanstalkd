@@ -2,7 +2,7 @@
 
 Linux-native work queue. Single C11 binary, requires only glibc.
 
-Fork of [upstream beanstalkd](https://github.com/beanstalkd/beanstalkd) with O(1) scheduling, per-syscall optimizations, and 48 bug fixes. Wire protocol and WAL format unchanged — every existing client works unmodified.
+Fork of [upstream beanstalkd](https://github.com/beanstalkd/beanstalkd) with O(1) scheduling, per-syscall optimizations, and 48 bug fixes. Wire protocol unchanged — every existing client works unmodified. WAL format upgraded to v8 with per-record CRC32C; upstream v7 binlogs replay transparently on startup.
 
 ## Quick start
 
@@ -16,7 +16,7 @@ Requires **Linux 6.1+**, glibc, gcc 12+. Compatible with GCC 15.
 
 ## Compatibility
 
-100% wire protocol compatible with upstream beanstalkd v1.13. No new commands, no changed responses, no modified stats fields. All client libraries (Go, Python, Ruby, PHP, Java, etc.) work without changes. WAL format v7 — identical to upstream.
+100% wire protocol compatible with upstream beanstalkd v1.13. No new commands, no changed responses, no modified stats fields. All client libraries (Go, Python, Ruby, PHP, Java, etc.) work without changes. WAL writer emits v8 (4-byte CRC32C trailer per record for silent-corruption detection); upstream v7 binlogs are read transparently on startup, so upgrade requires no migration. Downgrade to a pre-v8 binary is not supported. Legacy v5 (beanstalkd 1.4.6) reader removed — drain pre-v7 binlogs on the old binary before upgrading.
 
 ## Fork vs upstream
 
@@ -31,14 +31,15 @@ Requires **Linux 6.1+**, glibc, gcc 12+. Compatible with GCC 15.
 | Job memory | malloc/free per job | 11 size classes, O(1) pool reuse |
 | WAL fsync | Synchronous | Async fsync thread |
 | WAL compaction | Broken on release cycles | Fixed alive tracking |
+| WAL integrity | None | CRC32C per record (v8 format, SSE4.2) |
 | Crash/data bugs | 22+ open | 48 fixed |
-| Tests | ~100 unit | 219 unit + hostile WAL + ASan + Valgrind |
+| Tests | ~100 unit | 213 unit + hostile WAL + ASan + Valgrind |
 | Status | Maintenance mode (last code 2020) | Active development |
 
 ## Build and test
 
 ```sh
-make check                                # 219 unit tests (UBSan in CI)
+make check                                # 213 unit tests (UBSan in CI)
 docker build -f Dockerfile.build .        # CI: UBSan + cppcheck (C11)
 docker build -f Dockerfile.benchmark .    # A/B benchmark vs upstream
 docker build -f test/Dockerfile.loadtest -t loadtest . && docker run --rm loadtest
@@ -79,7 +80,7 @@ u64toa two-digit pair table. reply_inserted/reply_job backward build into reply_
 11-class job pool (64B-64KB, `__attribute__((malloc))`). Cache-line Conn/Tube struct layout. Conn slab pool (256). Incremental rehash (16 buckets/op, dual-table). DJB2+finalizer tube hash with hash-first filter. MALLOC_ARENA_MAX=1. Periodic malloc_trim.
 
 **WAL:**
-Async fsync thread (_Atomic error signaling). writev records. fallocate prealloc. Rate-limited compaction with correct alive tracking. Lock-free error check. Readahead on recovery. _Static_assert guards on WAL record sizes.
+Async fsync thread (_Atomic error signaling). writev records with per-record CRC32C trailer (v8 format, Intel SSE4.2 `_mm_crc32_u64` ~0.33 cyc/byte, negligible overhead). fallocate prealloc. Rate-limited compaction with correct alive tracking. Lock-free error check. Readahead on recovery. _Static_assert guards on WAL record sizes. Transparent v7 binlog replay for upgrade from upstream.
 
 **Network:**
 TCP_FASTOPEN(1024). TCP_DEFER_ACCEPT. TCP_NOTSENT_LOWAT(16KB). TCP_USER_TIMEOUT(30s). SO_INCOMING_CPU. sched_setaffinity.

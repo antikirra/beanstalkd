@@ -15,7 +15,6 @@
 #include <string.h>
 
 static int  readrec(File*, Job *, int*);
-static int  readrec5(File*, Job *, int*);
 static int  readrec7(File*, Job *, int*);
 static int  readfull(File*, void*, int, int*, char*);
 static void warnpos(File*, int, char*, ...)
@@ -25,35 +24,8 @@ FAlloc falloc = rawfalloc;
 
 enum
 {
-    Walver5 = 5,
     Walver7 = 7
 };
-
-typedef struct Jobrec5 Jobrec5;
-
-struct Jobrec5 {
-    uint64 id;
-    uint32 pri;
-    uint64 delay; // usec
-    uint64 ttr; // usec
-    int32  body_size;
-    uint64 created_at; // usec
-    uint64 deadline_at; // usec
-    uint32 reserve_ct;
-    uint32 timeout_ct;
-    uint32 release_ct;
-    uint32 bury_ct;
-    uint32 kick_ct;
-    byte   state;
-
-    char pad[1];
-};
-
-enum
-{
-    Jobrec5size = offsetof(Jobrec5, pad)
-};
-_Static_assert(Jobrec5size == 77, "Jobrec5 layout changed — breaks v5 WAL compatibility");
 
 // rawfalloc allocates disk space of len bytes.
 // It expects fd's offset to be 0; may also reset fd's offset to 0.
@@ -169,12 +141,6 @@ fileread(File *f, Job *list)
     case Walver7:
         fileincref(f);
         while (readrec7(f, list, &err));
-        filedecref(f);
-        f->rbuf = NULL;
-        return err;
-    case Walver5:
-        fileincref(f);
-        while (readrec5(f, list, &err));
         filedecref(f);
         f->rbuf = NULL;
         return err;
@@ -532,159 +498,6 @@ readrec7(File *f, Job *l, int *err)
         return 1;
     default:
         warnpos(f, -r, "unknown job state: %d", jr.state);
-        goto Error;
-    }
-
-Error:
-    *err = 1;
-    if (j) {
-        job_list_remove(j);
-        filermjob(j->file, j);
-        job_free(j);
-    }
-    return 0;
-}
-
-
-// Readrec5 is like readrec, but it reads a record in "version 5"
-// of the log format.
-static int
-readrec5(File *f, Job *l, int *err)
-{
-    int r, sz = 0;
-    size_t namelen;
-    Jobrec5 jr;
-    Job *j;
-    Tube *t;
-    char tubename[MAX_TUBE_NAME_LEN];
-
-    r = readfull(f, &namelen, sizeof(namelen), err, "v5 namelen");
-    if (!r) return 0;
-    sz += r;
-    if (namelen >= MAX_TUBE_NAME_LEN) {
-        warnpos(f, -r, "namelen %zu exceeds maximum of %d", namelen, MAX_TUBE_NAME_LEN - 1);
-        *err = 1;
-        return 0;
-    }
-
-    if (namelen) {
-        r = readfull(f, tubename, namelen, err, "v5 tube name");
-        if (!r) {
-            return 0;
-        }
-        sz += r;
-    }
-    tubename[namelen] = '\0';
-
-    r = readfull(f, &jr, Jobrec5size, err, "v5 job struct");
-    if (!r) {
-        return 0;
-    }
-    sz += r;
-
-    // are we reading trailing zeroes?
-    if (!jr.id) return 0;
-
-    if (namelen && jr.body_size < 2 && jr.state != Invalid) {
-        warnpos(f, -sz, "v5 job %"PRIu64" invalid body_size %d", jr.id, jr.body_size);
-        *err = 1;
-        return 0;
-    }
-
-    j = job_find(jr.id);
-    if (!(j || namelen)) {
-        // We read a short record without having seen a
-        // full record for this job, so the full record
-        // was in an earlier file that has been deleted.
-        // Therefore the job itself has either been
-        // deleted or migrated; either way, this record
-        // should be ignored.
-        return 1;
-    }
-
-    switch (jr.state) {
-    case Reserved:
-        jr.state = Ready;
-        /* Falls through */
-    case Ready:
-    case Buried:
-    case Delayed:
-        if (!j) {
-            if ((size_t)jr.body_size > job_data_size_limit) {
-                warnpos(f, -r, "job %"PRIu64" is too big (%"PRId32" > %zu)",
-                        jr.id,
-                        jr.body_size,
-                        job_data_size_limit);
-                goto Error;
-            }
-            t = tube_find_or_make(tubename);
-            if (!t) {
-                warnpos(f, -r, "OOM tube_find_or_make");
-                goto Error;
-            }
-            j = make_job_with_id(jr.pri, jr.delay, jr.ttr, jr.body_size,
-                                 t, jr.id);
-            if (!j) {
-                warnpos(f, -r, "OOM make_job_with_id");
-                goto Error;
-            }
-            job_list_reset(j);
-        }
-        {
-        int32 old_body_size = j->r.body_size;
-        j->r.id = jr.id;
-        j->r.pri = jr.pri;
-        j->r.delay = jr.delay * 1000; // us => ns
-        j->r.ttr = jr.ttr * 1000; // us => ns
-        j->r.body_size = jr.body_size;
-        j->r.created_at = jr.created_at * 1000; // us => ns
-        j->r.deadline_at = jr.deadline_at * 1000; // us => ns
-        j->r.reserve_ct = jr.reserve_ct;
-        j->r.timeout_ct = jr.timeout_ct;
-        j->r.release_ct = jr.release_ct;
-        j->r.bury_ct = jr.bury_ct;
-        j->r.kick_ct = jr.kick_ct;
-        j->r.state = jr.state;
-
-        if (!namelen) {
-            job_list_remove(j);
-        }
-        job_list_insert(l, j);
-
-        // full record; read the job body
-        if (namelen) {
-            if (jr.body_size != old_body_size) {
-                warnpos(f, -r, "job %"PRIu64" size changed", j->r.id);
-                warnpos(f, -r, "was %"PRId32", now %"PRId32, j->r.body_size, jr.body_size);
-                goto Error;
-            }
-            r = readfull(f, j->body, j->r.body_size, err, "v5 job body");
-            if (!r) {
-                goto Error;
-            }
-            sz += r;
-
-            // since this is a full record, we can move
-            // the file pointer and decref the old
-            // file, if any
-            filermjob(j->file, j);
-            fileaddjob(f, j);
-
-            j->walused += sz;
-            f->w->alive += sz;
-        }
-
-        return 1;
-        } /* end old_body_size scope */
-    case Invalid:
-        if (j) {
-            job_list_remove(j);
-            filermjob(j->file, j);
-            job_free(j);
-        }
-        return 1;
-    default:
-        warnpos(f, -r, "unknown v5 job state: %d", jr.state);
         goto Error;
     }
 
