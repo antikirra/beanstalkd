@@ -232,6 +232,7 @@ walresvmigrate(Wal *w, Job *j)
     z += j->tube->name_len;
     z += sizeof(Jobrec);
     z += j->r.body_size;
+    z += sizeof(uint32);  // v8 CRC32C trailer
 
     if (z > INT_MAX) return 0;
     return reserve(w, (int)z);
@@ -444,7 +445,8 @@ static int
 balancerest(Wal *w, File *b, int n)
 {
     int rest, c, r;
-    static const int z = sizeof(int) + sizeof(Jobrec);
+    // v8 delete-record slot size: namelen + Jobrec + CRC32C trailer.
+    static const int z = sizeof(int) + sizeof(Jobrec) + sizeof(uint32);
 
     if (!b) return 1;
 
@@ -541,9 +543,9 @@ reserve(Wal *w, int n)
 int
 walresvput(Wal *w, Job *j)
 {
-    // Full record: int + name + Jobrec + body.
-    // Delete record: int + Jobrec. Precompute constant part.
-    int64 z = (2 * sizeof(int)) + (2 * sizeof(Jobrec))
+    // Full record: int + name + Jobrec + body + CRC32C (v8).
+    // Delete record: int + Jobrec + CRC32C (v8). Precompute constant part.
+    int64 z = (2 * sizeof(int)) + (2 * sizeof(Jobrec)) + (2 * sizeof(uint32))
             + j->tube->name_len + j->r.body_size;
     if (unlikely(z > INT_MAX)) return 0;
     return reserve(w, (int)z);
@@ -555,8 +557,9 @@ int
 walresvupdate(Wal *w)
 {
     int z = 0;
-    z +=sizeof(int);
-    z +=sizeof(Jobrec);
+    z += sizeof(int);
+    z += sizeof(Jobrec);
+    z += sizeof(uint32);  // v8 CRC32C trailer
     return reserve(w, z);
 }
 

@@ -1688,7 +1688,10 @@ cttest_binlog_read()
 void
 cttest_binlog_disk_full()
 {
-    size = 1000;
+    // v8 binlog records carry a 4-byte CRC32C trailer, so per-put
+    // reservation grew by 8 bytes (full + delete). Bumping filesize
+    // keeps the expected "4 puts per file" allocation pattern.
+    size = 1080;
     falloc = wrapfalloc;
     fallocpat[0] = 1;
     fallocpat[2] = 1;
@@ -1752,7 +1755,9 @@ cttest_binlog_disk_full()
 void
 cttest_binlog_disk_full_delete()
 {
-    size = 1000;
+    // v8 binlog records carry a 4-byte CRC32C trailer; see note in
+    // cttest_binlog_disk_full above.
+    size = 1080;
     falloc = wrapfalloc;
     fallocpat[0] = 1;
     fallocpat[1] = 1;

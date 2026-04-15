@@ -16,6 +16,7 @@
 
 static int  readrec(File*, Job *, int*);
 static int  readrec5(File*, Job *, int*);
+static int  readrec7(File*, Job *, int*);
 static int  readfull(File*, void*, int, int*, char*);
 static void warnpos(File*, int, char*, ...)
 __attribute__((format(printf, 3, 4)));
@@ -24,7 +25,8 @@ FAlloc falloc = rawfalloc;
 
 enum
 {
-    Walver5 = 5
+    Walver5 = 5,
+    Walver7 = 7
 };
 
 typedef struct Jobrec5 Jobrec5;
@@ -164,6 +166,12 @@ fileread(File *f, Job *list)
         filedecref(f);
         f->rbuf = NULL;
         return err;
+    case Walver7:
+        fileincref(f);
+        while (readrec7(f, list, &err));
+        filedecref(f);
+        f->rbuf = NULL;
+        return err;
     case Walver5:
         fileincref(f);
         while (readrec5(f, list, &err));
@@ -178,11 +186,214 @@ fileread(File *f, Job *list)
 }
 
 
-// Readrec reads a record from f->fd into linked list l.
-// If an error occurs, it sets *err to 1.
-// Readrec returns the number of records read, either 1 or 0.
+// Readrec reads a v8 WAL record from f->fd into linked list l and verifies
+// its CRC32C trailer. If an error occurs, it sets *err to 1.
+// Returns 1 if a record was read, 0 on EOF or error.
+//
+// Record layout (v8):
+//   full:  [int32 namelen] [char tubename[namelen]] [Jobrec jr] [body] [uint32 crc32c_le]
+//   short: [int32 namelen=0] [Jobrec jr] [uint32 crc32c_le]
+//
+// CRC32C (Castagnoli) covers everything before the trailer; trailer is
+// 4 bytes in little-endian byte order. Mismatch → record rejected, *err = 1.
 static int
 readrec(File *f, Job *l, int *err)
+{
+    int r, sz = 0;
+    int namelen;
+    Jobrec jr;
+    Job *j;
+    Tube *t;
+    char tubename[MAX_TUBE_NAME_LEN];
+    uint32 crc = WAL_CRC32C_INIT;
+    unsigned char crc_bytes[4];
+    char *body_buf = NULL;
+
+    r = readfull(f, &namelen, sizeof(int), err, "namelen");
+    if (!r) return 0;
+    sz += r;
+    crc = wal_crc32c(crc, &namelen, sizeof(int));
+
+    if (namelen >= MAX_TUBE_NAME_LEN) {
+        warnpos(f, -r, "namelen %d exceeds maximum of %d", namelen, MAX_TUBE_NAME_LEN - 1);
+        *err = 1;
+        return 0;
+    }
+
+    if (namelen < 0) {
+        warnpos(f, -r, "namelen %d is negative", namelen);
+        *err = 1;
+        return 0;
+    }
+
+    if (namelen) {
+        r = readfull(f, tubename, namelen, err, "tube name");
+        if (!r) {
+            return 0;
+        }
+        sz += r;
+        crc = wal_crc32c(crc, tubename, namelen);
+    }
+    tubename[namelen] = '\0';
+
+    r = readfull(f, &jr, sizeof(Jobrec), err, "job struct");
+    if (!r) {
+        return 0;
+    }
+    sz += r;
+    crc = wal_crc32c(crc, &jr, sizeof(Jobrec));
+
+    // Are we reading trailing zeroes? (fallocate zero-fills unused tail;
+    // a genuine record always has jr.id > 0.)
+    if (!jr.id) return 0;
+
+    // Reject jobs with body_size < 2 from corrupted WAL.
+    // Valid jobs always include \r\n trailer (body_size >= 2).
+    if (namelen && jr.body_size < 2 && jr.state != Invalid) {
+        warnpos(f, -sz, "job %"PRIu64" invalid body_size %d", jr.id, jr.body_size);
+        *err = 1;
+        return 0;
+    }
+
+    // For full records, read body into a temporary buffer and fold into CRC.
+    // We cannot read directly into j->body yet because CRC verification must
+    // pass BEFORE any existing job state is mutated. This preserves the
+    // invariant that corrupted data never overwrites valid in-memory state.
+    if (namelen) {
+        body_buf = malloc(jr.body_size);
+        if (!body_buf) {
+            warnpos(f, -sz, "OOM body_buf");
+            *err = 1;
+            return 0;
+        }
+        r = readfull(f, body_buf, jr.body_size, err, "job body");
+        if (!r) { free(body_buf); return 0; }
+        sz += r;
+        crc = wal_crc32c(crc, body_buf, jr.body_size);
+    }
+
+    // Read and verify the 4-byte little-endian CRC32C trailer.
+    r = readfull(f, crc_bytes, sizeof crc_bytes, err, "crc trailer");
+    if (!r) { free(body_buf); return 0; }
+    sz += r;
+
+    uint32 stored = (uint32)crc_bytes[0]
+                  | ((uint32)crc_bytes[1] << 8)
+                  | ((uint32)crc_bytes[2] << 16)
+                  | ((uint32)crc_bytes[3] << 24);
+    uint32 computed = crc ^ WAL_CRC32C_XOR;
+    if (stored != computed) {
+        warnpos(f, -sz, "job %"PRIu64" crc mismatch: computed 0x%08x stored 0x%08x",
+                jr.id, computed, stored);
+        *err = 1;
+        free(body_buf);
+        return 0;
+    }
+
+    // CRC is valid — safe to apply state changes.
+    j = job_find(jr.id);
+    if (!(j || namelen)) {
+        // Short record for a job whose full record lived in a now-deleted
+        // earlier file. The record itself is checksum-valid, so we
+        // intentionally ignore it (job has been deleted or migrated).
+        return 1;
+    }
+
+    switch (jr.state) {
+    case Reserved:
+        jr.state = Ready;
+        /* Falls through */
+    case Ready:
+    case Buried:
+    case Delayed:
+        if (!j) {
+            if ((size_t)jr.body_size > job_data_size_limit) {
+                warnpos(f, -sz, "job %"PRIu64" is too big (%"PRId32" > %zu)",
+                        jr.id,
+                        jr.body_size,
+                        job_data_size_limit);
+                goto Error;
+            }
+            t = tube_find_or_make(tubename);
+            if (!t) {
+                warnpos(f, -sz, "OOM tube_find_or_make");
+                goto Error;
+            }
+            j = make_job_with_id(jr.pri, jr.delay, jr.ttr, jr.body_size,
+                                 t, jr.id);
+            if (!j) {
+                warnpos(f, -sz, "OOM make_job_with_id");
+                goto Error;
+            }
+            job_list_reset(j);
+            j->r.created_at = jr.created_at;
+        }
+        {
+        int32 old_body_size = j->r.body_size;
+        j->r = jr;
+
+        // For short records, move job to tail of replay list to
+        // preserve WAL ordering. Ensures buried jobs maintain
+        // their burial order after restart (#668).
+        if (!namelen) {
+            job_list_remove(j);
+        }
+        job_list_insert(l, j);
+
+        if (namelen) {
+            if (jr.body_size != old_body_size) {
+                warnpos(f, -sz, "job %"PRIu64" size changed", j->r.id);
+                warnpos(f, -sz, "was %d, now %d", old_body_size, jr.body_size);
+                goto Error;
+            }
+            memcpy(j->body, body_buf, j->r.body_size);
+
+            // since this is a full record, we can move
+            // the file pointer and decref the old
+            // file, if any
+            filermjob(j->file, j);
+            fileaddjob(f, j);
+
+            // Only count full records toward alive/walused.
+            // Short records are redundant state updates; their bytes
+            // are dead space eligible for compaction (#622).
+            j->walused += sz;
+            f->w->alive += sz;
+        }
+
+        free(body_buf);
+        return 1;
+        } /* end old_body_size scope */
+    case Invalid:
+        free(body_buf);
+        if (j) {
+            job_list_remove(j);
+            filermjob(j->file, j);
+            job_free(j);
+        }
+        return 1;
+    default:
+        warnpos(f, -sz, "unknown job state: %d", jr.state);
+        goto Error;
+    }
+
+Error:
+    *err = 1;
+    free(body_buf);
+    if (j) {
+        job_list_remove(j);
+        filermjob(j->file, j);
+        job_free(j);
+    }
+    return 0;
+}
+
+
+// Readrec7 reads a v7 WAL record. v7 has no CRC trailer; this function is
+// an unchanged snapshot of the previous readrec implementation and exists
+// to recover pre-v8 binlogs during migration. See dat.h:186 for procedure.
+static int
+readrec7(File *f, Job *l, int *err)
 {
     int r, sz = 0;
     int namelen;
@@ -671,19 +882,33 @@ __attribute__((hot)) int
 filewrjobshort(File *f, Job *j)
 {
     int nl = 0; // name len 0 indicates short record
-    struct iovec iov[2] = {
-        { .iov_base = &nl,   .iov_len = sizeof nl },
-        { .iov_base = &j->r, .iov_len = sizeof j->r },
+
+    // CRC32C (v8 trailer) over [nl, j->r], serialized little-endian.
+    uint32 crc = WAL_CRC32C_INIT;
+    crc = wal_crc32c(crc, &nl,   sizeof nl);
+    crc = wal_crc32c(crc, &j->r, sizeof j->r);
+    crc ^= WAL_CRC32C_XOR;
+    unsigned char crc_bytes[4] = {
+        (unsigned char)(crc      ),
+        (unsigned char)(crc >>  8),
+        (unsigned char)(crc >> 16),
+        (unsigned char)(crc >> 24),
     };
 
-    int r = filewritev(f, j, iov, 2);
+    struct iovec iov[3] = {
+        { .iov_base = &nl,       .iov_len = sizeof nl },
+        { .iov_base = &j->r,     .iov_len = sizeof j->r },
+        { .iov_base = crc_bytes, .iov_len = sizeof crc_bytes },
+    };
+
+    int r = filewritev(f, j, iov, 3);
     if (!r) return 0;
 
     // Short records are state updates for an existing job whose
     // authoritative data lives in a full record (in j->file).
     // Undo the alive/walused accounting from filewritev to prevent
     // phantom bytes that suppress compaction ratio (#622).
-    int total = sizeof(int) + sizeof(Jobrec);
+    int total = sizeof(int) + sizeof(Jobrec) + sizeof crc_bytes;
     j->walused -= total;
     f->w->alive -= total;
 
@@ -699,14 +924,30 @@ int
 filewrjobfull(File *f, Job *j)
 {
     int nl = j->tube->name_len;
-    struct iovec iov[4] = {
+
+    // CRC32C (v8 trailer) over [nl, tube name, j->r, body], serialized LE.
+    uint32 crc = WAL_CRC32C_INIT;
+    crc = wal_crc32c(crc, &nl,           sizeof nl);
+    crc = wal_crc32c(crc, j->tube->name, nl);
+    crc = wal_crc32c(crc, &j->r,         sizeof j->r);
+    crc = wal_crc32c(crc, j->body,       j->r.body_size);
+    crc ^= WAL_CRC32C_XOR;
+    unsigned char crc_bytes[4] = {
+        (unsigned char)(crc      ),
+        (unsigned char)(crc >>  8),
+        (unsigned char)(crc >> 16),
+        (unsigned char)(crc >> 24),
+    };
+
+    struct iovec iov[5] = {
         { .iov_base = &nl,           .iov_len = sizeof nl },
         { .iov_base = j->tube->name, .iov_len = nl },
         { .iov_base = &j->r,         .iov_len = sizeof j->r },
         { .iov_base = j->body,       .iov_len = j->r.body_size },
+        { .iov_base = crc_bytes,     .iov_len = sizeof crc_bytes },
     };
 
-    int r = filewritev(f, j, iov, 4);
+    int r = filewritev(f, j, iov, 5);
     if (r)
         fileaddjob(f, j);
     return r;

@@ -18,6 +18,7 @@ MOFILE=main.o
 OFILES=\
 	linux.o\
 	conn.o\
+	crc32c.o\
 	file.o\
 	heap.o\
 	job.o\
@@ -47,6 +48,7 @@ TOFILES=\
 	teststress.o\
 	testcore.o\
 	testprot2.o\
+	testwal2.o\
 
 HFILES=\
 	dat.h\
@@ -86,6 +88,10 @@ $(BINDIR)/%: %
 CLEANFILES+=$(TARG)
 
 $(OFILES) $(MOFILE): $(HFILES)
+
+# crc32c.c uses Intel SSE4.2 _mm_crc32_u64 intrinsic; flag it locally
+# rather than globally so the rest of the tree stays portable-ready.
+crc32c.o: override CFLAGS += -msse4.2
 
 CLEANFILES+=$(wildcard *.o)
 

@@ -180,7 +180,7 @@ enum // Jobrec.state
 
 enum
 {
-    Walver = 7
+    Walver = 8
 };
 
 // If you modify Jobrec struct, you must increment Walver above.
@@ -202,6 +202,18 @@ enum
 // It is a really easy thing to do and it means during development
 // you won't have to worry about misinterpreting the contents of a binlog
 // that you generated with a dev copy of beanstalkd.
+//
+// v8 (current): per-record CRC32C trailer (Castagnoli, 4 bytes LE) for
+// silent-corruption detection. See crc32c.c.
+// v7: per-record layout without checksum, ns-resolution timestamps.
+// v5: legacy, us-resolution timestamps.
+
+// WAL CRC32C (Castagnoli, SSE4.2 hardware-accelerated).
+// Usage: c = WAL_CRC32C_INIT; c = wal_crc32c(c, buf, n); ... ; c ^= WAL_CRC32C_XOR;
+// Serialize as 4-byte little-endian trailer at end of each v8 WAL record.
+#define WAL_CRC32C_INIT 0xFFFFFFFFu
+#define WAL_CRC32C_XOR  0xFFFFFFFFu
+uint32 wal_crc32c(uint32 crc, const void *buf, size_t n);
 
 struct Jobrec {
     uint64 id;
