@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifdef HAVE_LIBSYSTEMD
@@ -12,6 +13,86 @@
 #endif
 
 const char *progname;
+int log_json = 0;
+
+size_t
+json_escape(char *dst, size_t dst_size, const char *src)
+{
+    size_t out = 0;
+    if (dst_size == 0) return 0;
+    while (*src) {
+        unsigned char c = (unsigned char)*src++;
+        const char *e;
+        size_t n;
+        char u6[8];
+        switch (c) {
+            case '"':  e = "\\\""; n = 2; break;
+            case '\\': e = "\\\\"; n = 2; break;
+            case '\b': e = "\\b";  n = 2; break;
+            case '\f': e = "\\f";  n = 2; break;
+            case '\n': e = "\\n";  n = 2; break;
+            case '\r': e = "\\r";  n = 2; break;
+            case '\t': e = "\\t";  n = 2; break;
+            default:
+                if (c < 0x20) {
+                    snprintf(u6, sizeof u6, "\\u%04x", c);
+                    e = u6;
+                    n = 6;
+                } else {
+                    if (out + 1 >= dst_size) goto done;
+                    dst[out++] = (char)c;
+                    continue;
+                }
+        }
+        if (out + n >= dst_size) goto done;
+        memcpy(dst + out, e, n);
+        out += n;
+    }
+done:
+    dst[out] = 0;
+    return out;
+}
+
+static void
+vlog_json(const char *err, const char *fmt, va_list args)
+__attribute__((format(printf, 2, 0)));
+
+static void
+vlog_json(const char *err, const char *fmt, va_list args)
+{
+    char raw[1024];
+    char esc_msg[2048];
+    char esc_err[256];
+    char line[3072];
+
+    if (fmt)
+        vsnprintf(raw, sizeof raw, fmt, args);
+    else
+        raw[0] = 0;
+    json_escape(esc_msg, sizeof esc_msg, raw);
+
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+
+    if (err) {
+        json_escape(esc_err, sizeof esc_err, err);
+        snprintf(line, sizeof line,
+            "{\"ts\":%lld.%03ld,\"level\":\"error\","
+            "\"msg\":\"%s\",\"errno\":\"%s\"}\n",
+            (long long)ts.tv_sec, ts.tv_nsec / 1000000L,
+            esc_msg, esc_err);
+    } else {
+        snprintf(line, sizeof line,
+            "{\"ts\":%lld.%03ld,\"level\":\"warn\","
+            "\"msg\":\"%s\"}\n",
+            (long long)ts.tv_sec, ts.tv_nsec / 1000000L,
+            esc_msg);
+    }
+    // Single fputs → one stdio write under glibc's per-FILE lock.
+    // Concurrent warnings from the fsync thread cannot interleave a
+    // partial JSON record into the same stderr line.
+    fputs(line, stderr);
+}
 
 static void
 vwarnx(const char *err, const char *fmt, va_list args)
@@ -20,6 +101,10 @@ __attribute__((format(printf, 2, 0)));
 static void
 vwarnx(const char *err, const char *fmt, va_list args)
 {
+    if (log_json) {
+        vlog_json(err, fmt, args);
+        return;
+    }
     fprintf(stderr, "%s: ", progname);
     if (fmt) {
         vfprintf(stderr, fmt, args);
@@ -118,7 +203,8 @@ usage(int code)
             " -t CPU   pin main thread to CPU core (default is no pinning)\n"
             " -v       show version information\n"
             " -V       increase verbosity\n"
-            " -h       show this help\n",
+            " -h       show this help\n"
+            " --log-json  emit warnings as JSON objects on stderr\n",
             progname,
             DEFAULT_FSYNC_MS,
             JOB_DATA_SIZE_LIMIT_DEFAULT,
@@ -160,6 +246,17 @@ optparse(Server *s, char **argv)
 #   define EARGF(x) (*arg ? (tmp=arg,arg="",tmp) : *argv ? *argv++ : (x))
 
     while ((arg = *argv++) && *arg++ == '-' && *arg) {
+        // Long-form flag: "--name". Detected before the single-char
+        // loop so "--" never leaks into the switch as two flags.
+        if (*arg == '-') {
+            char *long_name = arg + 1;
+            if (strcmp(long_name, "log-json") == 0) {
+                log_json = 1;
+                continue;
+            }
+            warnx("unknown flag: --%s", long_name);
+            usage(5);
+        }
         char c;
         while ((c = *arg++)) {
             switch (c) {

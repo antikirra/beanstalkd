@@ -104,6 +104,7 @@ TCP_FASTOPEN(1024). TCP_DEFER_ACCEPT. TCP_NOTSENT_LOWAT(16KB). TCP_USER_TIMEOUT(
 | `-m SEC` | 60 | malloc_trim interval (0 = disable) |
 | `-t CPU` | — | Pin to CPU core |
 | `-V` | | Verbose logging (`-VV` for command trace) |
+| `--log-json` | | Emit warnings as JSON objects on stderr (`{"ts":...,"level":"warn\|error","msg":"...","errno":"..."}`) |
 
 ## Docker benchmark results
 

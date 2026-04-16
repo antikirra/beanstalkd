@@ -71,6 +71,12 @@ extern const char version[];
 // verbose holds the count of -V parameters; it's a verbosity level.
 extern int verbose;
 
+// log_json enables structured JSON output via --log-json. When set,
+// warn()/warnx() emit one JSON object per line to stderr instead of the
+// human-readable "<progname>: msg" format. Verbose stdout traces
+// (-V) are unaffected — they remain plain text by design.
+extern int log_json;
+
 extern struct Server srv;
 extern volatile sig_atomic_t shutdown_requested;
 
@@ -314,6 +320,11 @@ struct Tube {
 
 void warn(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void warnx(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+// JSON-escape src into dst. Writes at most dst_size-1 chars + NUL.
+// Truncation-safe: never writes past dst_size, always NUL-terminates
+// when dst_size > 0. Returns number of chars written (excluding NUL).
+// Exposed for testing the escape table.
+size_t json_escape(char *dst, size_t dst_size, const char *src);
 char* fmtalloc(char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void* zalloc(size_t n);
 #define new(T) zalloc(sizeof(T))
