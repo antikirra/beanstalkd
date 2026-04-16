@@ -622,3 +622,745 @@ cttest_wal_release_delay0_multi_priority_changes()
     ckstatjob(fd, 1, "\nreleases: 5\n");
 }
 
+
+/* ============================================================
+ * TRUNCATE COMMAND TESTS
+ * ============================================================ */
+
+void
+cttest_truncate_basic()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    snd(fd, "use test\r\n");
+    ck(fd, "USING test\r\n");
+    snd(fd, "put 0 0 60 4\r\naaaa\r\n");
+    ck(fd, "INSERTED 1\r\n");
+    snd(fd, "put 0 0 60 4\r\nbbbb\r\n");
+    ck(fd, "INSERTED 2\r\n");
+    snd(fd, "put 0 0 60 4\r\ncccc\r\n");
+    ck(fd, "INSERTED 3\r\n");
+
+    snd(fd, "truncate test\r\n");
+    ck(fd, "TRUNCATED 3\r\n");
+
+    snd(fd, "watch test\r\n");
+    ck(fd, "WATCHING 2\r\n");
+    snd(fd, "reserve-with-timeout 0\r\n");
+    ck(fd, "TIMED_OUT\r\n");
+}
+
+void
+cttest_truncate_not_found()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+    snd(fd, "truncate nonexistent\r\n");
+    ck(fd, "NOT_FOUND\r\n");
+}
+
+void
+cttest_truncate_bad_format()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+    snd(fd, "truncate \r\n");
+    ck(fd, "BAD_FORMAT\r\n");
+}
+
+void
+cttest_truncate_trailing_garbage()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+    snd(fd, "use test\r\n");
+    ck(fd, "USING test\r\n");
+    snd(fd, "put 0 0 60 1\r\nx\r\n");
+    ck(fd, "INSERTED 1\r\n");
+    snd(fd, "truncate test extra\r\n");
+    ck(fd, "BAD_FORMAT\r\n");
+}
+
+void
+cttest_truncate_empty_tube()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+    snd(fd, "use empty\r\n");
+    ck(fd, "USING empty\r\n");
+    snd(fd, "put 0 0 60 1\r\nx\r\n");
+    ck(fd, "INSERTED 1\r\n");
+    snd(fd, "watch empty\r\n");
+    ck(fd, "WATCHING 2\r\n");
+    snd(fd, "reserve-with-timeout 0\r\n");
+    cksub(fd, "RESERVED 1 1\r\n");
+    rd(fd);
+    snd(fd, "delete 1\r\n");
+    ck(fd, "DELETED\r\n");
+    snd(fd, "truncate empty\r\n");
+    ck(fd, "TRUNCATED 0\r\n");
+}
+
+void
+cttest_truncate_preserves_new_jobs()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    snd(fd, "use myq\r\n");
+    ck(fd, "USING myq\r\n");
+    snd(fd, "put 0 0 60 3\r\nold\r\n");
+    ck(fd, "INSERTED 1\r\n");
+    snd(fd, "put 0 0 60 3\r\nold\r\n");
+    ck(fd, "INSERTED 2\r\n");
+
+    snd(fd, "truncate myq\r\n");
+    ck(fd, "TRUNCATED 2\r\n");
+
+    snd(fd, "put 0 0 60 3\r\nnew\r\n");
+    ck(fd, "INSERTED 3\r\n");
+
+    snd(fd, "watch myq\r\n");
+    ck(fd, "WATCHING 2\r\n");
+    snd(fd, "reserve-with-timeout 0\r\n");
+    cksub(fd, "RESERVED 3 3\r\n");
+    cksub(fd, "new\r\n");
+}
+
+void
+cttest_truncate_with_delayed()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    snd(fd, "use dq\r\n");
+    ck(fd, "USING dq\r\n");
+    snd(fd, "put 0 3600 60 4\r\ndata\r\n");
+    ck(fd, "INSERTED 1\r\n");
+    snd(fd, "put 0 3600 60 4\r\ndata\r\n");
+    ck(fd, "INSERTED 2\r\n");
+
+    snd(fd, "truncate dq\r\n");
+    ck(fd, "TRUNCATED 2\r\n");
+
+    snd(fd, "watch dq\r\n");
+    ck(fd, "WATCHING 2\r\n");
+    snd(fd, "reserve-with-timeout 0\r\n");
+    ck(fd, "TIMED_OUT\r\n");
+}
+
+void
+cttest_truncate_with_buried()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    snd(fd, "use bq\r\n");
+    ck(fd, "USING bq\r\n");
+    snd(fd, "put 0 0 60 4\r\ndata\r\n");
+    ck(fd, "INSERTED 1\r\n");
+    snd(fd, "watch bq\r\n");
+    ck(fd, "WATCHING 2\r\n");
+    snd(fd, "reserve-with-timeout 0\r\n");
+    cksub(fd, "RESERVED 1 4\r\n");
+    rd(fd);
+    snd(fd, "bury 1 0\r\n");
+    ck(fd, "BURIED\r\n");
+
+    snd(fd, "truncate bq\r\n");
+    ck(fd, "TRUNCATED 1\r\n");
+
+    snd(fd, "kick 100\r\n");
+    ck(fd, "KICKED 0\r\n");
+}
+
+void
+cttest_truncate_reserved_released_is_dead()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    snd(fd, "use rq\r\n");
+    ck(fd, "USING rq\r\n");
+    snd(fd, "put 0 0 60 4\r\ndata\r\n");
+    ck(fd, "INSERTED 1\r\n");
+    snd(fd, "watch rq\r\n");
+    ck(fd, "WATCHING 2\r\n");
+    snd(fd, "reserve-with-timeout 0\r\n");
+    cksub(fd, "RESERVED 1 4\r\n");
+    rd(fd);
+
+    snd(fd, "truncate rq\r\n");
+    ck(fd, "TRUNCATED 0\r\n");
+
+    snd(fd, "release 1 0 0\r\n");
+    ck(fd, "RELEASED\r\n");
+
+    snd(fd, "stats-tube rq\r\n");
+    cksub(fd, "OK ");
+    cksub(fd, "current-jobs-ready: 0\n");
+}
+
+void
+cttest_truncate_other_tube_unaffected()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    snd(fd, "use alpha\r\n");
+    ck(fd, "USING alpha\r\n");
+    snd(fd, "put 0 0 60 1\r\na\r\n");
+    ck(fd, "INSERTED 1\r\n");
+
+    snd(fd, "use beta\r\n");
+    ck(fd, "USING beta\r\n");
+    snd(fd, "put 0 0 60 1\r\nb\r\n");
+    ck(fd, "INSERTED 2\r\n");
+
+    snd(fd, "truncate alpha\r\n");
+    ck(fd, "TRUNCATED 1\r\n");
+
+    snd(fd, "watch beta\r\n");
+    ck(fd, "WATCHING 2\r\n");
+    snd(fd, "reserve-with-timeout 0\r\n");
+    cksub(fd, "RESERVED 2 1\r\n");
+    cksub(fd, "b\r\n");
+}
+
+void
+cttest_truncate_double()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    snd(fd, "use dbl\r\n");
+    ck(fd, "USING dbl\r\n");
+    snd(fd, "put 0 0 60 1\r\nx\r\n");
+    ck(fd, "INSERTED 1\r\n");
+
+    snd(fd, "truncate dbl\r\n");
+    ck(fd, "TRUNCATED 1\r\n");
+
+    snd(fd, "truncate dbl\r\n");
+    ck(fd, "TRUNCATED 0\r\n");
+}
+
+void
+cttest_wal_truncate_persists()
+{
+    srv.wal.dir = ctdir();
+    int port = startsrv_wal();
+    int fd = diallocal(port);
+
+    snd(fd, "use wt\r\n");
+    ck(fd, "USING wt\r\n");
+    snd(fd, "put 0 0 60 4\r\ndata\r\n");
+    ck(fd, "INSERTED 1\r\n");
+    snd(fd, "put 0 0 60 4\r\nmore\r\n");
+    ck(fd, "INSERTED 2\r\n");
+
+    snd(fd, "truncate wt\r\n");
+    ck(fd, "TRUNCATED 2\r\n");
+
+    close(fd);
+    port = restartsrv_wal();
+    fd = diallocal(port);
+
+    snd(fd, "watch wt\r\n");
+    ck(fd, "WATCHING 2\r\n");
+    snd(fd, "reserve-with-timeout 0\r\n");
+    ck(fd, "TIMED_OUT\r\n");
+}
+
+void
+cttest_wal_truncate_new_jobs_survive()
+{
+    srv.wal.dir = ctdir();
+    int port = startsrv_wal();
+    int fd = diallocal(port);
+
+    snd(fd, "use ws\r\n");
+    ck(fd, "USING ws\r\n");
+    snd(fd, "put 0 0 60 3\r\nold\r\n");
+    ck(fd, "INSERTED 1\r\n");
+
+    snd(fd, "truncate ws\r\n");
+    ck(fd, "TRUNCATED 1\r\n");
+
+    snd(fd, "put 0 0 60 3\r\nnew\r\n");
+    ck(fd, "INSERTED 2\r\n");
+
+    close(fd);
+    port = restartsrv_wal();
+    fd = diallocal(port);
+
+    snd(fd, "watch ws\r\n");
+    ck(fd, "WATCHING 2\r\n");
+    snd(fd, "reserve-with-timeout 0\r\n");
+    cksub(fd, "RESERVED 2 3\r\n");
+    cksub(fd, "new\r\n");
+}
+
+void
+cttest_truncate_put_into_truncated_tube()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    snd(fd, "use tput\r\n");
+    ck(fd, "USING tput\r\n");
+    snd(fd, "put 0 0 60 3\r\nold\r\n");
+    ck(fd, "INSERTED 1\r\n");
+
+    snd(fd, "truncate tput\r\n");
+    ck(fd, "TRUNCATED 1\r\n");
+
+    snd(fd, "put 0 0 60 3\r\nnew\r\n");
+    ck(fd, "INSERTED 2\r\n");
+    snd(fd, "put 0 0 60 4\r\nnew2\r\n");
+    ck(fd, "INSERTED 3\r\n");
+
+    snd(fd, "watch tput\r\n");
+    ck(fd, "WATCHING 2\r\n");
+    snd(fd, "reserve-with-timeout 0\r\n");
+    cksub(fd, "RESERVED 2 3\r\n");
+    cksub(fd, "new\r\n");
+
+    snd(fd, "delete 2\r\n");
+    ck(fd, "DELETED\r\n");
+    snd(fd, "reserve-with-timeout 0\r\n");
+    cksub(fd, "RESERVED 3 4\r\n");
+    cksub(fd, "new2\r\n");
+}
+
+void
+cttest_truncate_stats_cmd_counter()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    snd(fd, "use st\r\n");
+    ck(fd, "USING st\r\n");
+    snd(fd, "put 0 0 60 1\r\nx\r\n");
+    ck(fd, "INSERTED 1\r\n");
+
+    snd(fd, "truncate st\r\n");
+    ck(fd, "TRUNCATED 1\r\n");
+
+    snd(fd, "stats\r\n");
+    cksub(fd, "OK ");
+    cksub(fd, "cmd-truncate: 1\n");
+}
+
+void
+cttest_truncate_kick_dead_buried()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    snd(fd, "use kb\r\n");
+    ck(fd, "USING kb\r\n");
+    snd(fd, "put 0 0 60 1\r\na\r\n");
+    ck(fd, "INSERTED 1\r\n");
+    snd(fd, "put 0 0 60 1\r\nb\r\n");
+    ck(fd, "INSERTED 2\r\n");
+
+    snd(fd, "watch kb\r\n");
+    ck(fd, "WATCHING 2\r\n");
+    snd(fd, "reserve-with-timeout 0\r\n");
+    cksub(fd, "RESERVED 1 1\r\n");
+    rd(fd);
+    snd(fd, "bury 1 0\r\n");
+    ck(fd, "BURIED\r\n");
+    snd(fd, "reserve-with-timeout 0\r\n");
+    cksub(fd, "RESERVED 2 1\r\n");
+    rd(fd);
+    snd(fd, "bury 2 0\r\n");
+    ck(fd, "BURIED\r\n");
+
+    snd(fd, "truncate kb\r\n");
+    ck(fd, "TRUNCATED 2\r\n");
+
+    snd(fd, "put 0 0 60 3\r\nnew\r\n");
+    ck(fd, "INSERTED 3\r\n");
+
+    snd(fd, "reserve-with-timeout 0\r\n");
+    cksub(fd, "RESERVED 3 3\r\n");
+    cksub(fd, "new\r\n");
+}
+
+void
+cttest_truncate_pause_interaction()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    snd(fd, "use pi\r\n");
+    ck(fd, "USING pi\r\n");
+    snd(fd, "put 0 0 60 1\r\nx\r\n");
+    ck(fd, "INSERTED 1\r\n");
+
+    snd(fd, "pause-tube pi 3600\r\n");
+    ck(fd, "PAUSED\r\n");
+
+    snd(fd, "truncate pi\r\n");
+    ck(fd, "TRUNCATED 1\r\n");
+
+    snd(fd, "put 0 0 60 3\r\nnew\r\n");
+    ck(fd, "INSERTED 2\r\n");
+
+    snd(fd, "pause-tube pi 0\r\n");
+    ck(fd, "PAUSED\r\n");
+
+    snd(fd, "watch pi\r\n");
+    ck(fd, "WATCHING 2\r\n");
+    snd(fd, "reserve-with-timeout 2\r\n");
+    cksub(fd, "RESERVED 2 3\r\n");
+    cksub(fd, "new\r\n");
+}
+
+void
+cttest_truncate_drain_mode()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    snd(fd, "use dr\r\n");
+    ck(fd, "USING dr\r\n");
+    snd(fd, "put 0 0 60 1\r\nx\r\n");
+    ck(fd, "INSERTED 1\r\n");
+
+    snd(fd, "truncate dr\r\n");
+    ck(fd, "TRUNCATED 1\r\n");
+
+    snd(fd, "watch dr\r\n");
+    ck(fd, "WATCHING 2\r\n");
+    snd(fd, "reserve-with-timeout 0\r\n");
+    ck(fd, "TIMED_OUT\r\n");
+}
+
+void
+cttest_truncate_peek_ready_hides_zombie()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    snd(fd, "use pk\r\n");
+    ck(fd, "USING pk\r\n");
+    snd(fd, "put 0 0 60 3\r\nfoo\r\n");
+    ck(fd, "INSERTED 1\r\n");
+
+    // Pipeline: truncate + peek-ready in one write.
+    // No prottick between them, so the zombie is still in the heap.
+    snd(fd, "truncate pk\r\npeek-ready\r\n");
+    ck(fd, "TRUNCATED 1\r\n");
+    ck(fd, "NOT_FOUND\r\n");
+}
+
+void
+cttest_truncate_peek_job_hides_zombie()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    snd(fd, "use pj\r\n");
+    ck(fd, "USING pj\r\n");
+    snd(fd, "put 0 0 60 3\r\nfoo\r\n");
+    ck(fd, "INSERTED 1\r\n");
+
+    // Pipeline: truncate + peek <id> in one write.
+    snd(fd, "truncate pj\r\npeek 1\r\n");
+    ck(fd, "TRUNCATED 1\r\n");
+    ck(fd, "NOT_FOUND\r\n");
+}
+
+void
+cttest_truncate_reserve_job_blocked()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    snd(fd, "use rj\r\n");
+    ck(fd, "USING rj\r\n");
+    snd(fd, "put 0 0 60 3\r\nfoo\r\n");
+    ck(fd, "INSERTED 1\r\n");
+
+    // Pipeline: truncate + reserve-job in one write.
+    snd(fd, "truncate rj\r\nreserve-job 1\r\n");
+    ck(fd, "TRUNCATED 1\r\n");
+    ck(fd, "NOT_FOUND\r\n");
+}
+
+void
+cttest_truncate_fast_reserve_skips_zombie()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    snd(fd, "use fr\r\n");
+    ck(fd, "USING fr\r\n");
+    snd(fd, "put 0 0 60 3\r\nfoo\r\n");
+    ck(fd, "INSERTED 1\r\n");
+
+    // Pipeline: truncate + watch + reserve in one write.
+    // Fast-path reserve must skip the truncated tube.
+    snd(fd, "truncate fr\r\nwatch fr\r\nreserve-with-timeout 0\r\n");
+    ck(fd, "TRUNCATED 1\r\n");
+    ck(fd, "WATCHING 2\r\n");
+    ck(fd, "TIMED_OUT\r\n");
+}
+
+void
+cttest_truncate_peek_delayed_hides_zombie()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    snd(fd, "use pd\r\n");
+    ck(fd, "USING pd\r\n");
+    snd(fd, "put 0 3600 60 3\r\nfoo\r\n");
+    ck(fd, "INSERTED 1\r\n");
+
+    snd(fd, "truncate pd\r\npeek-delayed\r\n");
+    ck(fd, "TRUNCATED 1\r\n");
+    ck(fd, "NOT_FOUND\r\n");
+}
+
+void
+cttest_truncate_peek_buried_hides_zombie()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    snd(fd, "use pb\r\n");
+    ck(fd, "USING pb\r\n");
+    snd(fd, "put 0 0 60 3\r\nfoo\r\n");
+    ck(fd, "INSERTED 1\r\n");
+    snd(fd, "watch pb\r\n");
+    ck(fd, "WATCHING 2\r\n");
+    snd(fd, "reserve-with-timeout 0\r\n");
+    cksub(fd, "RESERVED 1 3\r\n");
+    rd(fd);
+    snd(fd, "bury 1 0\r\n");
+    ck(fd, "BURIED\r\n");
+
+    snd(fd, "truncate pb\r\npeek-buried\r\n");
+    ck(fd, "TRUNCATED 1\r\n");
+    ck(fd, "NOT_FOUND\r\n");
+}
+
+void
+cttest_truncate_delete_reserved_zombie()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    snd(fd, "use dr\r\n");
+    ck(fd, "USING dr\r\n");
+    snd(fd, "put 0 0 60 3\r\nfoo\r\n");
+    ck(fd, "INSERTED 1\r\n");
+    snd(fd, "watch dr\r\n");
+    ck(fd, "WATCHING 2\r\n");
+    snd(fd, "reserve-with-timeout 0\r\n");
+    cksub(fd, "RESERVED 1 3\r\n");
+    rd(fd);
+
+    snd(fd, "truncate dr\r\n");
+    ck(fd, "TRUNCATED 0\r\n");
+
+    // Explicit delete of a reserved purge-eligible job must work.
+    snd(fd, "delete 1\r\n");
+    ck(fd, "DELETED\r\n");
+}
+
+void
+cttest_truncate_release_with_delay_kills_zombie()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    snd(fd, "use rd\r\n");
+    ck(fd, "USING rd\r\n");
+    snd(fd, "put 0 0 60 3\r\nfoo\r\n");
+    ck(fd, "INSERTED 1\r\n");
+    snd(fd, "watch rd\r\n");
+    ck(fd, "WATCHING 2\r\n");
+    snd(fd, "reserve-with-timeout 0\r\n");
+    cksub(fd, "RESERVED 1 3\r\n");
+    rd(fd);
+
+    snd(fd, "truncate rd\r\n");
+    ck(fd, "TRUNCATED 0\r\n");
+
+    // Release with delay: enqueue_job intercept catches purge-eligible.
+    snd(fd, "release 1 0 3600\r\n");
+    ck(fd, "RELEASED\r\n");
+
+    // Job should NOT appear in delay queue.
+    snd(fd, "stats-tube rd\r\n");
+    cksub(fd, "OK ");
+    cksub(fd, "current-jobs-delayed: 0\n");
+}
+
+void
+cttest_truncate_multi_tube_isolation()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    // Create jobs across 3 tubes.
+    snd(fd, "use t1\r\n");
+    ck(fd, "USING t1\r\n");
+    snd(fd, "put 0 0 60 2\r\nt1\r\n");
+    ck(fd, "INSERTED 1\r\n");
+
+    snd(fd, "use t2\r\n");
+    ck(fd, "USING t2\r\n");
+    snd(fd, "put 0 0 60 2\r\nt2\r\n");
+    ck(fd, "INSERTED 2\r\n");
+
+    snd(fd, "use t3\r\n");
+    ck(fd, "USING t3\r\n");
+    snd(fd, "put 0 0 60 2\r\nt3\r\n");
+    ck(fd, "INSERTED 3\r\n");
+
+    // Truncate only t2.
+    snd(fd, "truncate t2\r\n");
+    ck(fd, "TRUNCATED 1\r\n");
+
+    // t1 and t3 must still have their jobs.
+    snd(fd, "use t1\r\n");
+    ck(fd, "USING t1\r\n");
+    snd(fd, "peek-ready\r\n");
+    cksub(fd, "FOUND 1 2\r\n");
+    rd(fd);
+
+    snd(fd, "use t3\r\n");
+    ck(fd, "USING t3\r\n");
+    snd(fd, "peek-ready\r\n");
+    cksub(fd, "FOUND 3 2\r\n");
+    rd(fd);
+
+    // t2 must be empty.
+    snd(fd, "use t2\r\n");
+    ck(fd, "USING t2\r\n");
+    snd(fd, "watch t2\r\n");
+    ck(fd, "WATCHING 2\r\n");
+    snd(fd, "reserve-with-timeout 0\r\n");
+    ck(fd, "TIMED_OUT\r\n");
+}
+
+void
+cttest_truncate_bury_then_kick_new()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    snd(fd, "use bk\r\n");
+    ck(fd, "USING bk\r\n");
+    snd(fd, "put 0 0 60 3\r\nold\r\n");
+    ck(fd, "INSERTED 1\r\n");
+    snd(fd, "watch bk\r\n");
+    ck(fd, "WATCHING 2\r\n");
+    snd(fd, "reserve-with-timeout 0\r\n");
+    cksub(fd, "RESERVED 1 3\r\n");
+    rd(fd);
+    snd(fd, "bury 1 0\r\n");
+    ck(fd, "BURIED\r\n");
+
+    snd(fd, "truncate bk\r\n");
+    ck(fd, "TRUNCATED 1\r\n");
+
+    // Put a NEW job, bury it, then kick.
+    snd(fd, "put 0 0 60 3\r\nnew\r\n");
+    ck(fd, "INSERTED 2\r\n");
+    snd(fd, "reserve-with-timeout 0\r\n");
+    cksub(fd, "RESERVED 2 3\r\n");
+    rd(fd);
+    snd(fd, "bury 2 0\r\n");
+    ck(fd, "BURIED\r\n");
+
+    // Kick should get the NEW buried job, not the old dead one.
+    snd(fd, "kick 100\r\n");
+    ck(fd, "KICKED 1\r\n");
+    snd(fd, "reserve-with-timeout 0\r\n");
+    cksub(fd, "RESERVED 2 3\r\n");
+    cksub(fd, "new\r\n");
+}
+
+void
+cttest_wal_truncate_cross_tube_safe()
+{
+    srv.wal.dir = ctdir();
+    int port = startsrv_wal();
+    int fd = diallocal(port);
+
+    // Tube alpha gets job 1.
+    snd(fd, "use alpha\r\n");
+    ck(fd, "USING alpha\r\n");
+    snd(fd, "put 0 0 60 5\r\nalpha\r\n");
+    ck(fd, "INSERTED 1\r\n");
+
+    // Tube beta gets job 2, then truncated.
+    snd(fd, "use beta\r\n");
+    ck(fd, "USING beta\r\n");
+    snd(fd, "put 0 0 60 4\r\nbeta\r\n");
+    ck(fd, "INSERTED 2\r\n");
+    snd(fd, "truncate beta\r\n");
+    ck(fd, "TRUNCATED 1\r\n");
+
+    // Restart.
+    close(fd);
+    port = restartsrv_wal();
+    fd = diallocal(port);
+
+    // Alpha's job must survive (cross-tube safety).
+    snd(fd, "use alpha\r\n");
+    ck(fd, "USING alpha\r\n");
+    snd(fd, "watch alpha\r\n");
+    ck(fd, "WATCHING 2\r\n");
+    snd(fd, "reserve-with-timeout 0\r\n");
+    cksub(fd, "RESERVED 1 5\r\n");
+    cksub(fd, "alpha\r\n");
+
+    // Beta's job must be gone.
+    snd(fd, "watch beta\r\n");
+    ck(fd, "WATCHING 3\r\n");
+    snd(fd, "ignore alpha\r\n");
+    ck(fd, "WATCHING 2\r\n");
+    snd(fd, "delete 1\r\n");
+    ck(fd, "DELETED\r\n");
+    snd(fd, "reserve-with-timeout 0\r\n");
+    ck(fd, "TIMED_OUT\r\n");
+}
+
+void
+cttest_truncate_connclose_reserved()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    snd(fd, "use cc\r\n");
+    ck(fd, "USING cc\r\n");
+    snd(fd, "put 0 0 60 3\r\nfoo\r\n");
+    ck(fd, "INSERTED 1\r\n");
+    snd(fd, "watch cc\r\n");
+    ck(fd, "WATCHING 2\r\n");
+    snd(fd, "reserve-with-timeout 0\r\n");
+    cksub(fd, "RESERVED 1 3\r\n");
+    rd(fd);
+
+    snd(fd, "truncate cc\r\n");
+    ck(fd, "TRUNCATED 0\r\n");
+
+    // Close connection with reserved purge-eligible job.
+    // Must not crash (use-after-free fix in enqueue_reserved_jobs).
+    close(fd);
+
+    // Verify server is still alive by connecting again.
+    int fd2 = diallocal(port);
+    snd(fd2, "stats\r\n");
+    cksub(fd2, "OK ");
+}
+

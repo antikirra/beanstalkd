@@ -69,6 +69,7 @@ static const char _Alignas(64) valid_name_char[256] = {
 #define CMD_STATS_TUBE "stats-tube "
 #define CMD_QUIT "quit"
 #define CMD_PAUSE_TUBE "pause-tube"
+#define CMD_TRUNCATE "truncate "
 
 #define CONSTSTRLEN(m) (sizeof(m) - 1)
 
@@ -95,6 +96,7 @@ static const char _Alignas(64) valid_name_char[256] = {
 #define CMD_LIST_TUBES_WATCHED_LEN CONSTSTRLEN(CMD_LIST_TUBES_WATCHED)
 #define CMD_STATS_TUBE_LEN CONSTSTRLEN(CMD_STATS_TUBE)
 #define CMD_PAUSE_TUBE_LEN CONSTSTRLEN(CMD_PAUSE_TUBE)
+#define CMD_TRUNCATE_LEN CONSTSTRLEN(CMD_TRUNCATE)
 
 #define MSG_FOUND "FOUND"
 #define MSG_NOTFOUND "NOT_FOUND\r\n"
@@ -154,7 +156,8 @@ static const char _Alignas(64) valid_name_char[256] = {
 #define OP_PAUSE_TUBE 23
 #define OP_KICKJOB 24
 #define OP_RESERVE_JOB 25
-#define TOTAL_OPS 26
+#define OP_TRUNCATE 26
+#define TOTAL_OPS 27
 
 #define STATS_FMT "---\n" \
     "current-jobs-urgent: %" PRIu64 "\n" \
@@ -184,6 +187,7 @@ static const char _Alignas(64) valid_name_char[256] = {
     "cmd-list-tube-used: %" PRIu64 "\n" \
     "cmd-list-tubes-watched: %" PRIu64 "\n" \
     "cmd-pause-tube: %" PRIu64 "\n" \
+    "cmd-truncate: %" PRIu64 "\n" \
     "job-timeouts: %" PRIu64 "\n" \
     "total-jobs: %" PRIu64 "\n" \
     "max-job-size: %zu\n" \
@@ -249,6 +253,7 @@ static const char _Alignas(64) valid_name_char[256] = {
 
 static uint64 ready_ct = 0;
 static uint64 delayed_ct = 0;
+static uint64 truncated_tubes_ct = 0;
 static uint64 paused_ct = 0;
 static uint64 timeout_ct = 0;
 
@@ -367,6 +372,9 @@ prot_remove_tube(Tube *t)
         heapremove(&pause_tube_heap, t->pause_heap_index);
         t->in_pause_heap = 0;
     }
+    if (t->purge_before_id) {
+        truncated_tubes_ct--;
+    }
 }
 
 static Tube *default_tube;
@@ -413,6 +421,7 @@ static const char * op_names[] = {
     CMD_PAUSE_TUBE,
     CMD_KICKJOB,
     CMD_RESERVE_JOB,
+    CMD_TRUNCATE,
 };
 
 static Job *remove_ready_job(Job *j);
@@ -678,6 +687,19 @@ reply_kicked(Conn *c, uint64 count)
     reply(c, p, (int)(c->reply_buf + LINE_BUF_SIZE - p), STATE_SEND_WORD);
 }
 
+static void
+reply_truncated(Conn *c, uint64 count)
+{
+    char *end = c->reply_buf + LINE_BUF_SIZE;
+    *--end = '\n';
+    *--end = '\r';
+    char *p = u64toa(end, count);
+    *--p = ' ';
+    p -= 9;
+    memcpy(p, "TRUNCATED", 9);
+    reply(c, p, (int)(c->reply_buf + LINE_BUF_SIZE - p), STATE_SEND_WORD);
+}
+
 // reply "BURIED <id>\r\n" without vsnprintf.
 static void
 reply_buried(Conn *c, uint64 id)
@@ -753,11 +775,23 @@ __attribute__((hot)) static void
 process_tube(Tube *t)
 {
     if (t->pause) return;  // hoisted: pause can't change during the loop
+    int purge_limit = 64;
     while (t->ready.len > 0 && t->waiting_conns.len > 0) {
         Job *j = remove_ready_job(t->ready.data[0]);
         if (!j) {
             twarnx("job not ready");
             break;
+        }
+        if (unlikely(t->purge_before_id && j->r.id <= t->purge_before_id)) {
+            j->r.state = Invalid;
+            int z = walresvupdate(&srv.wal);
+            if (z) { j->walresv += z; walwrite(&srv.wal, j); }
+            filermjob(j->file, j);
+            t->stat.total_delete_ct++;
+            walresvreturn(&srv.wal, j->walresv);
+            job_free(j);
+            if (unlikely(--purge_limit <= 0)) break;
+            continue;
         }
         // Prefetch new heap root for next iteration (hides L2/L3 latency).
         if (t->ready.len > 0)
@@ -818,6 +852,16 @@ enqueue_job(Server *s, Job *j, int64 delay, char update_store)
 {
     int r;
     Wal *w = &s->wal;
+
+    if (unlikely(j->tube->purge_before_id && j->r.id <= j->tube->purge_before_id)) {
+        j->r.state = Invalid;
+        if (update_store && j->file) walwrite(w, j);
+        filermjob(j->file, j);
+        j->tube->stat.total_delete_ct++;
+        walresvreturn(w, j->walresv);
+        job_free(j);
+        return 1;
+    }
 
     // j->reserver is already NULL: new jobs from memset(0) in allocate_job,
     // re-enqueued jobs from remove_this_reserved_job.
@@ -910,11 +954,12 @@ enqueue_reserved_jobs(Conn *c)
     c->soonest_job = NULL;
     while (!job_list_is_empty(&c->reserved_jobs)) {
         Job *j = job_list_remove(c->reserved_jobs.next);
+        Tube *t = j->tube;
         int r = enqueue_job(c->srv, j, 0, 0);
         if (r < 1)
             bury_job(c->srv, j, 0);
         global_stat.reserved_ct--;
-        j->tube->stat.reserved_ct--;
+        t->stat.reserved_ct--;
     }
 }
 
@@ -1180,7 +1225,10 @@ which_cmd(Conn *c)
         TEST_CMD(c->cmd, CMD_KICKJOB, OP_KICKJOB);   // "kick-job "
         break;
     case 't':
-        TEST_CMD(c->cmd, CMD_TOUCH, OP_TOUCH);
+        switch (c->cmd[1]) {
+        case 'r': TEST_CMD(c->cmd, CMD_TRUNCATE, OP_TRUNCATE); break;
+        case 'o': TEST_CMD(c->cmd, CMD_TOUCH, OP_TOUCH); break;
+        }
         break;
     case 's':
         if (c->cmd_len < 7) break; // shortest: "stats\r\n" = 7
@@ -1316,16 +1364,17 @@ enqueue_incoming_job(Conn *c)
     /* we have a complete job, so let's stick it in the pqueue */
     global_stat.total_jobs_ct++;
     j->tube->stat.total_jobs_ct++;
+    uint64 jid = j->r.id;
     r = enqueue_job(c->srv, j, j->r.delay, 1);
 
     if (likely(r == 1)) {
-        reply_inserted(c, j->r.id);
+        reply_inserted(c, jid);
         return;
     }
 
     /* out of memory trying to grow the queue, so it gets buried */
     bury_job(c->srv, j, 0);
-    reply_buried(c, j->r.id);
+    reply_buried(c, jid);
 }
 
 static uint
@@ -1404,6 +1453,7 @@ fmt_stats(char *buf, size_t size, void *x)
                     agg_op[OP_LIST_TUBE_USED],
                     agg_op[OP_LIST_TUBES_WATCHED],
                     agg_op[OP_PAUSE_TUBE],
+                    agg_op[OP_TRUNCATE],
                     agg_timeout,
                     agg_total_jobs,
                     job_data_size_limit,
@@ -1846,7 +1896,9 @@ dispatch_cmd(Conn *c)
         op_ct[type]++;
 
         if (c->use->ready.len) {
-            j = job_copy(c->use->ready.data[0]);
+            Job *top = c->use->ready.data[0];
+            if (!c->use->purge_before_id || top->r.id > c->use->purge_before_id)
+                j = job_copy(top);
         }
 
         if (!j) {
@@ -1864,7 +1916,9 @@ dispatch_cmd(Conn *c)
         op_ct[type]++;
 
         if (c->use->delay.len) {
-            j = job_copy(c->use->delay.data[0]);
+            Job *top = c->use->delay.data[0];
+            if (!c->use->purge_before_id || top->r.id > c->use->purge_before_id)
+                j = job_copy(top);
         }
 
         if (!j) {
@@ -1882,10 +1936,11 @@ dispatch_cmd(Conn *c)
         }
         op_ct[type]++;
 
-        if (!job_list_is_empty(&c->use->buried))
-            j = job_copy(c->use->buried.next);
-        else
-            j = NULL;
+        if (!job_list_is_empty(&c->use->buried)) {
+            Job *top = c->use->buried.next;
+            if (!c->use->purge_before_id || top->r.id > c->use->purge_before_id)
+                j = job_copy(top);
+        }
 
         if (!j) {
             reply_msg(c, MSG_NOTFOUND);
@@ -1904,7 +1959,13 @@ dispatch_cmd(Conn *c)
         /* So, peek is annoying, because some other connection might free the
          * job while we are still trying to write it out. So we copy it and
          * free the copy when it's done sending, in the "conn_want_command" function. */
-        j = job_copy(job_find(id));
+        {
+            Job *orig = job_find(id);
+            if (orig && orig->tube->purge_before_id
+                && orig->r.id <= orig->tube->purge_before_id)
+                orig = NULL;
+            j = job_copy(orig);
+        }
 
         if (!j) {
             reply_msg(c, MSG_NOTFOUND);
@@ -1940,7 +2001,7 @@ dispatch_cmd(Conn *c)
         /* Fast path: scan watched tubes for a ready job. */
         for (size_t wi = 0; wi < c->watch.len; wi++) {
             Tube *wt = c->watch.items[wi];
-            if (wt->ready.len > 0 && !wt->pause) {
+            if (wt->ready.len > 0 && !wt->pause && !wt->purge_before_id) {
                 j = remove_ready_job(wt->ready.data[0]);
                 if (likely(j)) {
                     global_stat.reserved_ct++;
@@ -1973,6 +2034,10 @@ dispatch_cmd(Conn *c)
 
         j = job_find(id);
         if (!j) {
+            reply_msg(c, MSG_NOTFOUND);
+            return;
+        }
+        if (j->tube->purge_before_id && j->r.id <= j->tube->purge_before_id) {
             reply_msg(c, MSG_NOTFOUND);
             return;
         }
@@ -2403,6 +2468,55 @@ dispatch_cmd(Conn *c)
         return;
     }
 
+    case OP_TRUNCATE: {
+        size_t namelen;
+        char *endpos;
+        if (read_tube_name(&name, c->cmd + CMD_TRUNCATE_LEN, &endpos)) {
+            reply_msg(c, MSG_BAD_FORMAT);
+            return;
+        }
+
+        if (*endpos != '\0') {
+            reply_msg(c, MSG_BAD_FORMAT);
+            return;
+        }
+        namelen = is_valid_tube(name, MAX_TUBE_NAME_LEN - 1);
+        if (!namelen) {
+            reply_msg(c, MSG_BAD_FORMAT);
+            return;
+        }
+        op_ct[type]++;
+        t = tube_find_name(name, namelen);
+        if (!t) {
+            reply_msg(c, MSG_NOTFOUND);
+            return;
+        }
+
+        uint64 cutoff = job_next_id() - 1;
+        if (cutoff == 0) {
+            reply_truncated(c, 0);
+            return;
+        }
+
+        uint64 count = t->ready.len + t->delay.len;
+        for (Job *bj = t->buried.next; bj != &t->buried; bj = bj->next)
+            count++;
+
+        uint64 old_purge = t->purge_before_id;
+        if (!old_purge) truncated_tubes_ct++;
+        t->purge_before_id = cutoff;
+        if (!wal_write_truncate(&c->srv->wal, t, cutoff)) {
+            t->purge_before_id = old_purge;
+            if (!old_purge) truncated_tubes_ct--;
+            reply_serr(c, MSG_INTERNAL_ERROR);
+            return;
+        }
+        walmaint(&c->srv->wal);
+
+        reply_truncated(c, count);
+        return;
+    }
+
     default:
         reply_msg(c, MSG_UNKNOWN_COMMAND);
     }
@@ -2755,6 +2869,69 @@ prottick(Server *s)
             bury_job(s, j, 0);  /* out of memory */
     }
 
+    // Lazy reap: remove dead jobs from truncated tubes, up to 64 per tick.
+    if (truncated_tubes_ct > 0) {
+        int reaped = 0;
+        for (size_t ti = 0; ti < tubes.len && reaped < 64; ti++) {
+            Tube *rt = tubes.items[ti];
+            if (!rt->purge_before_id) continue;
+
+            for (size_t i = 0; i < rt->ready.len && reaped < 64; ) {
+                Job *rj = rt->ready.data[i];
+                if (rj->r.id <= rt->purge_before_id) {
+                    if (!remove_ready_job(rj)) { i++; continue; }
+                    rj->r.state = Invalid;
+                    int z = walresvupdate(&s->wal);
+                    if (z) { rj->walresv += z; walwrite(&s->wal, rj); }
+                    filermjob(rj->file, rj);
+                    rt->stat.total_delete_ct++;
+                    walresvreturn(&s->wal, rj->walresv);
+                    job_free(rj);
+                    reaped++;
+                } else { i++; }
+            }
+
+            for (size_t i = 0; i < rt->delay.len && reaped < 64; ) {
+                Job *rj = rt->delay.data[i];
+                if (rj->r.id <= rt->purge_before_id) {
+                    remove_delayed_job(rj);
+                    rj->r.state = Invalid;
+                    int z = walresvupdate(&s->wal);
+                    if (z) { rj->walresv += z; walwrite(&s->wal, rj); }
+                    filermjob(rj->file, rj);
+                    rt->stat.total_delete_ct++;
+                    walresvreturn(&s->wal, rj->walresv);
+                    job_free(rj);
+                    reaped++;
+                } else { i++; }
+            }
+
+            Job *next;
+            for (Job *bj = rt->buried.next; bj != &rt->buried && reaped < 64; bj = next) {
+                next = bj->next;
+                if (bj->r.id <= rt->purge_before_id) {
+                    remove_buried_job(bj);
+                    bj->r.state = Invalid;
+                    int z = walresvupdate(&s->wal);
+                    if (z) { bj->walresv += z; walwrite(&s->wal, bj); }
+                    filermjob(bj->file, bj);
+                    rt->stat.total_delete_ct++;
+                    walresvreturn(&s->wal, bj->walresv);
+                    job_free(bj);
+                    reaped++;
+                }
+            }
+
+            if (rt->ready.len == 0 && rt->delay.len == 0
+                && job_list_is_empty(&rt->buried)
+                && rt->stat.reserved_ct == 0) {
+                rt->purge_before_id = 0;
+                truncated_tubes_ct--;
+            }
+        }
+        if (reaped > 0) walmaint(&s->wal);
+    }
+
     // Unpause tubes whose deadline has arrived. O(k log n) for k expired tubes.
     // Uses pause_tube_heap for O(1) lookup of soonest unpause deadline.
     while (pause_tube_heap.len) {
@@ -2851,11 +3028,26 @@ h_accept(const int fd, const short which, Server *s)
     epollq_apply();
 }
 
+static int
+wal_compact_post(Wal *w)
+{
+    if (truncated_tubes_ct == 0) return 1;
+    for (size_t i = 0; i < tubes.len; i++) {
+        Tube *t = tubes.items[i];
+        if (t->purge_before_id) {
+            if (!wal_write_truncate(w, t, t->purge_before_id))
+                return 0;
+        }
+    }
+    return 1;
+}
+
 __attribute__((cold)) void
 prot_init()
 {
     now = nanoseconds();
     started_at = now;
+    srv.wal.compact_post = wal_compact_post;
 
     int dev_random = open("/dev/urandom", O_RDONLY);
     if (dev_random < 0) {
@@ -2946,5 +3138,12 @@ prot_replay(Server *s, Job *list)
             }
         }
     }
+
+    truncated_tubes_ct = 0;
+    for (size_t i = 0; i < tubes.len; i++) {
+        Tube *rt = tubes.items[i];
+        if (rt->purge_before_id) truncated_tubes_ct++;
+    }
+
     return ok;
 }

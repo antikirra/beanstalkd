@@ -114,6 +114,12 @@ store_job(Job *j)
         rehash_start(1);
 }
 
+uint64
+job_next_id(void)
+{
+    return next_id;
+}
+
 __attribute__((hot)) Job *
 job_find(uint64 job_id)
 {

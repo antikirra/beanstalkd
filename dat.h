@@ -282,9 +282,9 @@ struct Tube {
     int64 unpause_at;                   // timestamp when to unpause, in nsec
     Ms waiting_conns;                   // conns waiting for a job at this moment
 
-    // --- cache line 4 (192-255): stats ---
+    // --- cache line 4 (192-255): stats + truncate state ---
     struct stats stat;
-    // (8 bytes remaining in CL4)
+    uint64 purge_before_id;             // jobs with id <= this are dead (0 = no purge)
 
     // --- cold fields: lookup, list management ---
     Tube *ht_next;                      // hash table chain for global tube lookup
@@ -344,6 +344,8 @@ void job_free(Job *j);
 
 /* Lookup a job by job ID */
 Job *job_find(uint64 job_id);
+
+uint64 job_next_id(void);
 
 /* the void* parameters are really job pointers */
 void job_setpos(void *j, size_t pos);
@@ -520,10 +522,13 @@ struct Wal {
     int             sync_stop;
     _Atomic int     sync_err;
     int             sync_on;
+
+    int (*compact_post)(Wal *);
 };
 int  waldirlock(Wal*);
 void walinit(Wal*, Job *list);
 int  walwrite(Wal*, Job*);
+int  wal_write_truncate(Wal*, Tube*, uint64);
 int  walmaint(Wal*);
 int  walresvput(Wal*, Job*);
 int  walresvupdate(Wal*);
@@ -565,6 +570,7 @@ void filewopen(File*);
 void filewclose(File*);
 int  filewrjobshort(File*, Job*);
 int  filewrjobfull(File*, Job*);
+int  filewrtruncate(File*, Tube*, uint64);
 
 
 #define Portdef "11300"

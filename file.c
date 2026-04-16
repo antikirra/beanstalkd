@@ -332,6 +332,12 @@ readrec(File *f, Job *l, int *err)
         } /* end old_body_size scope */
     case Invalid:
         free(body_buf);
+        if (namelen > 0) {
+            t = tube_find_or_make(tubename);
+            if (t && jr.id > t->purge_before_id)
+                t->purge_before_id = jr.id;
+            return 1;
+        }
         if (j) {
             job_list_remove(j);
             filermjob(j->file, j);
@@ -764,6 +770,83 @@ filewrjobfull(File *f, Job *j)
     if (r)
         fileaddjob(f, j);
     return r;
+}
+
+
+int
+filewrtruncate(File *f, Tube *t, uint64 cutoff_id)
+{
+    int nl = t->name_len;
+    char body[2] = "\r\n";
+    Jobrec jr = {0};
+    jr.id = cutoff_id;
+    jr.state = Invalid;
+    jr.body_size = sizeof body;
+
+    uint32 crc = WAL_CRC32C_INIT;
+    crc = wal_crc32c(crc, &nl,     sizeof nl);
+    crc = wal_crc32c(crc, t->name, nl);
+    crc = wal_crc32c(crc, &jr,     sizeof jr);
+    crc = wal_crc32c(crc, body,    sizeof body);
+    crc ^= WAL_CRC32C_XOR;
+    unsigned char crc_bytes[4] = {
+        (unsigned char)(crc      ),
+        (unsigned char)(crc >>  8),
+        (unsigned char)(crc >> 16),
+        (unsigned char)(crc >> 24),
+    };
+
+    struct iovec iov[5] = {
+        { .iov_base = &nl,       .iov_len = sizeof nl },
+        { .iov_base = t->name,   .iov_len = nl },
+        { .iov_base = &jr,       .iov_len = sizeof jr },
+        { .iov_base = body,      .iov_len = sizeof body },
+        { .iov_base = crc_bytes, .iov_len = sizeof crc_bytes },
+    };
+
+    int total = sizeof(int) + nl + sizeof(Jobrec) + sizeof body + sizeof(uint32);
+    struct iovec *vp = iov;
+    int iovcnt = 5;
+    ssize_t r = writev(f->fd, vp, iovcnt);
+    if (likely(r == total))
+        goto done;
+
+    if (r == -1) {
+        if (errno == EINTR) r = 0;
+        else { twarn("writev truncate marker"); return 0; }
+    } else if (unlikely(r <= 0)) {
+        twarn("writev truncate marker");
+        return 0;
+    }
+
+    {
+        int written = (int)r;
+        while (iovcnt > 0 && (size_t)r >= vp[0].iov_len) {
+            r -= vp[0].iov_len; vp++; iovcnt--;
+        }
+        if (iovcnt > 0 && r > 0) {
+            vp[0].iov_base = (char *)vp[0].iov_base + r;
+            vp[0].iov_len -= r;
+        }
+        while (written < total) {
+            r = writev(f->fd, vp, iovcnt);
+            if (r == -1 && errno == EINTR) continue;
+            if (unlikely(r <= 0)) { twarn("writev truncate marker"); return 0; }
+            written += r;
+            while (iovcnt > 0 && (size_t)r >= vp[0].iov_len) {
+                r -= vp[0].iov_len; vp++; iovcnt--;
+            }
+            if (iovcnt > 0 && r > 0) {
+                vp[0].iov_base = (char *)vp[0].iov_base + r;
+                vp[0].iov_len -= r;
+            }
+        }
+    }
+
+done:
+    f->w->resv -= total;
+    f->resv -= total;
+    return 1;
 }
 
 

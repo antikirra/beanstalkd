@@ -281,12 +281,22 @@ walcompact(Wal *w)
 {
     int r;
 
+    // Rewrite truncate markers to the current file BEFORE migration.
+    // walgc is triggered lazily by filedecref inside moveone, so it
+    // can delete old files (with their markers) during the loop below.
+    // Writing fresh markers first ensures they survive in w->cur.
+    if (w->compact_post) {
+        if (!w->compact_post(w))
+            return 0;
+    }
+
     for (r=ratio(w); r>=2; r--) {
         for (int batch = 0; batch < 8; batch++) {
             if (!moveone(w))
                 return batch > 0; // partial batch is not a failure
         }
     }
+
     return 1;
 }
 
@@ -356,6 +366,26 @@ walwrite(Wal *w, Job *j)
         }
     }
     if (unlikely(!r)) {
+        filewclose(w->cur);
+        w->use = 0;
+        return 0;
+    }
+    w->nrec++;
+    return r;
+}
+
+
+int
+wal_write_truncate(Wal *w, Tube *t, uint64 cutoff_id)
+{
+    if (!w->use) return 1;
+
+    int needed = sizeof(int) + (int)t->name_len + sizeof(Jobrec) + 2 + sizeof(uint32);
+    if (!reserve(w, needed)) return 0;
+    if (w->cur->resv <= 0 && !usenext(w)) return 0;
+
+    int r = filewrtruncate(w->cur, t, cutoff_id);
+    if (!r) {
         filewclose(w->cur);
         w->use = 0;
         return 0;
