@@ -49,6 +49,8 @@ TOFILES=\
 	testcore.o\
 	testprot2.o\
 	testwal2.o\
+	testinject.o\
+	testinject2.o\
 
 HFILES=\
 	dat.h\
@@ -107,8 +109,19 @@ check: ct/_ctcheck
 bench: ct/_ctcheck
 	ct/_ctcheck -b
 
+WRAP_FLAGS=\
+	-Wl,--wrap,malloc\
+	-Wl,--wrap,calloc\
+	-Wl,--wrap,realloc\
+	-Wl,--wrap,write\
+	-Wl,--wrap,writev\
+	-Wl,--wrap,read\
+	-Wl,--wrap,open\
+	-Wl,--wrap,ftruncate\
+	-Wl,--wrap,unlink
+
 ct/_ctcheck: ct/_ctcheck.o ct/ct.o $(OFILES) $(TOFILES)
-	$(LINK.o) -o $@ $^ $(LDLIBS)
+	$(LINK.o) $(WRAP_FLAGS) -o $@ $^ $(LDLIBS)
 
 ct/_ctcheck.o: ct/_ctcheck.c
 
@@ -119,6 +132,7 @@ ct/_ctcheck.c: $(TOFILES) ct/gen
 ct/ct.o ct/_ctcheck.o: ct/ct.h ct/internal.h
 
 $(TOFILES): $(HFILES) ct/ct.h
+testinject.o testinject2.o: testinject.h
 
 CLEANFILES+=$(wildcard ct/_* ct/*.o ct/*.gc*)
 
