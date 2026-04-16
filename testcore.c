@@ -262,3 +262,111 @@ cttest_tube_find_name_adversarial()
     tube_dref(t);
     ms_clear(&tubes);
 }
+
+/* --- primes[] table sanity --- */
+
+// Deterministic Miller-Rabin for n < 3.3e18 using the 12-witness set
+// {2,3,5,7,11,13,17,19,23,29,31,37}. Covers all primes in the table
+// (max = 1.73e18 on LP64).
+
+static uint64_t
+mulmod64(uint64_t a, uint64_t b, uint64_t m)
+{
+    return (uint64_t)(((__uint128_t)a * b) % m);
+}
+
+static uint64_t
+powmod(uint64_t base, uint64_t exp, uint64_t mod)
+{
+    uint64_t res = 1;
+    base %= mod;
+    while (exp) {
+        if (exp & 1)
+            res = mulmod64(res, base, mod);
+        base = mulmod64(base, base, mod);
+        exp >>= 1;
+    }
+    return res;
+}
+
+static int
+mr_composite(uint64_t a, uint64_t d, int s, uint64_t n)
+{
+    uint64_t x = powmod(a, d, n);
+    if (x == 1 || x == n - 1)
+        return 0;
+    for (int r = 0; r < s - 1; r++) {
+        x = mulmod64(x, x, n);
+        if (x == n - 1)
+            return 0;
+    }
+    return 1;
+}
+
+static int
+is_prime_u64(uint64_t n)
+{
+    if (n < 2) return 0;
+    if (n < 4) return 1;
+    if ((n & 1) == 0) return 0;
+
+    uint64_t d = n - 1;
+    int s = 0;
+    while ((d & 1) == 0) { d >>= 1; s++; }
+
+    static const uint64_t witnesses[] = {
+        2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37
+    };
+    for (size_t i = 0; i < sizeof(witnesses) / sizeof(witnesses[0]); i++) {
+        uint64_t a = witnesses[i];
+        if (a >= n) continue;
+        if (mr_composite(a, d, s, n))
+            return 0;
+    }
+    return 1;
+}
+
+// Hostile: every entry in primes[] must be prime. A typo in the hand-written
+// table silently degrades hash-table distribution (collisions cluster around
+// composite "pseudo-primes"), invisible until production latency spikes.
+void
+cttest_primes_all_prime()
+{
+    assertf(primes_len > 0, "primes_len must be > 0, got %zu", primes_len);
+    for (size_t i = 0; i < primes_len; i++) {
+        assertf(is_prime_u64((uint64_t)primes[i]),
+                "primes[%zu] = %zu is NOT prime", i, primes[i]);
+    }
+}
+
+// Strictly monotone: the rehash code picks the next bucket count by
+// stepping forward in this list. A non-increasing entry would make
+// upscale pick a smaller table — silent performance cliff.
+void
+cttest_primes_strictly_monotone()
+{
+    for (size_t i = 1; i < primes_len; i++) {
+        assertf(primes[i] > primes[i - 1],
+                "primes not strictly monotone at index %zu: "
+                "prev=%zu curr=%zu",
+                i, primes[i - 1], primes[i]);
+    }
+}
+
+// Growth invariant: each step at least ~2x the previous.
+// The rehash upscales at 4x load; if two adjacent primes were closer
+// than 2x, we'd rehash without gaining headroom.
+//
+// The bound is computed in __uint128_t so a future entry close to
+// 2^63 does not silently overflow the check into "always passes".
+void
+cttest_primes_doubling()
+{
+    for (size_t i = 1; i < primes_len; i++) {
+        __uint128_t prev = (__uint128_t)primes[i - 1];
+        __uint128_t bound = prev * 2 - prev / 8;   // ~1.875x
+        assertf((__uint128_t)primes[i] >= bound,
+                "primes[%zu]=%zu not >= ~1.875x primes[%zu]=%zu",
+                i, primes[i], i - 1, primes[i - 1]);
+    }
+}

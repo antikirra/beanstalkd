@@ -32,6 +32,9 @@ fault_set(int which, int after, int err)
     faults[which].countdown = after + 1;
     faults[which].err = err;
     faults[which].hits = 0;
+    // Intentionally DO NOT reset `calls` here: a test may want to
+    // measure the number of wrapped calls before AND after arming.
+    // Use fault_clear_all() to reset everything.
 }
 
 void
@@ -48,6 +51,7 @@ fault_clear_all(void)
         faults[i].countdown = 0;
         faults[i].err = 0;
         faults[i].hits = 0;
+        faults[i].calls = 0;
     }
 }
 
@@ -57,10 +61,17 @@ fault_hits(int which)
     return faults[which].hits;
 }
 
+int
+fault_calls(int which)
+{
+    return faults[which].calls;
+}
+
 static int
 fault_fire(int which)
 {
     struct fault *f = &faults[which];
+    f->calls++;
     if (f->countdown <= 0)
         return 0;
     if (f->countdown > 1) {
@@ -86,6 +97,7 @@ extern ssize_t __real_read(int, void *, size_t);
 extern int     __real_open(const char *, int, mode_t);
 extern int     __real_ftruncate(int, off_t);
 extern int     __real_unlink(const char *);
+extern int     __real_fdatasync(int);
 
 
 void *
@@ -165,4 +177,18 @@ __wrap_unlink(const char *path)
     if (fault_fire(FAULT_UNLINK))
         return -1;
     return __real_unlink(path);
+}
+
+int
+__wrap_fdatasync(int fd)
+{
+    // Skip fd 0/1/2 to match the discipline used by __wrap_write /
+    // __wrap_writev: a misbehaving test that accidentally issues
+    // fdatasync(stdin) must not be silently "fixed" by an injected
+    // failure, and conversely must not count toward fault_calls().
+    if (fd <= 2)
+        return __real_fdatasync(fd);
+    if (fault_fire(FAULT_FDATASYNC))
+        return -1;
+    return __real_fdatasync(fd);
 }

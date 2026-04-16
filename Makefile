@@ -118,7 +118,8 @@ WRAP_FLAGS=\
 	-Wl,--wrap,read\
 	-Wl,--wrap,open\
 	-Wl,--wrap,ftruncate\
-	-Wl,--wrap,unlink
+	-Wl,--wrap,unlink\
+	-Wl,--wrap,fdatasync
 
 ct/_ctcheck: ct/_ctcheck.o ct/ct.o $(OFILES) $(TOFILES)
 	$(LINK.o) $(WRAP_FLAGS) -o $@ $^ $(LDLIBS)

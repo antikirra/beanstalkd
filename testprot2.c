@@ -770,3 +770,117 @@ cttest_job_hash_large_scale_rehash()
     free(ids);
     tube_dref(t);
 }
+
+
+// ─── wyhash: avalanche on 1-bit input change ───────────────────
+// A good hash flips ~50% of output bits for a 1-bit input flip.
+// DJB2 notoriously leaves the low bits almost unchanged. Require
+// at least 10 of 32 bits flipped — a conservative lower bound.
+void
+cttest_tube_name_hash_avalanche()
+{
+    char a[16] = "workload-task-X";
+    char b[16] = "workload-task-Y";  // diff one byte, one bit: 'X'^'Y' = 1
+
+    uint ha = tube_name_hash_n(a, 15);
+    uint hb = tube_name_hash_n(b, 15);
+    assertf(ha != hb, "single-byte diff must produce different hashes");
+
+    int flipped = __builtin_popcount(ha ^ hb);
+    assertf(flipped >= 10,
+            "avalanche weak: only %d/32 bits flipped between '%s' and '%s' "
+            "(0x%08x vs 0x%08x)", flipped, a, b, ha, hb);
+}
+
+// ─── Adversarial key family: incremental length ────────────────
+// A pathological hash (e.g. plain DJB2 with no finalizer, or a
+// hash that ignores length) collapses "a", "aa", "aaa", ... into
+// one or two buckets. The test catches the catastrophic regime,
+// not statistical outliers: with N=1024 items in 32 buckets
+// (mean=32, stddev≈5.7) a healthy hash fills every bucket and
+// keeps the maximum within ~3σ of the mean.
+void
+cttest_tube_name_hash_adversarial_family()
+{
+    enum { N = 1024, NBUCKETS = 32 };
+    int buckets[NBUCKETS] = {0};
+
+    char name[N + 1];
+    memset(name, 'a', N);
+    name[N] = '\0';
+
+    for (int len = 1; len <= N; len++) {
+        uint h = tube_name_hash_n(name, (size_t)len);
+        buckets[h % NBUCKETS]++;
+    }
+
+    int empty = 0, max = 0;
+    for (int i = 0; i < NBUCKETS; i++) {
+        if (buckets[i] == 0) empty++;
+        if (buckets[i] > max) max = buckets[i];
+    }
+
+    // Healthy hash: 0 empty buckets, max ≲ 60 (~3σ above mean=32).
+    // Broken hash collapses to one bucket: empty≈31, max=N.
+    assertf(empty <= 2,
+            "wyhash clusters 'a'×N family: %d empty buckets / %d",
+            empty, NBUCKETS);
+    assertf(max <= 60,
+            "wyhash peaks at %d in one bucket (mean=%d) — clustering",
+            max, N / NBUCKETS);
+}
+
+// ─── Length-invariant determinism ──────────────────────────────
+// tube_name_hash_n(s, len) must equal tube_name_hash(s) when s is
+// NUL-terminated with length `len`. Catches a bug where _n picks
+// up the trailing NUL or misreads len.
+void
+cttest_tube_name_hash_n_matches_name_hash()
+{
+    const char *samples[] = {
+        "", "a", "default", "email-priority-high",
+        "this-is-a-much-longer-tube-name-to-stress-the-16-byte-branch",
+    };
+    for (size_t i = 0; i < sizeof(samples) / sizeof(samples[0]); i++) {
+        size_t len = strlen(samples[i]);
+        uint ha = tube_name_hash(samples[i]);
+        uint hb = tube_name_hash_n(samples[i], len);
+        assertf(ha == hb,
+                "hash drift for '%s': strlen path=%u explicit path=%u",
+                samples[i], ha, hb);
+    }
+}
+
+// ─── Hash distribution at full TUBE_HASH_SIZE (4096) ───────────
+// Heavier than cttest_hash_distribution_fairness: 10K realistic
+// tube names, all 4096 buckets, p99 load factor must be bounded.
+void
+cttest_tube_name_hash_full_table_fairness()
+{
+    enum { N = 10000, NB = 4096 };
+    int *buckets = calloc(NB, sizeof(int));
+    assertf(buckets, "calloc must succeed");
+
+    for (int i = 0; i < N; i++) {
+        char name[64];
+        snprintf(name, sizeof name, "queue-%d-shard-%d", i / 97, i % 97);
+        uint h = tube_name_hash(name) % NB;
+        buckets[h]++;
+    }
+
+    int empty = 0, max = 0;
+    for (int i = 0; i < NB; i++) {
+        if (buckets[i] == 0) empty++;
+        if (buckets[i] > max) max = buckets[i];
+    }
+
+    // Poisson with mean 10000/4096 ≈ 2.44: P(bucket empty) ≈ e^-2.44 ≈ 0.087.
+    // Expected ~356 empty. Allow wide margin (up to 900 ≈ 22%).
+    assertf(empty < 900,
+            "too many empty buckets: %d / %d — hash is skewed", empty, NB);
+    // Max bucket > 12 would indicate clustering; Poisson tail predicts < 15.
+    assertf(max <= 15,
+            "max bucket depth %d too high — clustering detected", max);
+
+    free(buckets);
+}

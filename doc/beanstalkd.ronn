@@ -46,6 +46,15 @@ and format of the `beanstalkd` protocol.
 
   (This option has no effect without `-b`.)
 
+* `-D`:
+  Durable mode: call fdatasync(2) synchronously inside every binlog
+  write so that a successful reply to the client guarantees the data
+  is already on disk. This disables the asynchronous fsync thread
+  (implies `-F`) and significantly reduces throughput; use when
+  zero-loss durability matters more than peak ops/sec.
+
+  (This option has no effect without `-b`.)
+
 * `-h`:
   Show a brief help message and exit.
 

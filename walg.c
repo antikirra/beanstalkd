@@ -370,6 +370,27 @@ walwrite(Wal *w, Job *j)
         w->use = 0;
         return 0;
     }
+
+    // Durable mode (-D): block until data is on disk before returning.
+    // Without this flag the async fsync thread may lag, and a crash
+    // between walwrite() and fdatasync() loses the record even though
+    // the client already received the success reply.
+    //
+    // fdatasync may be interrupted by a signal (EINTR); retry in that
+    // case. Any other error is treated as permanent — the WAL is
+    // disabled so the next walwrite call refuses cleanly.
+    if (unlikely(w->durable_sync)) {
+        int sr;
+        while ((sr = fdatasync(w->cur->fd)) == -1 && errno == EINTR)
+            ;
+        if (sr == -1) {
+            twarn("durable fdatasync");
+            filewclose(w->cur);
+            w->use = 0;
+            return 0;
+        }
+    }
+
     w->nrec++;
     return r;
 }
@@ -390,6 +411,19 @@ wal_write_truncate(Wal *w, Tube *t, uint64 cutoff_id)
         w->use = 0;
         return 0;
     }
+
+    if (unlikely(w->durable_sync)) {
+        int sr;
+        while ((sr = fdatasync(w->cur->fd)) == -1 && errno == EINTR)
+            ;
+        if (sr == -1) {
+            twarn("durable fdatasync (truncate)");
+            filewclose(w->cur);
+            w->use = 0;
+            return 0;
+        }
+    }
+
     w->nrec++;
     return r;
 }

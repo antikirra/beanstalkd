@@ -104,6 +104,8 @@ usage(int code)
             " -f MS    fsync at most once every MS milliseconds (default is %dms);\n"
             "          use -f0 for \"always fsync\"\n"
             " -F       never fsync\n"
+            " -D       durable mode: block on fdatasync inside each WAL\n"
+            "          write so replies never precede persistence (implies -F)\n"
             " -l ADDR  listen on address (default is 0.0.0.0)\n"
             " -p PORT  listen on port (default is " Portdef ")\n"
             " -u USER  become user and group\n"
@@ -194,9 +196,19 @@ optparse(Server *s, char **argv)
                         ms = 1000000000;
                     }
                     s->wal.syncrate = ms * 1000000;
-                    s->wal.wantsync = 1;
+                    // -f should not resurrect the async sync thread after
+                    // -D asked for blocking fdatasync. -D wins regardless
+                    // of position on the command line.
+                    if (!s->wal.durable_sync)
+                        s->wal.wantsync = 1;
                     break;
                 case 'F':
+                    s->wal.wantsync = 0;
+                    break;
+                case 'D':
+                    // Durable: blocking fdatasync inside walwrite().
+                    // Disable the async sync thread — it would double up.
+                    s->wal.durable_sync = 1;
                     s->wal.wantsync = 0;
                     break;
                 case 'u':

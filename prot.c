@@ -259,7 +259,8 @@ static uint64 timeout_ct = 0;
 
 int64 now = 0;
 static uint64 op_ct[TOTAL_OPS] = {0};
-static struct stats global_stat = {0};
+/* Not static: exposed for hostile unit tests in testinject2.c. */
+struct stats global_stat = {0};
 
 // Global delay tube heap: tubes ordered by their soonest delayed job's deadline.
 // Provides O(1) lookup of the soonest delayed job across all tubes,
@@ -963,7 +964,8 @@ enqueue_reserved_jobs(Conn *c)
     }
 }
 
-static int
+/* Not static: exposed for hostile unit tests in testinject2.c. */
+int
 kick_buried_job(Server *s, Job *j)
 {
     int r;
@@ -996,7 +998,8 @@ kick_buried_job(Server *s, Job *j)
 
 
 
-static int
+/* Not static: exposed for hostile unit tests in testinject2.c. */
+int
 kick_delayed_job(Server *s, Job *j)
 {
     int r;

@@ -7,6 +7,12 @@
 #include <unistd.h>
 #include <errno.h>
 
+// Exposed from prot.c for hostile error-path testing.
+extern int kick_buried_job(Server *s, Job *j);
+extern int kick_delayed_job(Server *s, Job *j);
+extern struct stats global_stat;
+extern void prot_init();
+
 static void
 setup(void)
 {
@@ -460,6 +466,402 @@ cttest_inject_filewritev_writev_fail(void)
     // Job must NOT be linked to the file on write failure.
     assertf(!j->file,
             "job must not be linked to file after writev failure");
+
+    close(fd);
+    unlink(tmppath);
+    job_free(j);
+}
+
+
+// --- Kick error-path: walresv balance under ready-heap OOM ---
+//
+// kick_buried_job reserves WAL space (walresvupdate) for a delete record,
+// removes the job from the buried list, then tries to enqueue it on the
+// ready heap. If heapinsert() fails (realloc ENOMEM here), the function
+// must:
+//   1. roll back kick_ct;
+//   2. return the reserved bytes via walresvreturn() (w->resv, file.resv,
+//      file.free must all return to pre-call values);
+//   3. clear j->walresv;
+//   4. bury the job again so it is not leaked.
+//
+// A regression in any of these steps would silently grow w->resv on every
+// failed kick — fatal for long-running instances under WAL-full pressure.
+void
+cttest_inject_kick_buried_heapinsert_oom_walresv(void)
+{
+    setup();
+
+    Server s = {0};
+
+    // Real file so reserve()/walresvreturn() operate on real counters.
+    char tmppath[] = "/tmp/testinject_kickburied.XXXXXX";
+    int fd = mkstemp(tmppath);
+    assertf(fd >= 0, "mkstemp must succeed");
+
+    int ver = Walver;
+    ssize_t nver = write(fd, &ver, sizeof(ver));
+    assertf(nver == (ssize_t)sizeof(ver),
+            "version header write must succeed");
+
+    s.wal.use = 1;
+    s.wal.filesize = 4096;
+    s.wal.nfile = 1;
+
+    File f = {0};
+    f.w = &s.wal;
+    f.fd = fd;
+    f.iswopen = 1;
+    f.free = 4096;
+    f.resv = 0;
+    f.refs = 2;                  // prevent walgc on filedecref
+    f.jlist.fprev = &f.jlist;
+    f.jlist.fnext = &f.jlist;
+
+    s.wal.cur = &f;
+    s.wal.tail = &f;
+    s.wal.head = &f;
+
+    Tube *t = make_tube("kickburied");
+    assertf(t, "tube must allocate");
+
+    Job *j = allocate_job(10);
+    assertf(j, "job must allocate");
+    TUBE_ASSIGN(j->tube, t);
+    j->r.id = 1;
+    j->r.body_size = 10;
+    memset(j->body, 'X', 10);
+
+    // Place job in Buried state — caller precondition for kick_buried_job.
+    job_list_insert(&t->buried, j);
+    j->r.state = Buried;
+    global_stat.buried_ct++;
+    t->stat.buried_ct++;
+
+    // Snapshot every counter we expect to roll back.
+    int64  pre_wal_resv      = s.wal.resv;
+    int    pre_file_resv     = f.resv;
+    int    pre_file_free     = f.free;
+    int64  pre_j_walresv     = j->walresv;
+    uint32 pre_kick_ct       = j->r.kick_ct;
+    int64  pre_buried_global = global_stat.buried_ct;
+    int64  pre_buried_tube   = t->stat.buried_ct;
+
+    // Ready heap is fresh (cap==0). The FIRST heapinsert in enqueue_job()
+    // WILL call realloc — and that's the only call we arm. Fault disarms
+    // after one hit, so the sibling bury_job()'s list insert (no realloc)
+    // proceeds normally, letting us observe the rollback cleanly.
+    assertf(t->ready.cap == 0,
+            "ready heap must start with cap=0 to force realloc");
+    fault_set(FAULT_REALLOC, 0, ENOMEM);
+
+    int r = kick_buried_job(&s, j);
+
+    assertf(r == 0,
+            "kick must fail when ready heapinsert realloc fails, got %d", r);
+    assertf(fault_hits(FAULT_REALLOC) == 1,
+            "exactly one realloc injection expected, got %d",
+            fault_hits(FAULT_REALLOC));
+
+    // Core invariant: WAL reservation balances back to zero net change.
+    assertf(s.wal.resv == pre_wal_resv,
+            "wal.resv leak: was %" PRId64 " got %" PRId64,
+            pre_wal_resv, s.wal.resv);
+    assertf(f.resv == pre_file_resv,
+            "file.resv leak: was %d got %d", pre_file_resv, f.resv);
+    assertf(f.free == pre_file_free,
+            "file.free drift: was %d got %d", pre_file_free, f.free);
+    assertf(j->walresv == pre_j_walresv,
+            "j->walresv leak: was %" PRId64 " got %" PRId64,
+            pre_j_walresv, j->walresv);
+
+    // kick_ct must not advance on failure: ++ then -- must net to zero.
+    assertf(j->r.kick_ct == pre_kick_ct,
+            "kick_ct advanced on failure: was %u got %u",
+            pre_kick_ct, j->r.kick_ct);
+
+    // Job must be fully restored to buried state.
+    assertf(j->r.state == Buried,
+            "job must return to Buried, got state=%d", j->r.state);
+    assertf(global_stat.buried_ct == pre_buried_global,
+            "global buried_ct drift: was %" PRId64 " got %" PRId64,
+            pre_buried_global, global_stat.buried_ct);
+    assertf(t->stat.buried_ct == pre_buried_tube,
+            "tube buried_ct drift: was %" PRId64 " got %" PRId64,
+            pre_buried_tube, t->stat.buried_ct);
+
+    // Ready heap must not retain any reference to the job.
+    assertf(t->ready.len == 0,
+            "ready heap must be empty after rollback, got len=%zu",
+            t->ready.len);
+
+    // Cleanup.
+    job_list_remove(j);
+    global_stat.buried_ct--;
+    t->stat.buried_ct--;
+    TUBE_ASSIGN(j->tube, NULL);
+    job_free(j);
+    close(fd);
+    unlink(tmppath);
+}
+
+
+// kick_delayed_job error path: ready-heap OOM forces fallback to the delay
+// queue (enqueue_job with update_store=0, no walwrite). The reserved WAL
+// space must be returned via walresvreturn(), j->walresv must clear, and
+// kick_ct must net to zero (++ then --).
+//
+// prot_init() is required because the fallback path calls
+// delay_tube_update(), which touches the static delay_tube_heap in prot.c;
+// without less/setpos set, heapinsert would crash there.
+void
+cttest_inject_kick_delayed_heapinsert_oom_walresv(void)
+{
+    setup();
+    prot_init();
+
+    Server s = {0};
+
+    char tmppath[] = "/tmp/testinject_kickdelayed.XXXXXX";
+    int fd = mkstemp(tmppath);
+    assertf(fd >= 0, "mkstemp must succeed");
+
+    int ver = Walver;
+    ssize_t nver = write(fd, &ver, sizeof(ver));
+    assertf(nver == (ssize_t)sizeof(ver), "version header write must succeed");
+
+    s.wal.use = 1;
+    s.wal.filesize = 4096;
+    s.wal.nfile = 1;
+
+    File f = {0};
+    f.w = &s.wal;
+    f.fd = fd;
+    f.iswopen = 1;
+    f.free = 4096;
+    f.resv = 0;
+    f.refs = 2;
+    f.jlist.fprev = &f.jlist;
+    f.jlist.fnext = &f.jlist;
+
+    s.wal.cur = &f;
+    s.wal.tail = &f;
+    s.wal.head = &f;
+
+    Tube *t = make_tube("kickdelayed");
+    assertf(t, "tube must allocate");
+
+    Job *j = allocate_job(10);
+    assertf(j, "job must allocate");
+    TUBE_ASSIGN(j->tube, t);
+    j->r.id = 1;
+    j->r.body_size = 10;
+    j->r.delay = 1000000000LL;
+    j->r.deadline_at = 99999999999LL;
+    memset(j->body, 'Z', 10);
+
+    // Place job in the tube's delay heap. delay_tube_heap registration
+    // is intentionally deferred: remove_delayed_job → delay_tube_update
+    // sees t->delay.len==0 && t->in_delay_heap==0 and returns early,
+    // then the fallback enqueue_job(..delay..) re-registers t cleanly.
+    assertf(heapinsert(&t->delay, j) == 1,
+            "setup: delay heapinsert must succeed");
+    j->r.state = Delayed;
+
+    int64  pre_wal_resv   = s.wal.resv;
+    int    pre_file_resv  = f.resv;
+    int    pre_file_free  = f.free;
+    int64  pre_j_walresv  = j->walresv;
+    uint32 pre_kick_ct    = j->r.kick_ct;
+
+    // First realloc after this point is heapinsert(ready) in enqueue_job.
+    assertf(t->ready.cap == 0,
+            "ready heap must start at cap=0 to force realloc");
+    fault_set(FAULT_REALLOC, 0, ENOMEM);
+
+    int r = kick_delayed_job(&s, j);
+
+    assertf(r == 0,
+            "kick must fail when ready heapinsert realloc fails, got %d", r);
+    assertf(fault_hits(FAULT_REALLOC) == 1,
+            "exactly one realloc injection expected, got %d",
+            fault_hits(FAULT_REALLOC));
+
+    assertf(s.wal.resv == pre_wal_resv,
+            "wal.resv leak: was %" PRId64 " got %" PRId64,
+            pre_wal_resv, s.wal.resv);
+    assertf(f.resv == pre_file_resv,
+            "file.resv leak: was %d got %d", pre_file_resv, f.resv);
+    assertf(f.free == pre_file_free,
+            "file.free drift: was %d got %d", pre_file_free, f.free);
+    assertf(j->walresv == pre_j_walresv,
+            "j->walresv leak: was %" PRId64 " got %" PRId64,
+            pre_j_walresv, j->walresv);
+    assertf(j->r.kick_ct == pre_kick_ct,
+            "kick_ct advanced on failure: was %u got %u",
+            pre_kick_ct, j->r.kick_ct);
+
+    // Fallback: job re-entered the delay queue. enqueue_job(..delay, 0)
+    // succeeds because t->delay retained cap=1 after the heapremove.
+    assertf(j->r.state == Delayed,
+            "job must return to Delayed, got state=%d", j->r.state);
+    assertf(t->delay.len == 1,
+            "delay heap must hold the fallback job, got len=%zu",
+            t->delay.len);
+    assertf(t->ready.len == 0,
+            "ready heap must be empty, got len=%zu", t->ready.len);
+
+    // Cleanup for valgrind/ASan mode: fork isolation drops the rest.
+    heapremove(&t->delay, 0);
+    TUBE_ASSIGN(j->tube, NULL);
+    job_free(j);
+    close(fd);
+    unlink(tmppath);
+}
+
+
+// ─── Durable mode (-D): fdatasync failure must abort walwrite ──
+// When -D is active, a failed fdatasync() means the write may not
+// survive a crash. walwrite must refuse to claim success: it must
+// disable the WAL (w->use=0), close the current file, and return 0
+// so upstream reply() sees the failure and bails. A regression that
+// silently swallowed the fdatasync error would let beanstalkd ack
+// puts that subsequently vanish on crash — the exact invariant -D
+// exists to protect.
+void
+cttest_inject_durable_fdatasync_fail_disables_wal(void)
+{
+    setup();
+
+    char tmppath[] = "/tmp/testinject_durable.XXXXXX";
+    int fd = mkstemp(tmppath);
+    assertf(fd >= 0, "mkstemp must succeed");
+
+    int ver = Walver;
+    ssize_t nver = write(fd, &ver, sizeof(ver));
+    assertf(nver == (ssize_t)sizeof(ver), "version header must write");
+
+    Wal w = {
+        .filesize = 4096,
+        .use = 1,
+        .durable_sync = 1,   // the code path under test
+    };
+    File f = {0};
+    f.w = &w;
+    f.fd = fd;
+    f.iswopen = 1;
+    f.free = 3500;
+    f.resv = 300;
+    f.refs = 2;
+    f.jlist.fprev = &f.jlist;
+    f.jlist.fnext = &f.jlist;
+
+    w.cur = &f;
+    w.tail = &f;
+    w.head = &f;
+    w.resv = 300;
+
+    Tube *t = make_tube("durable");
+    assertf(t, "tube must allocate");
+
+    Job *j = allocate_job(10);
+    assertf(j, "job must allocate");
+    TUBE_ASSIGN(j->tube, t);
+    j->r.state = Ready;
+    j->r.body_size = 10;
+    j->r.id = 1;
+    memset(j->body, 'D', 10);
+    j->walresv = 300;
+    j->walused = 0;
+
+    int64 pre_nrec = w.nrec;
+
+    fault_set(FAULT_FDATASYNC, 0, EIO);
+    int r = walwrite(&w, j);
+
+    assertf(r == 0,
+            "walwrite must return 0 when durable fdatasync fails, got %d", r);
+    assertf(fault_hits(FAULT_FDATASYNC) == 1,
+            "fdatasync fault must fire exactly once, got %d",
+            fault_hits(FAULT_FDATASYNC));
+    assertf(w.use == 0,
+            "wal must be disabled (use=0) after fdatasync failure, got %d",
+            w.use);
+    assertf(!f.iswopen,
+            "current file must be closed on fdatasync failure");
+    assertf(w.nrec == pre_nrec,
+            "nrec must not advance when walwrite fails: was %" PRId64
+            " got %" PRId64, pre_nrec, w.nrec);
+
+    close(fd);
+    unlink(tmppath);
+    job_free(j);
+}
+
+
+// Durable mode success path: fdatasync is called exactly once per
+// walwrite when durable_sync=1, and nrec advances on success.
+// Guards against a refactor that accidentally skips the sync in the
+// fast path.
+void
+cttest_inject_durable_fdatasync_fires_once_on_success(void)
+{
+    setup();
+
+    char tmppath[] = "/tmp/testinject_durable_ok.XXXXXX";
+    int fd = mkstemp(tmppath);
+    assertf(fd >= 0, "mkstemp must succeed");
+
+    int ver = Walver;
+    ssize_t nver = write(fd, &ver, sizeof(ver));
+    assertf(nver == (ssize_t)sizeof(ver), "version header must write");
+
+    Wal w = {
+        .filesize = 4096,
+        .use = 1,
+        .durable_sync = 1,
+    };
+    File f = {0};
+    f.w = &w;
+    f.fd = fd;
+    f.iswopen = 1;
+    f.free = 3500;
+    f.resv = 300;
+    f.refs = 2;
+    f.jlist.fprev = &f.jlist;
+    f.jlist.fnext = &f.jlist;
+    w.cur = &f;
+    w.tail = &f;
+    w.head = &f;
+    w.resv = 300;
+
+    Tube *t = make_tube("durableok");
+    Job *j = allocate_job(10);
+    TUBE_ASSIGN(j->tube, t);
+    j->r.state = Ready;
+    j->r.body_size = 10;
+    j->r.id = 2;
+    memset(j->body, 'D', 10);
+    j->walresv = 300;
+
+    // No fault armed. fault_calls() counts wrapped invocations even
+    // when no fault fires — so an incremented count is direct
+    // evidence the durable_sync branch reached fdatasync().
+    fault_clear_all();              // zero the call counter
+    int64 pre_nrec = w.nrec;
+    int r = walwrite(&w, j);
+
+    assertf(r == 1, "walwrite must succeed in happy path, got %d", r);
+    assertf(w.use == 1, "wal must remain enabled, got use=%d", w.use);
+    assertf(w.nrec == pre_nrec + 1,
+            "nrec must advance by 1: was %" PRId64 " got %" PRId64,
+            pre_nrec, w.nrec);
+    assertf(fault_calls(FAULT_FDATASYNC) == 1,
+            "walwrite in durable mode must invoke fdatasync exactly "
+            "once, got %d calls", fault_calls(FAULT_FDATASYNC));
+    assertf(fault_hits(FAULT_FDATASYNC) == 0,
+            "no fault was armed; unexpected hits: %d",
+            fault_hits(FAULT_FDATASYNC));
 
     close(fd);
     unlink(tmppath);

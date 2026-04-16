@@ -22,6 +22,7 @@ enum {
     FAULT_OPEN,
     FAULT_FTRUNCATE,
     FAULT_UNLINK,
+    FAULT_FDATASYNC,
     FAULT_COUNT
 };
 
@@ -29,6 +30,9 @@ struct fault {
     int countdown;  // 0=off, 1=fail next, N=skip N-1 then fail
     int err;        // errno to inject (0=use sensible default)
     int hits;       // number of times fault was injected
+    int calls;      // total invocations of the wrapped call, fault or not;
+                    // useful to prove a code path reached the syscall on
+                    // success tests where no fault fires.
 };
 
 extern struct fault faults[];
@@ -40,5 +44,6 @@ void fault_set(int which, int after, int err);
 void fault_clear(int which);
 void fault_clear_all(void);
 int  fault_hits(int which);
+int  fault_calls(int which);
 
 #endif

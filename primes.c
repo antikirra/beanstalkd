@@ -55,3 +55,5 @@ size_t primes[] = {
 #endif
 };
 
+const size_t primes_len = sizeof(primes) / sizeof(primes[0]);
+

@@ -386,6 +386,7 @@ Tube *tube_find(Ms *tubeset, const char *name);
 Tube *tube_find_name(const char *name, size_t len);
 Tube *tube_find_name_h(const char *name, size_t len, uint hash);
 uint  tube_name_hash(const char *name);
+uint  tube_name_hash_n(const char *name, size_t len);
 Tube *tube_find_or_make(const char *name);
 Tube *tube_find_or_make_n(const char *name, size_t len);
 #define TUBE_ASSIGN(a,b) do { \
@@ -403,6 +404,7 @@ uint count_cur_workers(void);
 
 
 extern size_t primes[];
+extern const size_t primes_len;
 
 
 extern size_t job_data_size_limit;
@@ -510,6 +512,12 @@ struct Wal {
     int64  nrec;  // records written ever
     int    wantsync; // do we sync to disk?
     int64  syncrate; // how often we sync to disk, in nanoseconds
+    int    durable_sync; // -D: fdatasync synchronously inside walwrite,
+                         // so replies arrive only after data hits disk.
+                         // Every persistent command pays its own fsync
+                         // latency; there is no batching. Intended for
+                         // deployments that trade throughput for the
+                         // strict guarantee "ack ⇒ durable".
     int64  lastsync;
     int64  lastcompact;
 

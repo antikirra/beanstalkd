@@ -107,6 +107,13 @@ main(int argc, char **argv)
 
     optparse(&srv, argv+1);
 
+    // -D is a no-op without a WAL. The walwrite fast path returns
+    // before the durable_sync branch when wal.use == 0, so the user's
+    // expected "ack ⇒ durable" guarantee would silently not hold.
+    // Warn loudly at startup rather than later-in-the-night surprise.
+    if (srv.wal.durable_sync && !srv.wal.use)
+        warnx("-D has no effect without -b: durable mode needs a WAL");
+
     if (srv.user)
         su(srv.user);
 

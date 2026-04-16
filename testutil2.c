@@ -59,3 +59,65 @@ cttest_opts_one()
     assertf(srv.wal.filesize == 1,
         "s=1 must be accepted, got %d", srv.wal.filesize);
 }
+
+// -D enables durable mode: fdatasync blocks inside walwrite so replies
+// never precede persistence. Must also silence wantsync — the async
+// sync thread would otherwise duplicate the fsync work.
+void
+cttest_optD_enables_durable_and_disables_wantsync()
+{
+    srv.wal.durable_sync = 0;
+    srv.wal.wantsync = 1;
+
+    char *args[] = { "-D", NULL };
+    optparse(&srv, args);
+
+    assertf(srv.wal.durable_sync == 1,
+        "-D must set durable_sync=1, got %d", srv.wal.durable_sync);
+    assertf(srv.wal.wantsync == 0,
+        "-D must clear wantsync, got %d", srv.wal.wantsync);
+}
+
+// -D is order-independent: placing it after -f0 must still win and leave
+// durable_sync=1 with wantsync=0, so a user can safely append -D to an
+// existing command line without reordering.
+void
+cttest_optD_overrides_prior_fsync_request()
+{
+    srv.wal.durable_sync = 0;
+    srv.wal.wantsync = 0;
+    srv.wal.syncrate = 0;
+
+    char *args[] = { "-f0", "-D", NULL };
+    optparse(&srv, args);
+
+    assertf(srv.wal.durable_sync == 1,
+        "-D after -f0 must still set durable_sync, got %d",
+        srv.wal.durable_sync);
+    assertf(srv.wal.wantsync == 0,
+        "-D must disable the async sync thread, got wantsync=%d",
+        srv.wal.wantsync);
+}
+
+// Reverse order: -D earlier, -f later. Without the guard in case 'f',
+// a later -f would flip wantsync=1 and silently resurrect the async
+// sync thread while durable_sync=1 remains, making the server fsync
+// twice per write. The fix in util.c (if (!durable_sync) wantsync=1)
+// is regression-locked here.
+void
+cttest_optf_does_not_override_prior_D()
+{
+    srv.wal.durable_sync = 0;
+    srv.wal.wantsync = 0;
+    srv.wal.syncrate = 0;
+
+    char *args[] = { "-D", "-f100", NULL };
+    optparse(&srv, args);
+
+    assertf(srv.wal.durable_sync == 1,
+        "-D before -f100 must remain set, got %d",
+        srv.wal.durable_sync);
+    assertf(srv.wal.wantsync == 0,
+        "-f after -D must not re-enable async sync, got wantsync=%d",
+        srv.wal.wantsync);
+}

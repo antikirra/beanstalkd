@@ -32,8 +32,11 @@ Requires **Linux 6.1+**, glibc, gcc 12+. Compatible with GCC 15.
 | WAL fsync | Synchronous | Async fsync thread |
 | WAL compaction | Broken on release cycles | Fixed alive tracking |
 | WAL integrity | None | CRC32C per record (v8 format, SSE4.2) |
+| WAL durability | Async only | Async + opt-in synchronous (`-D`) |
+| Tube hash | Stock DJB2 | wyhash v4 (avalanche + length-aware) |
+| Heap layout | Binary (2-ary) | 4-ary (shallower, cache-line-fit children) |
 | Crash/data bugs | 22+ open | 48 fixed |
-| Tests | ~100 unit | 213 unit + hostile WAL + ASan + Valgrind |
+| Tests | ~100 unit | 287 unit + hostile WAL + ASan + Valgrind |
 | Status | Maintenance mode (last code 2020) | Active development |
 
 ## Build and test
@@ -68,7 +71,7 @@ input validation for kick/reserve-timeout, option parsing overflow, EMFILE backp
 ## Performance
 
 **Scheduling:**
-O(1) delay/pause/timeout heaps. Direct process_tube match on enqueue. Heapresift in-place. Heap grandchild prefetch.
+O(1) delay/pause/timeout heaps (4-ary, cache-friendlier than binary). Direct process_tube match on enqueue. Heapresift in-place. Grandchild prefetch for large heaps.
 
 **Syscall reduction:**
 Inline reply flush (skip epoll round-trip). writev for job body. 64-event epoll batch with drain loop. epoll_ctl caching. TCP_CORK only on pipeline. TCP_QUICKACK at accept. accept4 atomic flags. CLOCK_MONOTONIC_COARSE per batch. Incremental scan_line_end. Reserve fast path (skip ms round-trip when job ready).
@@ -77,10 +80,10 @@ Inline reply flush (skip epoll round-trip). writev for job body. 64-event epoll 
 u64toa two-digit pair table. reply_inserted/reply_job backward build into reply_buf. Manual base-10 read_uint. 256-byte tube name lookup table (_Alignas(64) cache-line aligned). Two-level byte command dispatch.
 
 **Memory:**
-11-class job pool (64B-64KB, `__attribute__((malloc))`). Cache-line Conn/Tube struct layout. Conn slab pool (256). Incremental rehash (16 buckets/op, dual-table). DJB2+finalizer tube hash with hash-first filter. MALLOC_ARENA_MAX=1. Periodic malloc_trim.
+11-class job pool (64B-64KB, `__attribute__((malloc))`). Cache-line Conn/Tube struct layout. Conn slab pool (256). Incremental rehash (16 buckets/op, dual-table). wyhash (final v4) tube hash with hash-first filter and length-aware API. MALLOC_ARENA_MAX=1. Periodic malloc_trim.
 
 **WAL:**
-Async fsync thread (_Atomic error signaling). writev records with per-record CRC32C trailer (v8 format, Intel SSE4.2 `_mm_crc32_u64` ~0.33 cyc/byte, negligible overhead). fallocate prealloc. Rate-limited compaction with correct alive tracking. Lock-free error check. Readahead on recovery. _Static_assert guards on WAL record sizes. Transparent v7 binlog replay for upgrade from upstream.
+Async fsync thread (_Atomic error signaling). Optional synchronous mode via `-D` (`ack ⇒ durable`, blocking fdatasync per write, EINTR-aware retry). writev records with per-record CRC32C trailer (v8 format, Intel SSE4.2 `_mm_crc32_u64` ~0.33 cyc/byte, negligible overhead). fallocate prealloc. Rate-limited compaction with correct alive tracking. Lock-free error check. Readahead on recovery. _Static_assert guards on WAL record sizes. Transparent v7 binlog replay for upgrade from upstream.
 
 **Network:**
 TCP_FASTOPEN(1024). TCP_DEFER_ACCEPT. TCP_NOTSENT_LOWAT(16KB). TCP_USER_TIMEOUT(30s). SO_INCOMING_CPU. sched_setaffinity.
@@ -92,6 +95,7 @@ TCP_FASTOPEN(1024). TCP_DEFER_ACCEPT. TCP_NOTSENT_LOWAT(16KB). TCP_USER_TIMEOUT(
 | `-b DIR` | — | WAL directory (enables persistence) |
 | `-f MS` | 50 | fsync interval (0 = every write) |
 | `-F` | | Never fsync |
+| `-D` | | Durable: block on fdatasync per WAL write; `ack ⇒ durable` (implies `-F`, needs `-b`) |
 | `-l ADDR` | 0.0.0.0 | Listen address (`unix:` for Unix socket) |
 | `-p PORT` | 11300 | Listen port |
 | `-z BYTES` | 65535 | Max job body size |
@@ -107,15 +111,16 @@ TCP_FASTOPEN(1024). TCP_DEFER_ACCEPT. TCP_NOTSENT_LOWAT(16KB). TCP_USER_TIMEOUT(
 
 | Scenario | Upstream | Fork | Delta |
 |---|---|---|---|
-| S1: Throughput (ops/s) | 124,795 | 207,857 | **+66.6%** |
-| S1: P50 latency (us) | 2,243 | 1,298 | **-42.2%** |
-| S1: P99.9 latency (us) | 13,364 | 5,913 | **-55.8%** |
-| S2: Latency (ops/s) | 39,691 | 53,286 | **+34.3%** |
-| S2: P50 latency (us) | 36.7 | 24.1 | **-34.3%** |
-| S3: Large body 16KB (ops/s) | 83,138 | 116,528 | **+40.2%** |
-| S4: 32 connections (ops/s) | 150,214 | 260,391 | **+73.3%** |
-| S5: Deep pipeline (ops/s) | 104,255 | 146,907 | **+40.9%** |
-| S6: 500 tubes (ops/s) | 42,822 | 42,444 | -0.9% |
+| S1: Throughput (ops/s) | 121,598 | 204,250 | **+68.0%** |
+| S1: P50 latency (us) | 2,735.7 | 1,420.1 | **-48.1%** |
+| S1: P99.9 latency (us) | 8,188.0 | 5,538.8 | **-32.4%** |
+| S2: Latency (ops/s) | 129,905 | 186,618 | **+43.7%** |
+| S2: P50 latency (us) | 6.9 | 5.8 | **-15.9%** |
+| S2: P99.9 latency (us) | 3,051.5 | 2,194.8 | **-28.1%** |
+| S3: Large body 16KB (ops/s) | 69,886 | 87,457 | **+25.1%** |
+| S4: 32 connections (ops/s) | 137,468 | 252,682 | **+83.8%** |
+| S5: Deep pipeline (ops/s) | 103,914 | 138,893 | **+33.7%** |
+| S6: 500 tubes (ops/s) | 36,367 | 36,889 | +1.4% |
 
 **Scenarios:** S1: 8 conn x 10K put+reserve+delete, 128B body, pipeline=64. S2: 1 conn x 5K ops, 4B body, pipeline=1 (round-trip). S3: 8 conn x 2K ops, 16KB body, pipeline=16. S4: 32 conn x 5K ops, 128B body, pipeline=32. S5: 1 conn x 20K ops, 128B body, pipeline=256. S6: 500 tubes x 100 jobs each, 4 clients, 16-256B mixed bodies.
 
