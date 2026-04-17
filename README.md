@@ -36,13 +36,13 @@ Requires **Linux 6.1+**, glibc, gcc 12+. Compatible with GCC 15.
 | Tube hash | Stock DJB2 | wyhash v4 (avalanche + length-aware) |
 | Heap layout | Binary (2-ary) | 4-ary (shallower, cache-line-fit children) |
 | Crash/data bugs | 22+ open | 48 fixed |
-| Tests | ~100 unit | 287 unit + hostile WAL + ASan + Valgrind |
+| Tests | ~100 unit | 329 unit + hostile WAL + ASan + Valgrind |
 | Status | Maintenance mode (last code 2020) | Active development |
 
 ## Build and test
 
 ```sh
-make check                                # 213 unit tests (UBSan in CI)
+make check                                # 329 unit tests (UBSan in CI)
 docker build -f Dockerfile.build .        # CI: UBSan + cppcheck (C11)
 docker build -f Dockerfile.benchmark .    # A/B benchmark vs upstream
 docker build -f test/Dockerfile.loadtest -t loadtest . && docker run --rm loadtest
@@ -103,6 +103,9 @@ TCP_FASTOPEN(1024). TCP_DEFER_ACCEPT. TCP_NOTSENT_LOWAT(16KB). TCP_USER_TIMEOUT(
 | `-u USER` | | Drop privileges |
 | `-m SEC` | 60 | malloc_trim interval (0 = disable) |
 | `-t CPU` | — | Pin to CPU core |
+| `-c N` | 0 (off) | Reject new connections when count reaches N; 0 = unlimited (preserves upstream behaviour). EMFILE remains the kernel hard cap |
+| `-I SEC` | 0 (off) | Close conns idle for SEC seconds. A worker blocked on `reserve` is NOT idle (waiting clients are excluded), so it is safe to enable with worker pools |
+| `-H` | off | Reply to HTTP `GET`/`HEAD` on the beanstalk port (`200 ok`, `503 draining`); intended for Kubernetes `httpGet` probes. Off by default — beanstalk clients never send these verbs, so enabling is harmless |
 | `-V` | | Verbose logging (`-VV` for command trace) |
 | `--log-json` | | Emit warnings as JSON objects on stderr (`{"ts":...,"level":"warn\|error","msg":"...","errno":"..."}`) |
 

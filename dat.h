@@ -83,6 +83,19 @@ extern volatile sig_atomic_t shutdown_requested;
 // Replaced by tests to simulate failures.
 extern FAlloc falloc;
 
+// Connection I/O state machine. Defined here so non-prot.c modules
+// (conn.c's idle scheduler) can reason about state without literal 0.
+// Order is load-bearing: STATE_WANT_COMMAND must be 0 (matches the
+// zero-init from make_conn for new connections).
+#define STATE_WANT_COMMAND  0
+#define STATE_WANT_DATA     1
+#define STATE_SEND_JOB      2
+#define STATE_SEND_WORD     3
+#define STATE_WAIT          4
+#define STATE_BITBUCKET     5
+#define STATE_CLOSE         6
+#define STATE_WANT_ENDLINE  7
+
 // stats structure holds counters for operations, both globally and per tube.
 struct stats {
     uint64 urgent_ct;
@@ -465,6 +478,7 @@ struct Conn {
     size_t tickpos;     // position in srv->conns, stale when in_conns=0
     Job    *soonest_job;// memoization of the soonest job
     Job    *out_job;    // a job to be sent to the client
+    int64  last_activity_at; // ns timestamp of last command processed; powers -I
     int    out_job_sent;// how many bytes of *out_job were sent already
     char   halfclosed;
 
@@ -599,6 +613,26 @@ struct Server {
     char *addr;
     char *user;
     int  cpu;           // CPU core to pin main thread (-1 = no pinning)
+
+    // Soft cap on simultaneous connections (-c N). 0 = unlimited.
+    // When count_cur_conns() reaches this, h_accept closes the freshly
+    // accepted fd without ever creating a Conn. EMFILE remains the kernel
+    // hard cap; -c is the operator's explicit ceiling below it.
+    uint   maxconn;
+
+    // Idle connection timeout (-I SEC) in nanoseconds. 0 = off.
+    // A conn is "idle" only when sitting in STATE_WANT_COMMAND with no
+    // reserved jobs, no pending reserve-with-timeout, and not in a
+    // waiting set — a worker blocked on reserve is NOT idle.
+    int64  idle_timeout;
+
+    // HTTP health endpoint on the beanstalk port (-H). 0 = off.
+    // When enabled, a "GET ..." or "HEAD ..." command is intercepted
+    // before the beanstalk dispatcher and answered with a minimal
+    // HTTP/1.0 response, then the conn is closed. drain_mode → 503,
+    // otherwise 200. No beanstalk client ever sends GET/HEAD as a
+    // command verb, so wire compat is preserved when -H is on.
+    int    http_health;
 
     Wal    wal;
     Socket sock;

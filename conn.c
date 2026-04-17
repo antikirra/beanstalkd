@@ -85,6 +85,7 @@ make_conn(int fd, char start_state, Tube *use, Tube *watch)
     c->pending_timeout = -1;
     c->tickpos = 0; // Does not mean anything if in_conns is set to 0.
     c->in_conns = 0;
+    c->last_activity_at = now; // baseline for -I; refreshed at every cmd
 
     // The list is empty.
     job_list_reset(&c->reserved_jobs);
@@ -144,22 +145,39 @@ has_reserved_job(Conn *c)
 
 
 // Returns positive nanoseconds when c should tick, 0 otherwise.
+//
+// The idle (-I) clause MUST mirror conn_timeout's idle close gate:
+// same state, same job/reserve/wait conditions. If conntickat were
+// looser than conn_timeout, the prottick loop would re-add the conn
+// with an overdue tickat that conn_timeout refuses to act on, then
+// connsched at conn_timeout's tail re-schedules the same overdue
+// time — an unbounded busy loop. STATE_WANT_COMMAND is the load-
+// bearing constraint here.
 static inline int64
 conntickat(Conn *c)
 {
-    // Fast path: no pending timeout and no reserved jobs → no tick needed.
-    // Covers the common case after a simple put/delete/stats reply.
-    if (likely(c->pending_timeout < 0 && job_list_is_empty(&c->reserved_jobs)))
+    int has_reserved = has_reserved_job(c);
+    int idle_eligible = srv.idle_timeout > 0
+                        && c->state == STATE_WANT_COMMAND
+                        && !has_reserved
+                        && c->pending_timeout < 0
+                        && !conn_waiting(c);
+    // Fast path: no pending timeout, no reserved jobs, no idle to track.
+    if (likely(c->pending_timeout < 0 && !has_reserved && !idle_eligible))
         return 0;
 
     int margin = conn_waiting(c) ? SAFETY_MARGIN : 0;
     int64 t = INT64_MAX;
 
-    if (has_reserved_job(c)) {
+    if (has_reserved) {
         t = connsoonestjob(c)->r.deadline_at - now - margin;
     }
     if (c->pending_timeout >= 0) {
         t = min(t, ((int64)c->pending_timeout) * 1000000000);
+    }
+    if (idle_eligible) {
+        int64 idle_d = c->last_activity_at + srv.idle_timeout - now;
+        t = min(t, idle_d);
     }
     return now + t;
 }

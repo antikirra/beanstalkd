@@ -1364,3 +1364,567 @@ cttest_truncate_connclose_reserved()
     cksub(fd2, "OK ");
 }
 
+// ============================================================
+// -c MAXCONN: hostile checks. Reject must happen at accept layer
+// without ever creating a Conn — verify by counting accepted
+// stats and probing a third connection.
+// ============================================================
+
+// Helper: read whatever the server sends, treat EOF as the signal
+// that the server slammed the door. Returns 1 if conn looks open
+// (got bytes back), 0 if conn was closed/reset before any reply.
+static int
+probe_conn_alive(int fd)
+{
+    // Send something cheap. If server already closed pre-write,
+    // EPIPE will surface here or on the read.
+    ssize_t w = write(fd, "stats\r\n", 7);
+    if (w < 0) return 0;
+    char buf[64];
+    fd_set rfd;
+    struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+    FD_ZERO(&rfd);
+    FD_SET(fd, &rfd);
+    int r = select(fd + 1, &rfd, NULL, NULL, &tv);
+    if (r <= 0) return 0;
+    ssize_t n = read(fd, buf, sizeof buf);
+    return n > 0;
+}
+
+void
+cttest_maxconn_rejects_excess()
+{
+    srv.maxconn = 2;
+    int port = startsrv();
+
+    int a = diallocal(port);
+    int b = diallocal(port);
+
+    // First two must be live: send stats, expect a reply.
+    assertf(probe_conn_alive(a), "1st conn must be accepted");
+    assertf(probe_conn_alive(b), "2nd conn must be accepted");
+
+    // Third conn: kernel completes the handshake (it's in accept
+    // backlog), but the server's accept4 + close cycle must hand
+    // back EOF to our read.
+    int c = diallocal(port);
+    assertf(!probe_conn_alive(c),
+        "3rd conn must be rejected (server-side close)");
+
+    close(a); close(b); close(c);
+}
+
+// After a slot frees up, the server must accept again — limit is
+// dynamic, not a one-shot trip.
+void
+cttest_maxconn_recovers_after_close()
+{
+    srv.maxconn = 1;
+    int port = startsrv();
+
+    int a = diallocal(port);
+    assertf(probe_conn_alive(a), "1st conn must be accepted");
+
+    int b = diallocal(port);
+    assertf(!probe_conn_alive(b), "2nd conn must be rejected at limit");
+    close(b);
+
+    close(a);
+
+    // Slot must be reclaimed in cur_conn_ct on connclose; new conn ok.
+    // Small sleep to let the server drain the close event.
+    usleep(50000);
+    int c = diallocal(port);
+    assertf(probe_conn_alive(c),
+        "after slot frees, server must accept again");
+    close(c);
+}
+
+// Default (maxconn=0) must allow many connections — preserves the
+// upstream "no limit on upgrade" contract. 32 is enough to detect
+// any accidental cap that crept in.
+void
+cttest_maxconn_default_unlimited()
+{
+    srv.maxconn = 0;
+    int port = startsrv();
+
+    int fds[32];
+    for (int i = 0; i < 32; i++) {
+        fds[i] = diallocal(port);
+        assertf(probe_conn_alive(fds[i]),
+            "conn %d must succeed with maxconn=0", i);
+    }
+    for (int i = 0; i < 32; i++) close(fds[i]);
+}
+
+// ============================================================
+// -I IDLE_TIMEOUT: hostile checks. Idle = STATE_WANT_COMMAND
+// with no reserved jobs and no pending reserve. A worker
+// blocked on reserve-with-timeout is NOT idle.
+// ============================================================
+
+// Wait up to `to_ms` ms and return whether the conn was server-closed
+// (read returns 0 = EOF). 1 = closed by server, 0 = still open.
+static int
+wait_for_server_close(int fd, int to_ms)
+{
+    fd_set rfd;
+    struct timeval tv = { .tv_sec = to_ms / 1000,
+                          .tv_usec = (to_ms % 1000) * 1000 };
+    FD_ZERO(&rfd);
+    FD_SET(fd, &rfd);
+    int r = select(fd + 1, &rfd, NULL, NULL, &tv);
+    if (r <= 0) return 0;
+    char buf[64];
+    ssize_t n = read(fd, buf, sizeof buf);
+    return n == 0; // EOF means server closed
+}
+
+// Drain whatever bytes are buffered on fd within tail_ms of quiet,
+// then return. Used after a stats reply where we don't care about
+// the body — only that the conn is back in STATE_WANT_COMMAND.
+static void
+drain_quiet(int fd, int tail_ms)
+{
+    char buf[4096];
+    for (;;) {
+        fd_set rfd;
+        struct timeval tv = { .tv_sec = 0, .tv_usec = tail_ms * 1000 };
+        FD_ZERO(&rfd);
+        FD_SET(fd, &rfd);
+        int r = select(fd + 1, &rfd, NULL, NULL, &tv);
+        if (r <= 0) return;
+        ssize_t n = read(fd, buf, sizeof buf);
+        if (n <= 0) return;
+    }
+}
+
+void
+cttest_idle_timeout_closes_silent_conn()
+{
+    srv.idle_timeout = 1000000000LL; // 1s
+    int port = startsrv();
+
+    int fd = diallocal(port);
+    // Send one command to ensure the server-side conn is fully wired.
+    snd(fd, "stats\r\n");
+    cksub(fd, "OK ");
+    drain_quiet(fd, 100);
+
+    // Now sit silent; server must close us within ~2s.
+    assertf(wait_for_server_close(fd, 2500),
+        "server must close conn after idle_timeout");
+    close(fd);
+}
+
+void
+cttest_idle_timeout_does_not_close_busy_conn()
+{
+    srv.idle_timeout = 1000000000LL; // 1s
+    int port = startsrv();
+
+    int fd = diallocal(port);
+    // Hammer commands continuously for ~1.5s. last_activity_at must
+    // refresh on each command boundary so idle never fires.
+    for (int i = 0; i < 6; i++) {
+        snd(fd, "stats\r\n");
+        cksub(fd, "OK ");
+        drain_quiet(fd, 50);
+        usleep(250000); // 0.25s between cmds — well under 1s timeout
+    }
+    // Conn must still be alive.
+    assertf(probe_conn_alive(fd),
+        "active conn must survive idle_timeout");
+    close(fd);
+}
+
+void
+cttest_idle_timeout_does_not_close_waiting_reserve()
+{
+    srv.idle_timeout = 1000000000LL; // 1s
+    int port = startsrv();
+
+    int fd = diallocal(port);
+    // Block on reserve-with-timeout 3 (longer than idle_timeout).
+    // The conn is "waiting" — must not be idle-closed before the
+    // protocol-level reserve timeout fires.
+    snd(fd, "reserve-with-timeout 3\r\n");
+    // Server will reply TIMED_OUT after ~3s; if -I (1s) wrongly fired
+    // first, we'd see EOF (read returns 0) instead.
+    char *got = rd(fd);
+    assertf(strcmp(got, "TIMED_OUT\r\n") == 0,
+        "blocked reserve must produce TIMED_OUT, got [%s]", got);
+    close(fd);
+}
+
+void
+cttest_idle_timeout_does_not_close_reserved_holder()
+{
+    srv.idle_timeout = 1000000000LL; // 1s
+    int port = startsrv();
+
+    // Conn A: producer, puts a job with TTR=10.
+    int a = diallocal(port);
+    snd(a, "put 0 0 10 3\r\nfoo\r\n");
+    cksub(a, "INSERTED");
+
+    // Conn B: worker, reserves the job and then sits silent. The conn
+    // is no longer "waiting" but holds a reserved job — must not be
+    // idle-closed (closing would auto-release the job and confuse
+    // workers that legitimately hold long-TTR jobs).
+    int b = diallocal(port);
+    snd(b, "reserve-with-timeout 1\r\n");
+    cksub(b, "RESERVED");
+    rd(b); // body line
+
+    // Wait > idle_timeout; B must still be alive.
+    usleep(1500000);
+    assertf(probe_conn_alive(b),
+        "conn holding a reserved job must not be idle-closed");
+    close(a); close(b);
+}
+
+void
+cttest_idle_timeout_default_off_keeps_conn()
+{
+    srv.idle_timeout = 0; // disabled
+    int port = startsrv();
+
+    int fd = diallocal(port);
+    snd(fd, "stats\r\n");
+    cksub(fd, "OK ");
+    drain_quiet(fd, 100);
+
+    // Sit silent for 2s; without -I, server must keep the conn open.
+    int closed = wait_for_server_close(fd, 2000);
+    assertf(!closed,
+        "default (idle_timeout=0) must not close idle conns");
+    close(fd);
+}
+
+// REGRESSION: after a put completes via the reply() fast path, the
+// conn transitions WANT_DATA → WANT_COMMAND. During WANT_DATA the
+// idle deadline that h_accept scheduled may FIRE (prottick removes
+// it from srv.conns; conn_timeout sees state != WANT_COMMAND so
+// it no-ops; connsched at conn_timeout's tail removes it again
+// because conntickat returns 0 for non-eligible states). The conn
+// is now OUT of the heap. Reply()'s fast path must put it back,
+// otherwise the client puts and sits silent and never gets reaped.
+//
+// To trigger this, we MUST wait > idle_timeout while in WANT_DATA
+// so the heap entry actually fires. A short usleep wouldn't expose
+// the bug — the conn would stay in the heap with its original
+// idle deadline, and reply()'s c->in_conns check would catch it.
+void
+cttest_idle_timeout_after_put_still_fires()
+{
+    srv.idle_timeout = 1000000000LL; // 1s
+    int port = startsrv();
+
+    int fd = diallocal(port);
+    snd(fd, "put 0 0 60 4\r\n");   // header — server enters WANT_DATA
+    usleep(1500000);                // > idle_timeout: heap entry fires & is removed
+    snd(fd, "test\r\n");            // body completes the put
+    cksub(fd, "INSERTED");
+    drain_quiet(fd, 50);
+
+    // Sit silent after INSERTED. Server must close us within ~2s.
+    // If reply() forgot to reschedule with -I on, the conn would be
+    // OUT of srv.conns (idle deadline already fired during WANT_DATA)
+    // and would never be reaped.
+    assertf(wait_for_server_close(fd, 2500),
+        "server must idle-close after a completed slow put");
+    close(fd);
+}
+
+// A client mid-PUT (STATE_WANT_DATA) is intentionally NOT subject to
+// -I: the conn_timeout idle gate requires STATE_WANT_COMMAND. Locks
+// in this scoping decision so a future "broaden -I to all states"
+// patch is forced to update this test deliberately.
+void
+cttest_idle_timeout_does_not_close_slow_put_body()
+{
+    srv.idle_timeout = 1000000000LL; // 1s
+    int port = startsrv();
+
+    int fd = diallocal(port);
+    // Send the PUT line but only part of the body. Server transitions
+    // to STATE_WANT_DATA. Wait > idle_timeout, then complete the body.
+    snd(fd, "put 0 0 60 10\r\n");
+    usleep(1500000); // 1.5s — well past idle deadline
+    snd(fd, "0123456789\r\n");
+    cksub(fd, "INSERTED");
+    close(fd);
+}
+
+// Hot-path regression. The reply() fast path sets STATE_WANT_COMMAND
+// directly, bypassing conn_want_command. Forgetting to refresh
+// last_activity_at there would let the idle timer fire while the
+// client is busy — a kill-the-server-while-it's-working bug.
+//
+// We MUST use a STATE_SEND_WORD reply (not stats — that's SEND_JOB
+// which routes through conn_want_command and would mask the bug).
+// `put` returns "INSERTED <id>\r\n" via the SEND_WORD fast path,
+// followed by `delete` which also returns "DELETED\r\n" via SEND_WORD.
+// Both go through reply()'s fast path on success.
+void
+cttest_idle_timeout_busy_pipeline_survives()
+{
+    srv.idle_timeout = 1000000000LL; // 1s
+    int port = startsrv();
+
+    int fd = diallocal(port);
+    // 6 cycles × 0.5s = 3s wall time, well past idle_timeout.
+    // Each cycle puts and deletes a job — both replies go through
+    // the SEND_WORD fast path. Without the last_activity_at refresh,
+    // the conn would be reaped around cycle 2-3.
+    for (int i = 0; i < 6; i++) {
+        char cmd[64];
+        snprintf(cmd, sizeof cmd, "put 0 0 60 1\r\nx\r\n");
+        snd(fd, cmd);
+        char *got = rd(fd);
+        assertf(strncmp(got, "INSERTED ", 9) == 0,
+            "expected INSERTED, got [%s]", got);
+        int id = atoi(got + 9);
+        snprintf(cmd, sizeof cmd, "delete %d\r\n", id);
+        snd(fd, cmd);
+        ck(fd, "DELETED\r\n");
+        usleep(500000); // 0.5s
+    }
+    assertf(probe_conn_alive(fd),
+        "pipelined client must survive idle_timeout via fast-path refresh");
+    close(fd);
+}
+
+// Hostile: the first conn that never sends a byte. Without the
+// connsched in h_accept, this conn would never enter srv.conns and
+// the idle timer would silently miss it. Catches that regression.
+void
+cttest_idle_timeout_closes_silent_at_accept()
+{
+    srv.idle_timeout = 1000000000LL; // 1s
+    int port = startsrv();
+
+    int fd = diallocal(port);
+    // Do NOT send anything. Server must still reap us.
+    assertf(wait_for_server_close(fd, 2500),
+        "server must idle-close a conn that never sent a byte");
+    close(fd);
+}
+
+// ============================================================
+// -H HTTP health endpoint. Detection runs before which_cmd, so
+// any non-GET/non-HEAD command must keep the upstream behaviour
+// 1:1. Drain mode flips 200 → 503; -H off makes GET an
+// UNKNOWN_COMMAND like any other unknown verb.
+// ============================================================
+
+// Read up to `cap` bytes within `to_ms` ms; returns total read.
+static int
+read_until_close(int fd, char *out, int cap, int to_ms)
+{
+    int total = 0;
+    while (total < cap) {
+        fd_set rfd;
+        struct timeval tv = { .tv_sec = to_ms / 1000,
+                              .tv_usec = (to_ms % 1000) * 1000 };
+        FD_ZERO(&rfd);
+        FD_SET(fd, &rfd);
+        int r = select(fd + 1, &rfd, NULL, NULL, &tv);
+        if (r <= 0) break;
+        ssize_t n = read(fd, out + total, cap - total);
+        if (n <= 0) break;
+        total += n;
+    }
+    out[total] = 0;
+    return total;
+}
+
+void
+cttest_http_health_get_200_with_flag()
+{
+    srv.http_health = 1;
+    int port = startsrv();
+    int fd = diallocal(port);
+    snd(fd, "GET /health HTTP/1.0\r\n\r\n");
+
+    char buf[1024];
+    int n = read_until_close(fd, buf, sizeof buf - 1, 1000);
+    assertf(n > 0, "must receive an HTTP response");
+    assertf(strncmp(buf, "HTTP/1.0 200 OK\r\n", 17) == 0,
+        "must start with HTTP/1.0 200 OK, got [%s]", buf);
+    assertf(strstr(buf, "Content-Length: 2") != NULL,
+        "must declare Content-Length: 2, got [%s]", buf);
+    assertf(strstr(buf, "Connection: close") != NULL,
+        "must include Connection: close, got [%s]", buf);
+    assertf(strstr(buf, "\r\n\r\nok") != NULL,
+        "body must be \"ok\", got [%s]", buf);
+    close(fd);
+}
+
+void
+cttest_http_health_head_200_no_body()
+{
+    srv.http_health = 1;
+    int port = startsrv();
+    int fd = diallocal(port);
+    snd(fd, "HEAD /health HTTP/1.0\r\n\r\n");
+
+    char buf[1024];
+    int n = read_until_close(fd, buf, sizeof buf - 1, 1000);
+    assertf(n > 0, "must receive a response");
+    assertf(strncmp(buf, "HTTP/1.0 200 OK\r\n", 17) == 0,
+        "HEAD must return 200, got [%s]", buf);
+    assertf(strstr(buf, "Content-Length: 2") != NULL,
+        "HEAD must keep Content-Length header, got [%s]", buf);
+    // Body must be absent: response ends with the empty-line CRLF.
+    assertf(buf[n - 1] == '\n' && buf[n - 2] == '\r'
+            && buf[n - 3] == '\n' && buf[n - 4] == '\r',
+        "HEAD must end at empty-line CRLF (no body), got [%s]", buf);
+    close(fd);
+}
+
+// 503 when draining. enter_drain_mode flips the static drain_mode in
+// the parent BEFORE fork; the child inherits it. Same pattern as
+// cttest_put_in_drain in testserv.c — avoids wiring SIGUSR1 into the
+// test server (default SIGUSR1 action is Term).
+void
+cttest_http_health_503_when_draining()
+{
+    srv.http_health = 1;
+    enter_drain_mode(SIGUSR1); // sets static drain_mode=1 pre-fork
+    int port = startsrv();
+
+    int fd = diallocal(port);
+    snd(fd, "GET /health HTTP/1.0\r\n\r\n");
+    char buf[1024];
+    int n = read_until_close(fd, buf, sizeof buf - 1, 1000);
+    assertf(n > 0, "must receive a 503 response");
+    assertf(strncmp(buf, "HTTP/1.0 503 ", 13) == 0,
+        "drain mode must produce 503, got [%s]", buf);
+    assertf(strstr(buf, "Content-Length: 8") != NULL,
+        "503 body length must be 8, got [%s]", buf);
+    assertf(strstr(buf, "draining") != NULL,
+        "drain body must be \"draining\", got [%s]", buf);
+    close(fd);
+}
+
+// Symmetric for HEAD: drain mode → 503 status line + headers, no body.
+void
+cttest_http_health_head_503_when_draining()
+{
+    srv.http_health = 1;
+    enter_drain_mode(SIGUSR1);
+    int port = startsrv();
+
+    int fd = diallocal(port);
+    snd(fd, "HEAD /health HTTP/1.0\r\n\r\n");
+    char buf[1024];
+    int n = read_until_close(fd, buf, sizeof buf - 1, 1000);
+    assertf(n > 0, "must receive a 503 response");
+    assertf(strncmp(buf, "HTTP/1.0 503 ", 13) == 0,
+        "HEAD in drain must produce 503, got [%s]", buf);
+    assertf(strstr(buf, "draining") == NULL,
+        "HEAD must NOT include body even in drain, got [%s]", buf);
+    close(fd);
+}
+
+// -H off: GET must hit the standard unknown-command path so
+// existing operators see no behaviour drift on upgrade.
+void
+cttest_http_health_off_get_is_unknown()
+{
+    srv.http_health = 0;
+    int port = startsrv();
+    int fd = diallocal(port);
+    snd(fd, "GET /health HTTP/1.0\r\n");
+    ck(fd, "UNKNOWN_COMMAND\r\n");
+    close(fd);
+}
+
+// "GETS" or "GET" without the trailing space must NOT be hijacked
+// — strict prefix match. UNKNOWN_COMMAND is the correct reply.
+void
+cttest_http_health_strict_prefix()
+{
+    srv.http_health = 1;
+    int port = startsrv();
+
+    int a = diallocal(port);
+    snd(a, "GETS\r\n"); // 5 chars, no space after GET
+    ck(a, "UNKNOWN_COMMAND\r\n");
+
+    int b = diallocal(port);
+    snd(b, "GET\r\n"); // 4 chars, "GET" then \r\n — no space
+    ck(b, "UNKNOWN_COMMAND\r\n");
+
+    int d = diallocal(port);
+    snd(d, "HEADS\r\n");
+    ck(d, "UNKNOWN_COMMAND\r\n");
+
+    close(a); close(b); close(d);
+}
+
+// Real-world HTTP probes (kubelet, curl) send the request line AND
+// headers in one TCP packet:
+//   GET / HTTP/1.1\r\nHost: x\r\nUser-Agent: kube-probe\r\n\r\n
+// The server's pipeline loop must NOT iterate past the GET line. If
+// it did, each subsequent header would be answered as UNKNOWN_COMMAND
+// and the kubelet probe would see garbage after the 200 OK. The
+// guarantee is delivered by cmd_data_ready's state == STATE_WANT_COMMAND
+// gate; STATE_CLOSE breaks the loop after the HTTP reply.
+void
+cttest_http_health_kubelet_style_request()
+{
+    srv.http_health = 1;
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    // Send the entire HTTP/1.1 request in one write — request line
+    // plus three headers plus the empty terminator line.
+    snd(fd,
+        "GET /healthz HTTP/1.1\r\n"
+        "Host: 127.0.0.1\r\n"
+        "User-Agent: kube-probe/1.28\r\n"
+        "Connection: close\r\n"
+        "\r\n");
+
+    char buf[2048];
+    int n = read_until_close(fd, buf, sizeof buf - 1, 1000);
+    assertf(n > 0, "must receive a response");
+    // Exactly ONE HTTP/1.0 status line. The body is "ok" (2 bytes).
+    // No UNKNOWN_COMMAND lines from header-misinterpretation.
+    assertf(strncmp(buf, "HTTP/1.0 200 OK\r\n", 17) == 0,
+        "must start with single 200 OK, got [%s]", buf);
+    assertf(strstr(buf, "UNKNOWN_COMMAND") == NULL,
+        "headers must not be misinterpreted as beanstalk cmds, got [%s]",
+        buf);
+    // Response must end at "ok" — no trailing UNKNOWN_COMMAND noise.
+    int len = (int)strlen(buf);
+    assertf(buf[len - 2] == 'o' && buf[len - 1] == 'k',
+        "response must end with body \"ok\", got tail [...%s]",
+        buf + (len > 8 ? len - 8 : 0));
+    close(fd);
+}
+
+// After replying, the server MUST close the conn. Connection: close
+// is advisory for the client; the real guarantee is that we read EOF.
+void
+cttest_http_health_closes_after_reply()
+{
+    srv.http_health = 1;
+    int port = startsrv();
+    int fd = diallocal(port);
+    snd(fd, "GET / HTTP/1.0\r\n\r\n");
+
+    char buf[1024];
+    read_until_close(fd, buf, sizeof buf - 1, 1000);
+    // Now the read above must have hit EOF for read_until_close to
+    // return without filling cap. Probe again — must be EOF immediately.
+    char tail[16];
+    ssize_t n = read(fd, tail, sizeof tail);
+    assertf(n == 0, "server must close conn after HTTP reply, read=%zd", n);
+    close(fd);
+}
+

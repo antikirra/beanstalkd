@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>
@@ -201,6 +202,12 @@ usage(int code)
             " -m SEC   return unused memory to OS every SEC seconds (default is 60);\n"
             "          use -m0 to disable\n"
             " -t CPU   pin main thread to CPU core (default is no pinning)\n"
+            " -c N     reject new connections when count reaches N (0 = unlimited);\n"
+            "          consider -c 10000 for production exposure\n"
+            " -I SEC   close conns idle for SEC seconds (0 = disabled, default);\n"
+            "          a worker blocked on reserve is NOT idle; safe with workers\n"
+            " -H       respond to HTTP GET/HEAD on the beanstalk port (200 ok,\n"
+            "          503 when draining); off by default\n"
             " -v       show version information\n"
             " -V       increase verbosity\n"
             " -h       show this help\n"
@@ -330,6 +337,34 @@ optparse(Server *s, char **argv)
                     s->cpu = cpu;
                     break;
                 }
+                case 'c': {
+                    size_t n = parse_size_t(EARGF(flagusage("-c")));
+                    if (n > UINT_MAX) {
+                        warnx("-c %zu: too large, capping at %u", n, UINT_MAX);
+                        n = UINT_MAX;
+                    }
+                    s->maxconn = (uint)n;
+                    break;
+                }
+                case 'I': {
+                    // SEC, converted to ns. 0 disables.
+                    // Cap at 1e9 sec (~31 years): protects last_activity_at
+                    // + idle_timeout from int64 overflow even on a server
+                    // with multi-year uptime where `now` (CLOCK_MONOTONIC)
+                    // is itself a large value. Any legitimate operator
+                    // wanting longer should just set 0 (off).
+                    int64 sec = (int64)parse_size_t(EARGF(flagusage("-I")));
+                    if (sec > 1000000000LL) {
+                        warnx("-I %lld: too large, capping at 1e9 sec",
+                            (long long)sec);
+                        sec = 1000000000LL;
+                    }
+                    s->idle_timeout = sec * 1000000000LL;
+                    break;
+                }
+                case 'H':
+                    s->http_health = 1;
+                    break;
                 case 'h':
                     usage(0);
                 case 'v':

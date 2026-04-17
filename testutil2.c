@@ -124,6 +124,142 @@ cttest_optf_does_not_override_prior_D()
         srv.wal.wantsync);
 }
 
+// --- DoS protection flags. Defaults must stay 0 (off) to preserve the
+// "no surprise on upgrade" contract. Parsing must reject malformed input
+// without silently swallowing it.
+
+void
+cttest_optc_default_off()
+{
+    srv.maxconn = 0;
+    char *args[] = { NULL };
+    optparse(&srv, args);
+    assertf(srv.maxconn == 0,
+        "default must be unlimited (0), got %u", srv.maxconn);
+}
+
+void
+cttest_optc_zero_explicit()
+{
+    srv.maxconn = 999;
+    char *args[] = { "-c0", NULL };
+    optparse(&srv, args);
+    assertf(srv.maxconn == 0,
+        "-c0 must mean unlimited, got %u", srv.maxconn);
+}
+
+void
+cttest_optc_valid_value()
+{
+    srv.maxconn = 0;
+    char *args[] = { "-c4096", NULL };
+    optparse(&srv, args);
+    assertf(srv.maxconn == 4096,
+        "-c4096 must set maxconn=4096, got %u", srv.maxconn);
+}
+
+void
+cttest_optc_one()
+{
+    srv.maxconn = 0;
+    char *args[] = { "-c1", NULL };
+    optparse(&srv, args);
+    assertf(srv.maxconn == 1,
+        "-c1 must be accepted as the smallest non-zero limit, got %u",
+        srv.maxconn);
+}
+
+void
+cttest_optI_default_off()
+{
+    srv.idle_timeout = 0;
+    char *args[] = { NULL };
+    optparse(&srv, args);
+    assertf(srv.idle_timeout == 0,
+        "default must be disabled (0), got %lld",
+        (long long)srv.idle_timeout);
+}
+
+void
+cttest_optI_zero_explicit()
+{
+    srv.idle_timeout = 999;
+    char *args[] = { "-I0", NULL };
+    optparse(&srv, args);
+    assertf(srv.idle_timeout == 0,
+        "-I0 must mean disabled, got %lld", (long long)srv.idle_timeout);
+}
+
+void
+cttest_optI_seconds_to_ns()
+{
+    srv.idle_timeout = 0;
+    char *args[] = { "-I60", NULL };
+    optparse(&srv, args);
+    assertf(srv.idle_timeout == 60LL * 1000000000LL,
+        "-I60 must store 60s in ns, got %lld",
+        (long long)srv.idle_timeout);
+}
+
+void
+cttest_optI_huge_capped()
+{
+    // 1e9 sec (~31 years) is the documented cap. It protects
+    // last_activity_at + idle_timeout from int64 overflow on servers
+    // with very long uptime (CLOCK_MONOTONIC is large). Any legitimate
+    // operator wanting longer should just disable -I.
+    srv.idle_timeout = 0;
+    char *args[] = { "-I99999999999", NULL };
+    optparse(&srv, args);
+    assertf(srv.idle_timeout == 1000000000LL * 1000000000LL,
+        "-I huge must cap at 1e9 sec, got %lld",
+        (long long)srv.idle_timeout);
+}
+
+void
+cttest_optI_one_second()
+{
+    srv.idle_timeout = 0;
+    char *args[] = { "-I1", NULL };
+    optparse(&srv, args);
+    assertf(srv.idle_timeout == 1000000000LL,
+        "-I1 must be the smallest enabled value, got %lld",
+        (long long)srv.idle_timeout);
+}
+
+void
+cttest_optH_default_off()
+{
+    srv.http_health = 0;
+    char *args[] = { NULL };
+    optparse(&srv, args);
+    assertf(srv.http_health == 0,
+        "default must be off, got %d", srv.http_health);
+}
+
+void
+cttest_optH_enables()
+{
+    srv.http_health = 0;
+    char *args[] = { "-H", NULL };
+    optparse(&srv, args);
+    assertf(srv.http_health == 1,
+        "-H must set http_health=1, got %d", srv.http_health);
+}
+
+void
+cttest_optH_with_other_flags()
+{
+    srv.http_health = 0;
+    job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
+    char *args[] = { "-H", "-z2048", NULL };
+    optparse(&srv, args);
+    assertf(srv.http_health == 1,
+        "-H must compose with following flags, got %d", srv.http_health);
+    assertf(job_data_size_limit == 2048,
+        "-z2048 after -H must still apply, got %zu", job_data_size_limit);
+}
+
 // --- json_escape: the escape table is the load-bearing part of JSON
 // output. Failure here would silently produce malformed objects that
 // break Loki/fluentd parsers — log-shipping silently drops them and

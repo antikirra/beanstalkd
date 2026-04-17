@@ -120,15 +120,9 @@ static const char _Alignas(64) valid_name_char[256] = {
 #define MSG_EXPECTED_CRLF "EXPECTED_CRLF\r\n"
 #define MSG_JOB_TOO_BIG "JOB_TOO_BIG\r\n"
 
-// Connection can be in one of these states:
-#define STATE_WANT_COMMAND  0  // conn expects a command from the client
-#define STATE_WANT_DATA     1  // conn expects a job data
-#define STATE_SEND_JOB      2  // conn sends job to the client
-#define STATE_SEND_WORD     3  // conn sends a line reply
-#define STATE_WAIT          4  // client awaits for the job reservation
-#define STATE_BITBUCKET     5  // conn discards content
-#define STATE_CLOSE         6  // conn should be closed
-#define STATE_WANT_ENDLINE  7  // skip until the end of a line
+// STATE_* moved to dat.h so conn.c (idle scheduler) can reference
+// STATE_WANT_COMMAND without a literal 0. Inline comments preserved
+// at the dat.h definitions.
 
 #define OP_UNKNOWN 0
 #define OP_PUT 1
@@ -500,12 +494,24 @@ reply(Conn *c, char *line, int len, int state)
         if (likely(r == len)) {
             // Fast path: skip c->reply* stores (only needed for retry).
             c->state = STATE_WANT_COMMAND;
+            // -I: this is the hot reply path; conn_want_command is
+            // bypassed, so refresh last_activity_at here too. A busy
+            // pipelined conn would otherwise drift toward the idle
+            // deadline set when it last entered the heap.
+            c->last_activity_at = now;
             if (unlikely(c->out_job)) {
                 if (c->out_job->r.state == Copy)
                     job_free(c->out_job);
                 c->out_job = NULL;
             }
-            if (unlikely(c->in_conns || c->pending_timeout >= 0))
+            // Reschedule when (a) conn was in heap, (b) reserve timeout
+            // pending, or (c) -I is on. Case (c) covers the transition
+            // STATE_WANT_DATA → STATE_WANT_COMMAND where the conn fell
+            // out of the heap during the put body and now needs a fresh
+            // idle deadline. Without it, a slow-PUT-then-silent client
+            // would never be reaped.
+            if (unlikely(c->in_conns || c->pending_timeout >= 0
+                         || srv.idle_timeout > 0))
                 connsched(c);
             return;
         }
@@ -1810,6 +1816,38 @@ is_valid_tube(const char *name, size_t max)
     return len;
 }
 
+// Minimal HTTP/1.0 responses for -H. Connection: close lets curl/kubelet
+// short-circuit instead of waiting for a keep-alive read. The 503 body is
+// "draining" so an oncall reading the response sees the reason directly.
+#define HTTP_200_BODY "ok"
+#define HTTP_503_BODY "draining"
+#define HTTP_200_HDR \
+    "HTTP/1.0 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n"
+#define HTTP_503_HDR \
+    "HTTP/1.0 503 Service Unavailable\r\nContent-Length: 8\r\n" \
+    "Connection: close\r\n\r\n"
+
+// Reply to the health probe and mark the conn for close. Any short or
+// failed write is fine — kubelet/curl retries fast and the probe only
+// needs the status line in the typical case.
+static void
+http_health_reply(Conn *c, int is_head)
+{
+    const char *hdr = drain_mode ? HTTP_503_HDR : HTTP_200_HDR;
+    const char *body = drain_mode ? HTTP_503_BODY : HTTP_200_BODY;
+    size_t hdr_len = strlen(hdr);
+    size_t body_len = is_head ? 0 : strlen(body);
+
+    struct iovec iov[2] = {
+        { .iov_base = (void *)hdr,  .iov_len = hdr_len },
+        { .iov_base = (void *)body, .iov_len = body_len },
+    };
+    int iovcnt = body_len ? 2 : 1;
+    ssize_t n = writev(c->sock.fd, iov, iovcnt);
+    (void)n; // best-effort; conn closes regardless
+    c->state = STATE_CLOSE;
+}
+
 __attribute__((hot)) static void
 dispatch_cmd(Conn *c)
 {
@@ -1839,6 +1877,21 @@ dispatch_cmd(Conn *c)
     if (unlikely(memchr(c->cmd, '\0', c->cmd_len - 2) != NULL)) {
         reply_msg(c, MSG_BAD_FORMAT);
         return;
+    }
+
+    // -H HTTP health endpoint. Detection requires a space after the verb
+    // so beanstalk commands that happen to share a prefix ("get-..." is
+    // not a thing today, but stay strict) cannot be hijacked. When -H is
+    // off, GET/HEAD fall through to UNKNOWN_COMMAND just like any junk.
+    if (srv.http_health) {
+        if (c->cmd_len >= 4 && memcmp(c->cmd, "GET ", 4) == 0) {
+            http_health_reply(c, 0);
+            return;
+        }
+        if (c->cmd_len >= 5 && memcmp(c->cmd, "HEAD ", 5) == 0) {
+            http_health_reply(c, 1);
+            return;
+        }
     }
 
     type = which_cmd(c);
@@ -2539,6 +2592,28 @@ conn_timeout(Conn *c)
     int should_timeout = 0;
     Job *j;
 
+    // -I idle close. Conditions mirror conntickat's idle branch so the
+    // tick that fires here is the one we scheduled. Workers blocked on
+    // reserve are excluded by !conn_waiting and pending_timeout<0; conns
+    // mid-put or sending a reply are excluded by the STATE_WANT_COMMAND
+    // gate. last_activity_at is the boundary of the last completed cmd,
+    // so a slow client typing one byte at a time still gets reaped.
+    if (srv.idle_timeout > 0
+        && c->state == STATE_WANT_COMMAND
+        && job_list_is_empty(&c->reserved_jobs)
+        && c->pending_timeout < 0
+        && !conn_waiting(c)
+        && now - c->last_activity_at >= srv.idle_timeout) {
+        if (verbose) {
+            printf("close idle %d (no activity for %llds)\n",
+                c->sock.fd,
+                (long long)((now - c->last_activity_at) / 1000000000));
+        }
+        epollq_rmconn(c);
+        connclose(c);
+        return;
+    }
+
     /* Check if the client was trying to reserve a job. */
     if (conn_waiting(c) && conndeadlinesoon(c))
         should_timeout = 1;
@@ -2600,6 +2675,7 @@ conn_want_command(Conn *c)
 
     c->reply_sent = 0; /* now that we're done, reset this */
     c->state = STATE_WANT_COMMAND;
+    c->last_activity_at = now; // -I: command boundary = activity edge
 }
 
 __attribute__((hot)) static void
@@ -3004,6 +3080,19 @@ h_accept(const int fd, const short which, Server *s)
             printf("accept %d\n", cfd);
         }
 
+        // -c N soft cap: reject before allocating Conn or touching TCP
+        // options. Closing here costs one accept+close per excess client;
+        // the alternative (sockwant off the listener) would stall legit
+        // backlog. The client sees an immediate close — its next read or
+        // write fails fast, no half-open hang.
+        if (s->maxconn && count_cur_conns() >= s->maxconn) {
+            if (verbose) {
+                printf("reject %d: maxconn=%u reached\n", cfd, s->maxconn);
+            }
+            close(cfd);
+            continue;
+        }
+
         int flags = 1;
         setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &flags, sizeof flags);
         setsockopt(cfd, IPPROTO_TCP, TCP_QUICKACK, &flags, sizeof flags);
@@ -3027,6 +3116,13 @@ h_accept(const int fd, const short which, Server *s)
             connclose(c);
             continue;
         }
+
+        // -I: a fresh conn that never sends a byte would otherwise
+        // stay outside srv.conns forever (no epollq_add fires until
+        // the client speaks). Schedule once at accept time so the
+        // idle deadline becomes reachable from prottick.
+        if (srv.idle_timeout > 0)
+            connsched(c);
     }
     epollq_apply();
 }
