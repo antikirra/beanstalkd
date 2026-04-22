@@ -279,18 +279,21 @@ moveone(Wal *w)
 static int
 walcompact(Wal *w)
 {
-    int r;
+    // Early-out: if there is nothing to migrate, skip compact_post as well.
+    // compact_post is only needed to protect markers from walgc unlinking
+    // old files during migration (moveone -> filedecref -> walgc). Without
+    // migration, walgc has no trigger here, so re-emitting every marker
+    // every walmaint tick is just write amplification (#703).
+    int r = ratio(w);
+    if (r < 2) return 1;
 
     // Rewrite truncate markers to the current file BEFORE migration.
-    // walgc is triggered lazily by filedecref inside moveone, so it
-    // can delete old files (with their markers) during the loop below.
-    // Writing fresh markers first ensures they survive in w->cur.
     if (w->compact_post) {
         if (!w->compact_post(w))
             return 0;
     }
 
-    for (r=ratio(w); r>=2; r--) {
+    for (; r >= 2; r--) {
         for (int batch = 0; batch < 8; batch++) {
             if (!moveone(w))
                 return batch > 0; // partial batch is not a failure
@@ -309,8 +312,11 @@ walsync(Wal *w)
     if (w->sync_on) {
         if (atomic_load_explicit(&w->sync_err, memory_order_relaxed)) {
             pthread_mutex_lock(&w->sync_mu);
-            int err = w->sync_err;
-            w->sync_err = 0;
+            int err = atomic_load_explicit(&w->sync_err, memory_order_relaxed);
+            // Use atomic_store to match the fsync thread's store pattern;
+            // mixing atomic and plain access on an _Atomic variable is
+            // technically allowed but brittle (#709).
+            atomic_store_explicit(&w->sync_err, 0, memory_order_relaxed);
             pthread_mutex_unlock(&w->sync_mu);
             errno = err;
             twarn("async fsync");
@@ -403,10 +409,19 @@ wal_write_truncate(Wal *w, Tube *t, uint64 cutoff_id)
 
     int needed = sizeof(int) + (int)t->name_len + sizeof(Jobrec) + 2 + sizeof(uint32);
     if (!reserve(w, needed)) return 0;
-    if (w->cur->resv <= 0 && !usenext(w)) return 0;
+    if (w->cur->resv <= 0 && !usenext(w)) {
+        // `reserve` already incremented w->resv/w->cur->resv/w->tail->resv.
+        // Return them before disabling — otherwise accounting leaks.
+        walresvreturn(w, needed);
+        return 0;
+    }
 
     int r = filewrtruncate(w->cur, t, cutoff_id);
     if (!r) {
+        // filewrtruncate left reservations untouched on failure. Return
+        // them before WAL goes dark so w->resv matches reality for any
+        // remaining jobs still trying to reserve (#702).
+        walresvreturn(w, needed);
         filewclose(w->cur);
         w->use = 0;
         return 0;

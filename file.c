@@ -221,6 +221,23 @@ readrec(File *f, Job *l, int *err)
         return 0;
     }
 
+    // Sanity cap on body_size BEFORE allocating. A corrupted or
+    // pathological binlog could carry jr.body_size = INT_MAX, which
+    // malloc would then attempt to honor. v7 reader bounds to 64 for
+    // markers; we accept the full job_data_size_limit here for real
+    // jobs and cap the Invalid-marker specifically at 64 to mirror v7
+    // (the marker body is always 2 bytes in our writer) (#717).
+    if (namelen) {
+        int64 max_body = (jr.state == Invalid) ? 64 : (int64)job_data_size_limit;
+        if (jr.body_size < 0 || (int64)jr.body_size > max_body) {
+            warnpos(f, -sz,
+                    "record %"PRIu64" body_size %d out of range (state=%d, max=%"PRId64")",
+                    jr.id, jr.body_size, jr.state, max_body);
+            *err = 1;
+            return 0;
+        }
+    }
+
     // For full records, read body into a temporary buffer and fold into CRC.
     // We cannot read directly into j->body yet because CRC verification must
     // pass BEFORE any existing job state is mutated. This preserves the
@@ -334,7 +351,18 @@ readrec(File *f, Job *l, int *err)
         free(body_buf);
         if (namelen > 0) {
             t = tube_find_or_make(tubename);
-            if (t && jr.id > t->purge_before_id)
+            if (!t) {
+                // OOM while resurrecting truncate marker. Silently
+                // dropping would let cutoff-covered jobs replay as
+                // live — a direct violation of invariant #9. Fail the
+                // replay so the operator notices (#718).
+                warnpos(f, -sz,
+                        "OOM tube_find_or_make for truncate marker "
+                        "(tube=%s cutoff=%"PRIu64")", tubename, jr.id);
+                *err = 1;
+                return 0;
+            }
+            if (jr.id > t->purge_before_id)
                 t->purge_before_id = jr.id;
             return 1;
         }
@@ -496,6 +524,40 @@ readrec7(File *f, Job *l, int *err)
         return 1;
         } /* end old_body_size scope */
     case Invalid:
+        // Truncate marker (Invalid + namelen > 0) was introduced after
+        // v8 rolled out, but a v7 reader that encounters a marker-shaped
+        // record (e.g. a downgrade or cross-version migration) must
+        // honor it — otherwise cutoff is silently dropped and jobs with
+        // id ≤ cutoff resurrect on replay (#707).
+        if (namelen > 0) {
+            // Consume the marker body so the file position stays aligned
+            // for the next readrec7 call. Without this, v7 reader falls
+            // behind by body_size bytes and the next record parses from
+            // the middle of the marker (#714). filewrtruncate writes a
+            // 2-byte "\r\n" body; bound defensively.
+            if (jr.body_size < 0 || jr.body_size > 64) {
+                warnpos(f, -sz, "v7 marker body_size %d out of expected range",
+                        jr.body_size);
+                goto Error;
+            }
+            char mbody[64];
+            if (jr.body_size > 0) {
+                int rb = readfull(f, mbody, jr.body_size, err, "marker body");
+                if (!rb) goto Error;
+            }
+            t = tube_find_or_make(tubename);
+            if (!t) {
+                // OOM while resurrecting v7 truncate marker — fail
+                // replay rather than silently drop the cutoff (#718).
+                warnpos(f, -sz,
+                        "OOM tube_find_or_make for v7 truncate marker "
+                        "(tube=%s cutoff=%"PRIu64")", tubename, jr.id);
+                goto Error;
+            }
+            if (jr.id > t->purge_before_id)
+                t->purge_before_id = jr.id;
+            return 1;
+        }
         if (j) {
             job_list_remove(j);
             filermjob(j->file, j);
@@ -639,6 +701,67 @@ filewopen(File *f)
 }
 
 
+// writev_all writes `total` bytes from iov to fd with EINTR / partial-write
+// retry. On failure, truncates the file back to the pre-write offset so
+// that on recovery, readrec does NOT stumble on half-written record
+// bytes: a torn trailer would CRC-fail and abort fileread, silently
+// dropping every record that followed in the same binlog (#700).
+// Returns 1 on success, 0 on failure (file rolled back when possible).
+static int
+writev_all(int fd, struct iovec *iov, int iovcnt, int total)
+{
+    off_t before = lseek(fd, 0, SEEK_CUR);
+    if (unlikely(before < 0)) { twarn("lseek before writev"); return 0; }
+
+    ssize_t r = writev(fd, iov, iovcnt);
+    if (likely(r == total)) return 1;
+
+    int written;
+    if (r == -1) {
+        if (errno != EINTR) { twarn("writev"); goto rollback; }
+        written = 0;
+    } else if (unlikely(r <= 0)) {
+        twarn("writev");
+        goto rollback;
+    } else {
+        written = (int)r;
+        while (iovcnt > 0 && (size_t)r >= iov[0].iov_len) {
+            r -= iov[0].iov_len; iov++; iovcnt--;
+        }
+        if (iovcnt > 0 && r > 0) {
+            iov[0].iov_base = (char *)iov[0].iov_base + r;
+            iov[0].iov_len -= r;
+        }
+    }
+    while (written < total) {
+        r = writev(fd, iov, iovcnt);
+        if (r == -1 && errno == EINTR) continue;
+        if (unlikely(r <= 0)) { twarn("writev"); goto rollback; }
+        written += r;
+        while (iovcnt > 0 && (size_t)r >= iov[0].iov_len) {
+            r -= iov[0].iov_len; iov++; iovcnt--;
+        }
+        if (iovcnt > 0 && r > 0) {
+            iov[0].iov_base = (char *)iov[0].iov_base + r;
+            iov[0].iov_len -= r;
+        }
+    }
+    return 1;
+
+rollback:
+    // Best-effort: leave the WAL in a readable state. If ftruncate fails
+    // (rare: ENOSPC already on a filesystem that ate our writev), the
+    // binlog tail will contain torn bytes — caller should treat this as
+    // WAL-disabled and let the next restart deal with a CRC fail at the
+    // tail, which stops at the first bad record rather than propagating.
+    if (ftruncate(fd, before) == -1) {
+        twarn("ftruncate rollback after writev fail");
+    } else if (lseek(fd, before, SEEK_SET) < 0) {
+        twarn("lseek after writev rollback");
+    }
+    return 0;
+}
+
 // filewritev writes multiple buffers to f in a single writev syscall.
 // Updates WAL accounting on success. Returns 1 on success, 0 on failure.
 __attribute__((hot)) static int
@@ -648,46 +771,8 @@ filewritev(File *f, Job *j, struct iovec *iov, int iovcnt)
     for (int i = 0; i < iovcnt; i++)
         total += iov[i].iov_len;
 
-    // Fast path: single writev completes everything (common case).
-    ssize_t r = writev(f->fd, iov, iovcnt);
-    if (likely(r == total))
-        goto done;
+    if (!writev_all(f->fd, iov, iovcnt, total)) return 0;
 
-    // EINTR before any bytes written: retry from scratch.
-    if (r == -1) {
-        if (errno != EINTR) { twarn("writev"); return 0; }
-        r = 0;
-    } else if (unlikely(r <= 0)) {
-        twarn("writev");
-        return 0;
-    }
-
-    // Slow path: partial write, advance iov and retry.
-    {
-        int written = (int)r;
-        while (iovcnt > 0 && (size_t)r >= iov[0].iov_len) {
-            r -= iov[0].iov_len; iov++; iovcnt--;
-        }
-        if (iovcnt > 0 && r > 0) {
-            iov[0].iov_base = (char *)iov[0].iov_base + r;
-            iov[0].iov_len -= r;
-        }
-        while (written < total) {
-            r = writev(f->fd, iov, iovcnt);
-            if (r == -1 && errno == EINTR) continue;
-            if (unlikely(r <= 0)) { twarn("writev"); return 0; }
-            written += r;
-            while (iovcnt > 0 && (size_t)r >= iov[0].iov_len) {
-                r -= iov[0].iov_len; iov++; iovcnt--;
-            }
-            if (iovcnt > 0 && r > 0) {
-                iov[0].iov_base = (char *)iov[0].iov_base + r;
-                iov[0].iov_len -= r;
-            }
-        }
-    }
-
-done:
     f->w->resv -= total;
     f->resv -= total;
     j->walresv -= total;
@@ -805,47 +890,14 @@ filewrtruncate(File *f, Tube *t, uint64 cutoff_id)
     };
 
     int total = sizeof(int) + nl + sizeof(Jobrec) + sizeof body + sizeof(uint32);
-    struct iovec *vp = iov;
-    int iovcnt = 5;
-    ssize_t r = writev(f->fd, vp, iovcnt);
-    if (likely(r == total))
-        goto done;
+    if (!writev_all(f->fd, iov, 5, total)) return 0;
 
-    if (r == -1) {
-        if (errno == EINTR) r = 0;
-        else { twarn("writev truncate marker"); return 0; }
-    } else if (unlikely(r <= 0)) {
-        twarn("writev truncate marker");
-        return 0;
-    }
-
-    {
-        int written = (int)r;
-        while (iovcnt > 0 && (size_t)r >= vp[0].iov_len) {
-            r -= vp[0].iov_len; vp++; iovcnt--;
-        }
-        if (iovcnt > 0 && r > 0) {
-            vp[0].iov_base = (char *)vp[0].iov_base + r;
-            vp[0].iov_len -= r;
-        }
-        while (written < total) {
-            r = writev(f->fd, vp, iovcnt);
-            if (r == -1 && errno == EINTR) continue;
-            if (unlikely(r <= 0)) { twarn("writev truncate marker"); return 0; }
-            written += r;
-            while (iovcnt > 0 && (size_t)r >= vp[0].iov_len) {
-                r -= vp[0].iov_len; vp++; iovcnt--;
-            }
-            if (iovcnt > 0 && r > 0) {
-                vp[0].iov_base = (char *)vp[0].iov_base + r;
-                vp[0].iov_len -= r;
-            }
-        }
-    }
-
-done:
     f->w->resv -= total;
     f->resv -= total;
+    // Count marker bytes as live so walgc's ratio() does not see a
+    // marker-only binlog as pure dead space and unlink it before the
+    // next compact_post re-emits the marker into w->cur (#701).
+    f->w->alive += total;
     return 1;
 }
 

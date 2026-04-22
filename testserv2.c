@@ -794,8 +794,11 @@ cttest_truncate_reserved_released_is_dead()
     snd(fd, "truncate rq\r\n");
     ck(fd, "TRUNCATED 0\r\n");
 
+    // Release of a post-truncate zombie reservation must not advertise
+    // RELEASED — that would be a ghost for an id the truncate contract
+    // already killed. Server reaps the zombie and replies NOT_FOUND.
     snd(fd, "release 1 0 0\r\n");
-    ck(fd, "RELEASED\r\n");
+    ck(fd, "NOT_FOUND\r\n");
 
     snd(fd, "stats-tube rq\r\n");
     cksub(fd, "OK ");
@@ -1193,9 +1196,11 @@ cttest_truncate_release_with_delay_kills_zombie()
     snd(fd, "truncate rd\r\n");
     ck(fd, "TRUNCATED 0\r\n");
 
-    // Release with delay: enqueue_job intercept catches purge-eligible.
+    // Release of a purge-eligible reservation — even with non-zero delay —
+    // must not advertise RELEASED (ghost-id). Server short-circuits to
+    // NOT_FOUND and reaps; the delay queue never receives the zombie.
     snd(fd, "release 1 0 3600\r\n");
-    ck(fd, "RELEASED\r\n");
+    ck(fd, "NOT_FOUND\r\n");
 
     // Job should NOT appear in delay queue.
     snd(fd, "stats-tube rd\r\n");
@@ -1362,6 +1367,202 @@ cttest_truncate_connclose_reserved()
     int fd2 = diallocal(port);
     snd(fd2, "stats\r\n");
     cksub(fd2, "OK ");
+}
+
+// UAF reproduction: tube refcount must drop to 1 (held only by the
+// reserved job) BEFORE close, so that enqueue_reserved_jobs -> enqueue_job
+// purge path -> job_free releases the last ref and frees the tube.
+// Without tube_iref/dref around the loop body, `t->stat.reserved_ct--`
+// writes into freed memory. ASan should catch this; counter consistency
+// is observable without ASan too.
+void
+cttest_truncate_connclose_reserved_last_ref()
+{
+    int port = startsrv();
+    int fda = diallocal(port);
+    int fdb = diallocal(port);
+
+    // Client A: use uaf, put, watch uaf, reserve, ignore default, use default.
+    // At this point the only ref on tube 'uaf' is the reserved job's TUBE_ASSIGN.
+    snd(fda, "use uaf\r\n");
+    ck(fda, "USING uaf\r\n");
+    snd(fda, "put 0 0 60 1\r\nz\r\n");
+    ck(fda, "INSERTED 1\r\n");
+    snd(fda, "watch uaf\r\n");
+    ck(fda, "WATCHING 2\r\n");
+    snd(fda, "reserve-with-timeout 0\r\n");
+    cksub(fda, "RESERVED 1 1\r\n");
+    rd(fda);
+    snd(fda, "ignore uaf\r\n");
+    ck(fda, "WATCHING 1\r\n");
+    snd(fda, "use default\r\n");
+    ck(fda, "USING default\r\n");
+
+    // Client B: truncate. Cutoff covers id 1. Client A's reserved job
+    // is now purge-eligible; on A's close, enqueue_job takes the purge
+    // path and job_free drops the last tube ref.
+    snd(fdb, "truncate uaf\r\n");
+    ck(fdb, "TRUNCATED 0\r\n");
+
+    // Close A. If UAF exists and ASan is on, this is where we crash.
+    close(fda);
+
+    // Observable consistency: a second truncate on a fresh connection
+    // must not see stale reserved_ct.
+    snd(fdb, "stats\r\n");
+    cksub(fdb, "OK ");
+}
+
+// touch on a post-truncate reserved zombie must return NOT_FOUND,
+// not TOUCHED. Otherwise the client could keep extending the TTR
+// indefinitely and pin truncated_tubes_ct > 0 forever, wasting the
+// reap slot every tick.
+void
+cttest_truncate_touch_reserved_returns_notfound()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    snd(fd, "use tz\r\n");
+    ck(fd, "USING tz\r\n");
+    snd(fd, "put 0 0 60 1\r\nx\r\n");
+    ck(fd, "INSERTED 1\r\n");
+    snd(fd, "watch tz\r\n");
+    ck(fd, "WATCHING 2\r\n");
+    snd(fd, "reserve-with-timeout 0\r\n");
+    cksub(fd, "RESERVED 1 1\r\n");
+    rd(fd);
+
+    snd(fd, "truncate tz\r\n");
+    ck(fd, "TRUNCATED 0\r\n");
+
+    snd(fd, "touch 1\r\n");
+    ck(fd, "NOT_FOUND\r\n");
+}
+
+// bury on a post-truncate reserved zombie must return NOT_FOUND (not
+// BURIED) — otherwise the zombie lives on the buried chain, stats.buried_ct
+// inflates, and lazy reap has to do a second pass.
+void
+cttest_truncate_bury_zombie_returns_notfound()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    snd(fd, "use bz\r\n");
+    ck(fd, "USING bz\r\n");
+    snd(fd, "put 0 0 60 1\r\nx\r\n");
+    ck(fd, "INSERTED 1\r\n");
+    snd(fd, "watch bz\r\n");
+    ck(fd, "WATCHING 2\r\n");
+    snd(fd, "reserve-with-timeout 0\r\n");
+    cksub(fd, "RESERVED 1 1\r\n");
+    rd(fd);
+
+    snd(fd, "truncate bz\r\n");
+    ck(fd, "TRUNCATED 0\r\n");
+
+    snd(fd, "bury 1 0\r\n");
+    ck(fd, "NOT_FOUND\r\n");
+
+    snd(fd, "stats-tube bz\r\n");
+    cksub(fd, "OK ");
+    cksub(fd, "current-jobs-buried: 0\n");
+}
+
+// kick-job on a zombie id must return NOT_FOUND, never KICKED for a
+// ghost id. Previously, a zombie in Buried/Delayed state would be
+// kicked into Ready, hit enqueue_job's purge intercept, and the reply
+// would be MSG_KICKED for an immediately-purged id.
+void
+cttest_truncate_kickjob_zombie_returns_notfound()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    snd(fd, "use kz\r\n");
+    ck(fd, "USING kz\r\n");
+    snd(fd, "put 0 0 60 1\r\nx\r\n");
+    ck(fd, "INSERTED 1\r\n");
+    snd(fd, "watch kz\r\n");
+    ck(fd, "WATCHING 2\r\n");
+    snd(fd, "reserve-with-timeout 0\r\n");
+    cksub(fd, "RESERVED 1 1\r\n");
+    rd(fd);
+    // Bury BEFORE truncate so the id is on the buried chain when cutoff
+    // covers it. Now a kick-job sees buried state + zombie.
+    snd(fd, "bury 1 0\r\n");
+    ck(fd, "BURIED\r\n");
+    snd(fd, "truncate kz\r\n");
+    ck(fd, "TRUNCATED 1\r\n");
+
+    snd(fd, "kick-job 1\r\n");
+    ck(fd, "NOT_FOUND\r\n");
+}
+
+// Protocol conformance: dispatch must strictly match the verb prefix.
+// Garbage bytes in place of a real command prefix should yield
+// UNKNOWN_COMMAND, not be misdispatched as the real verb.
+void
+cttest_prot_dispatch_strict_prefix()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    // peek must be exactly "peek ", not "pe?? ". Before the fix, any
+    // "pe?? <id>\r\n" dispatched to OP_PEEKJOB.
+    snd(fd, "pexk 1\r\n");
+    ck(fd, "UNKNOWN_COMMAND\r\n");
+
+    // reserve-with-timeout needs full prefix. Before the fix, any
+    // "r??????-w*" dispatched and replied BAD_FORMAT.
+    snd(fd, "reserve-wtf 1\r\n");
+    ck(fd, "UNKNOWN_COMMAND\r\n");
+
+    // quit must be exactly "quit\r\n" (6 bytes). Before the fix,
+    // "quitXXX\r\n" closed the connection.
+    snd(fd, "quitXXX\r\n");
+    ck(fd, "UNKNOWN_COMMAND\r\n");
+
+    // kick must be "kick N". "kxxk 1" must fail.
+    snd(fd, "kxxk 1\r\n");
+    ck(fd, "UNKNOWN_COMMAND\r\n");
+
+    // list-tubes-watched needs exact length-20 form.
+    snd(fd, "list-tubesXXXXXXXX\r\n");
+    ck(fd, "UNKNOWN_COMMAND\r\n");
+}
+
+// Global `stats` response must match per-tube `stats-tube` semantics:
+// between TRUNCATED and lazy reap, current-jobs-ready must drop by
+// exactly the number of killed jobs — both at the global level and
+// the per-tube level. Before the fix, global stats leaked zombies.
+void
+cttest_truncate_global_stats_drops_zombies()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    snd(fd, "use gs\r\n");
+    ck(fd, "USING gs\r\n");
+    // Put three ready jobs.
+    snd(fd, "put 0 0 60 1\r\na\r\n");  ck(fd, "INSERTED 1\r\n");
+    snd(fd, "put 0 0 60 1\r\nb\r\n");  ck(fd, "INSERTED 2\r\n");
+    snd(fd, "put 0 0 60 1\r\nc\r\n");  ck(fd, "INSERTED 3\r\n");
+
+    // Sanity: global stats should see 3 ready before truncate.
+    snd(fd, "stats\r\n");
+    cksub(fd, "OK ");
+    cksub(fd, "current-jobs-ready: 3\n");
+
+    snd(fd, "truncate gs\r\n");
+    ck(fd, "TRUNCATED 3\r\n");
+
+    // The reply claims 3 killed — global stats must immediately agree,
+    // even before lazy reap has run.
+    snd(fd, "stats\r\n");
+    cksub(fd, "OK ");
+    cksub(fd, "current-jobs-ready: 0\n");
 }
 
 // ============================================================

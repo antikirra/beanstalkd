@@ -286,13 +286,19 @@ optparse(Server *s, char **argv)
                         job_data_size_limit = JOB_DATA_SIZE_LIMIT_MAX;
                     }
                     break;
-                case 's':
-                    s->wal.filesize = parse_size_t(EARGF(flagusage("-s")));
-                    if (s->wal.filesize < 1) {
+                case 's': {
+                    // wal.filesize is `int` (dat.h). Cap before narrowing
+                    // to avoid silent truncation on large operator values
+                    // (#722).
+                    size_t fs = parse_size_t(EARGF(flagusage("-s")));
+                    if (fs < 1 || fs > INT_MAX) {
                         warnx("invalid wal file size, using default");
                         s->wal.filesize = Filesizedef;
+                    } else {
+                        s->wal.filesize = (int)fs;
                     }
                     break;
+                }
                 case 'f':
                     ms = (int64)parse_size_t(EARGF(flagusage("-f")));
                     if (ms > 1000000000) {
@@ -323,7 +329,14 @@ optparse(Server *s, char **argv)
                     s->wal.use = 1;
                     break;
                 case 'm': {
+                    // Cap to match -f/-I style: sec * 1e9 must fit in int64.
+                    // 1e9 seconds ≈ 31 years. Any larger input is an
+                    // operator mistake; prevent silent overflow (#722).
                     int64 sec = (int64)parse_size_t(EARGF(flagusage("-m")));
+                    if (sec < 0 || sec > 1000000000LL) {
+                        warnx("-m value out of range (0..1e9 sec), capping at 1e9");
+                        sec = 1000000000LL;
+                    }
                     mem_trim_rate = sec * 1000000000LL;
                     break;
                 }
