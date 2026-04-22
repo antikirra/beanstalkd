@@ -82,11 +82,33 @@ set_sig_handlers()
 static void
 pin_to_cpu(int cpu)
 {
+    // Reject cpu indices that can't be represented in a cpu_set_t.
+    // CPU_SET() with an out-of-range index is undefined (glibc docs) —
+    // on some builds it silently writes past the fd_set-shaped bitmap.
+    if (cpu < 0 || cpu >= CPU_SETSIZE) {
+        twarnx("pin_to_cpu: cpu %d out of range [0, %d); skipping",
+               cpu, CPU_SETSIZE);
+        srv.cpu = -1;
+        return;
+    }
+
+    // Reject cpu indices beyond the kernel's online CPU count. Prevents
+    // silent sched_setaffinity EINVAL and, more importantly, a bogus
+    // SO_INCOMING_CPU value leaking into make_server_socket.
+    long nproc = sysconf(_SC_NPROCESSORS_ONLN);
+    if (nproc > 0 && cpu >= nproc) {
+        twarnx("pin_to_cpu: cpu %d exceeds online cpu count %ld; skipping",
+               cpu, nproc);
+        srv.cpu = -1;
+        return;
+    }
+
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
     CPU_SET(cpu, &cpuset);
     if (sched_setaffinity(0, sizeof(cpuset), &cpuset) == -1) {
         twarn("sched_setaffinity(%d)", cpu);
+        srv.cpu = -1;  // do not propagate a bogus cpu to SO_INCOMING_CPU
     } else {
         srv.cpu = cpu; // SO_INCOMING_CPU in make_server_socket uses this
         if (verbose)

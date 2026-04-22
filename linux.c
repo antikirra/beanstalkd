@@ -100,11 +100,20 @@ socknext(Socket **s, int64 timeout)
     if (ep_pos < ep_nready) {
         struct epoll_event *ev = &ep_buf[ep_pos++];
         *s = ev->data.ptr;
+
+        // EPOLLIN takes priority over half/full close flags so we never
+        // drop a trailing command sitting in the receive buffer when the
+        // peer has already shut down its write side (bundled EPOLLIN|
+        // EPOLLRDHUP on the same wake-up). Level-triggered epoll re-arms
+        // EPOLLRDHUP/EPOLLHUP after the buffer is drained, so the close
+        // path is guaranteed to fire on a subsequent iteration.
+        if (likely(ev->events & EPOLLIN)) {
+            return 'r';
+        }
         if (unlikely(ev->events & (EPOLLERR|EPOLLHUP|EPOLLRDHUP))) {
             return 'h';
-        } else if (likely(ev->events & EPOLLIN)) {
-            return 'r';
-        } else if (ev->events & EPOLLOUT) {
+        }
+        if (ev->events & EPOLLOUT) {
             return 'w';
         }
     }

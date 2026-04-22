@@ -1486,6 +1486,16 @@ enqueue_incoming_job(Conn *c)
     }
 
     /* out of memory trying to grow the queue, so it gets buried */
+    // Return residual walresv before bury: walresvput reserved a full-record
+    // slot, enqueue_job returned 0 (heapinsert or walwrite failed), and
+    // bury_job(update_store=0) will not consume it. Without this return,
+    // every OOM'd PUT permanently inflates w->resv, eventually starving
+    // later PUTs of reservable WAL space. Mirrors the defensive return
+    // in process_tube's OOM-re-enqueue fallback.
+    if (j->walresv) {
+        walresvreturn(&c->srv->wal, j->walresv);
+        j->walresv = 0;
+    }
     bury_job(c->srv, j, 0);
     reply_buried(c, jid);
 }
@@ -3413,7 +3423,11 @@ prot_init()
     started_at = now;
     srv.wal.compact_post = wal_compact_post;
 
-    int dev_random = open("/dev/urandom", O_RDONLY);
+    // O_CLOEXEC: keep consistent with every other open() in the binary.
+    // prot_init runs before any conceivable fork/exec path, so a leak here
+    // is theoretical, but the project has a hard rule that every fd uses
+    // the cloexec flag — don't be the one outlier.
+    int dev_random = open("/dev/urandom", O_RDONLY|O_CLOEXEC);
     if (dev_random < 0) {
         twarn("open /dev/urandom");
         exit(50);

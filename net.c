@@ -212,7 +212,10 @@ make_unix_socket(char *path)
         if (S_ISSOCK(st.st_mode)) {
             warnx("removing existing local socket to replace it");
             r = unlink(path);
-            if (r == -1) {
+            // ENOENT here means another process raced us and already removed
+            // the stale socket — fine, bind() will proceed. Any other error
+            // is a real failure (permissions, bad mount, etc.).
+            if (r == -1 && errno != ENOENT) {
                 twarn("unlink");
                 return -1;
             }
@@ -220,6 +223,11 @@ make_unix_socket(char *path)
             twarnx("another file already exists in the given path");
             return -1;
         }
+    } else if (errno != ENOENT) {
+        // stat() failed for a reason other than "path doesn't exist".
+        // EACCES, ELOOP, etc. — don't proceed blindly to bind().
+        twarn("stat(\"%s\")", path);
+        return -1;
     }
 
     fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
