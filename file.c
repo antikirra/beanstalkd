@@ -762,8 +762,67 @@ rollback:
     return 0;
 }
 
+// Durable-commits the tail of f: fdatasync + ftruncate rollback on failure.
+// Mirrors writev_all's atomic-or-rollback pattern so that, on error, the
+// `total` bytes just written are removed from the end of the file. This
+// keeps server memory and on-disk state consistent: the caller has not
+// yet applied accounting updates, so a failure here looks identical to
+// "writev never happened" (#C2).
+//
+// EINTR retries indefinitely (fdatasync is never interrupted for long in
+// practice; if it is, the process is being signaled and the main loop
+// will shortly tear down). Any other errno is permanent.
+//
+// Returns 1 on success (data durable), 0 on failure (tail best-effort
+// rolled back, WAL caller should disable w->use and surface the error).
+static int
+filewrite_commit_durable(File *f, int total)
+{
+    if (likely(!f->w->durable_sync)) return 1;
+
+    int sr;
+    while ((sr = fdatasync(f->fd)) == -1 && errno == EINTR)
+        ;
+    if (likely(sr != -1)) return 1;
+
+    twarn("durable fdatasync");
+
+    // Best-effort rollback. If ftruncate or the follow-up fdatasync
+    // also fail, the tail may still contain the uncommitted bytes; the
+    // next readrec on replay will either accept them (kernel flushed
+    // the write + the record happened to be fully on-disk) or CRC-fail
+    // at the tail (partial record). Both paths are safer than leaving
+    // the server's memory claiming "write failed" while disk says
+    // "write succeeded", which is the bug this path closes.
+    off_t cur = lseek(f->fd, 0, SEEK_CUR);
+    if (cur < (off_t)total) {
+        twarnx("durable rollback: unexpected offset %lld < total %d",
+               (long long)cur, total);
+        return 0;
+    }
+    off_t before = cur - (off_t)total;
+    if (ftruncate(f->fd, before) == -1) {
+        twarn("ftruncate rollback after durable fdatasync");
+        return 0;
+    }
+    if (lseek(f->fd, before, SEEK_SET) < 0) {
+        twarn("lseek after durable rollback");
+        // Offset is unknown now, but we still removed the bytes. The
+        // caller will filewclose + w->use=0, making further writes
+        // impossible, so the misaligned offset is harmless.
+    }
+    int dr;
+    while ((dr = fdatasync(f->fd)) == -1 && errno == EINTR)
+        ;
+    if (dr == -1) twarn("durable fdatasync after rollback");
+    return 0;
+}
+
 // filewritev writes multiple buffers to f in a single writev syscall.
-// Updates WAL accounting on success. Returns 1 on success, 0 on failure.
+// Performs the durable fdatasync inside the same function under -D so
+// that a zero return is unambiguous: bytes either not on disk, or their
+// durability cannot be verified and the tail has been rolled back.
+// Updates WAL accounting only on success. Returns 1 on success, 0 otherwise.
 __attribute__((hot)) static int
 filewritev(File *f, Job *j, struct iovec *iov, int iovcnt)
 {
@@ -772,6 +831,7 @@ filewritev(File *f, Job *j, struct iovec *iov, int iovcnt)
         total += iov[i].iov_len;
 
     if (!writev_all(f->fd, iov, iovcnt, total)) return 0;
+    if (!filewrite_commit_durable(f, total)) return 0;
 
     f->w->resv -= total;
     f->resv -= total;
@@ -891,6 +951,10 @@ filewrtruncate(File *f, Tube *t, uint64 cutoff_id)
 
     int total = sizeof(int) + nl + sizeof(Jobrec) + sizeof body + sizeof(uint32);
     if (!writev_all(f->fd, iov, 5, total)) return 0;
+    // Durable commit BEFORE applying accounting. On fdatasync fail the
+    // tail is rolled back, so the caller's in-memory rollback of
+    // t->purge_before_id will match the disk state (#C2).
+    if (!filewrite_commit_durable(f, total)) return 0;
 
     f->w->resv -= total;
     f->resv -= total;

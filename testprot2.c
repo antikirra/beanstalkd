@@ -8,6 +8,10 @@
 #include <unistd.h>
 #include <errno.h>
 
+/* Defined in prot.c, exposed here for hostile unit tests that need to
+ * observe or seed the global stats counters directly. */
+extern struct stats global_stat;
+
 /*
  * Hostile tests for Phase 6 optimizations:
  * - delayed_ct global counter
@@ -883,4 +887,161 @@ cttest_tube_name_hash_full_table_fairness()
             "max bucket depth %d too high — clustering detected", max);
 
     free(buckets);
+}
+
+
+// #N5 regression: enqueue_reserved_jobs must null j->reserver before
+// the Conn pointer can be recycled. Previously the back-pointer stayed
+// set; is_job_reserved_by_conn's state==Reserved guard saved us today,
+// but a future reader without that gate would UAF the returned-to-pool
+// Conn slab.
+void
+cttest_enqueue_reserved_jobs_clears_reserver()
+{
+    now = nanoseconds();
+    prot_init();
+
+    Tube *t = tube_find_or_make("rsv-clear");
+    tube_iref(t);
+
+    Conn *c = make_conn(0, 0, t, t);
+    assertf(c, "make_conn must succeed");
+    c->srv = &srv;
+
+    /* Build a reserved job by hand — we avoid the network state
+     * machine so the test stays a pure unit test. */
+    Job *j = make_job(1, 0, 1000000000LL, 0, t);
+    assertf(j, "job must allocate");
+    j->r.state = Reserved;
+    j->r.deadline_at = now + 1000000000LL;
+    job_list_insert(&c->reserved_jobs, j);
+    j->reserver = c;
+    t->stat.reserved_ct = 1;
+    global_stat.reserved_ct = 1;
+
+    assertf(j->reserver == c, "precondition: reserver set");
+
+    enqueue_reserved_jobs(c);
+
+    assertf(j->reserver == NULL,
+            "enqueue_reserved_jobs must null reserver, got %p",
+            (void *)j->reserver);
+    assertf(j->r.state == Ready,
+            "job must be re-enqueued as Ready, got state=%d", j->r.state);
+    assertf(global_stat.reserved_ct == 0,
+            "reserved_ct must be decremented, got %" PRIu64,
+            global_stat.reserved_ct);
+
+    /* Clean up: remove from ready heap then free. */
+    heapremove(&t->ready, j->heap_index);
+    job_free(j);
+    connclose(c);
+    tube_dref(t);
+}
+
+
+// #N5 regression (multi-job): a mutation that nulls only the first
+// reserver and forgets the loop body would pass the single-job test
+// above. This variant seeds THREE reserved jobs and asserts every one
+// has reserver cleared + global counter drained to zero. Also locks
+// the empty-list no-op path via a pre-check.
+void
+cttest_enqueue_reserved_jobs_clears_all_reservers()
+{
+    now = nanoseconds();
+    prot_init();
+
+    Tube *t = tube_find_or_make("rsv-multi");
+    tube_iref(t);
+
+    Conn *c = make_conn(0, 0, t, t);
+    assertf(c, "make_conn must succeed");
+    c->srv = &srv;
+
+    /* Empty-list guard: enqueue_reserved_jobs on an empty conn must be
+     * a clean no-op — no counter drift, no crash. */
+    uint64 pre = global_stat.reserved_ct;
+    enqueue_reserved_jobs(c);
+    assertf(global_stat.reserved_ct == pre,
+            "empty reserved_jobs must leave reserved_ct unchanged "
+            "(was %" PRIu64 ", now %" PRIu64 ")",
+            pre, global_stat.reserved_ct);
+
+    /* Seed three reserved jobs with distinct priorities so they occupy
+     * distinct slots in the heap after re-enqueue. */
+    Job *jobs[3];
+    for (int i = 0; i < 3; i++) {
+        jobs[i] = make_job((uint32)(i + 1), 0, 1000000000LL, 0, t);
+        assertf(jobs[i], "job %d must allocate", i);
+        jobs[i]->r.state = Reserved;
+        jobs[i]->r.deadline_at = now + 1000000000LL;
+        job_list_insert(&c->reserved_jobs, jobs[i]);
+        jobs[i]->reserver = c;
+    }
+    t->stat.reserved_ct = 3;
+    global_stat.reserved_ct = 3;
+
+    enqueue_reserved_jobs(c);
+
+    for (int i = 0; i < 3; i++) {
+        assertf(jobs[i]->reserver == NULL,
+                "job %d reserver must be nulled, got %p",
+                i, (void *)jobs[i]->reserver);
+        assertf(jobs[i]->r.state == Ready,
+                "job %d must be Ready after re-enqueue, got state=%d",
+                i, jobs[i]->r.state);
+    }
+    assertf(global_stat.reserved_ct == 0,
+            "reserved_ct must be 0 after all three re-enqueued, got %" PRIu64,
+            global_stat.reserved_ct);
+    assertf(t->stat.reserved_ct == 0,
+            "tube reserved_ct must be 0, got %" PRIu64, t->stat.reserved_ct);
+
+    /* Clean up: remove all from ready heap, free, close conn. */
+    for (int i = 0; i < 3; i++) {
+        heapremove(&t->ready, jobs[i]->heap_index);
+        job_free(jobs[i]);
+    }
+    connclose(c);
+    tube_dref(t);
+}
+
+
+// #7 net.c: make_nonblocking must reject invalid fds cleanly. The
+// existing cttest_make_nonblocking_pipe covers the happy path; this
+// test locks the error branch (fcntl F_GETFL on a bad fd returns -1)
+// to stop a future refactor silently swallowing the failure.
+void
+cttest_make_nonblocking_bad_fd()
+{
+    int r = make_nonblocking(-1);
+    assertf(r == -1,
+            "make_nonblocking must return -1 on fd=-1, got %d", r);
+
+    r = make_nonblocking(999999);
+    assertf(r == -1,
+            "make_nonblocking must return -1 on an unopened high fd, got %d", r);
+}
+
+
+// #7 net.c: make_server_socket for a unix: path longer than
+// sizeof(sun_path)-1 must be rejected with -1 BEFORE any socket() /
+// bind() / listen() syscall. Catches a regression that silently
+// truncates sun_path (observed historically in other daemons via
+// strncpy semantics).
+void
+cttest_make_server_socket_unix_path_too_long()
+{
+    // Linux sun_path is 108 bytes. We build "unix:" + 150 'x' so that
+    // the path arg to make_unix_socket is 150 chars — well over the
+    // 107 effective limit (maxlen = sizeof(sun_path) - 1).
+    char addr[256];
+    const size_t pad = 150;
+    strcpy(addr, "unix:");
+    memset(addr + 5, 'x', pad);
+    addr[5 + pad] = '\0';
+
+    int fd = make_server_socket(addr, "0");
+    assertf(fd == -1,
+            "make_server_socket must reject over-long unix path, got fd=%d", fd);
 }

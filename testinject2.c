@@ -6,6 +6,10 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 
 // Exposed from prot.c for hostile error-path testing.
 extern int kick_buried_job(Server *s, Job *j);
@@ -867,3 +871,411 @@ cttest_inject_durable_fdatasync_fires_once_on_success(void)
     unlink(tmppath);
     job_free(j);
 }
+
+
+// #C1 regression: once w->use=0, walwrite() in durable mode must return 0
+// rather than silently ack. The legacy "return 1 when disabled" path was
+// valid for best-effort async mode but silently broke the -D "ack ⇒ on
+// disk" contract for every subsequent operation in the process.
+void
+cttest_inject_walwrite_refuses_when_durable_and_wal_disabled(void)
+{
+    setup();
+
+    Wal w = {
+        .use = 0,               // WAL already disabled by a prior failure
+        .durable_sync = 1,      // -D mode
+    };
+
+    Tube *t = make_tube("cdone");
+    assertf(t, "tube must allocate");
+
+    Job *j = allocate_job(4);
+    assertf(j, "job must allocate");
+    TUBE_ASSIGN(j->tube, t);
+    j->r.state = Ready;
+    j->r.body_size = 4;
+    j->r.id = 1;
+    memcpy(j->body, "data", 4);
+
+    int r = walwrite(&w, j);
+    assertf(r == 0,
+            "walwrite under -D with w->use=0 must refuse (return 0), got %d", r);
+    assertf(w.use == 0, "WAL must remain disabled, got use=%d", w.use);
+
+    // Non-durable control: same state, wantsync off, durable_sync off
+    // — legacy pass-through must still return 1.
+    Wal w2 = { .use = 0, .durable_sync = 0 };
+    int r2 = walwrite(&w2, j);
+    assertf(r2 == 1,
+            "walwrite in non-durable mode with w->use=0 must keep the "
+            "legacy pass-through (return 1), got %d", r2);
+
+    job_free(j);
+    tube_dref(t);
+}
+
+
+// #C1 regression (truncate path): wal_write_truncate must mirror walwrite's
+// durable-refusal behavior. A silently successful marker write under -D
+// with a disabled WAL would be worse than for put/delete: it looks like
+// truncate ran but the cutoff is not on disk and never will be.
+void
+cttest_inject_wal_write_truncate_refuses_when_durable_and_wal_disabled(void)
+{
+    setup();
+
+    Wal w = { .use = 0, .durable_sync = 1 };
+    Tube *t = make_tube("ctrunc");
+    assertf(t, "tube must allocate");
+
+    int r = wal_write_truncate(&w, t, 42);
+    assertf(r == 0,
+            "wal_write_truncate under -D with w->use=0 must refuse, got %d", r);
+
+    Wal w2 = { .use = 0, .durable_sync = 0 };
+    int r2 = wal_write_truncate(&w2, t, 42);
+    assertf(r2 == 1,
+            "wal_write_truncate non-durable with w->use=0 must pass through, got %d", r2);
+
+    tube_dref(t);
+}
+
+
+// #C1 regression (reserve gate): walresvput / walresvupdate propagate
+// through `reserve()`, which was also tightened. Under -D + !use both
+// must return 0 so enqueue_incoming_job / bury_job / release see the
+// failure and reply with a real error. Under non-durable + !use they
+// must keep the legacy "succeeds with 1" pass-through.
+//
+// This test closes the gap left by the walwrite/wal_write_truncate
+// tests above: a hypothetical refactor that undoes the `reserve()`
+// guard would let `walresvput` hand out bytes that walwrite then
+// refuses to write — the client would get INSERTED reply with no
+// matching WAL record, defeating the whole C1 contract.
+void
+cttest_inject_walresv_refuses_when_durable_and_wal_disabled(void)
+{
+    setup();
+
+    Tube *t = make_tube("cresv");
+    assertf(t, "tube must allocate");
+
+    Job *j = allocate_job(4);
+    assertf(j, "job must allocate");
+    TUBE_ASSIGN(j->tube, t);
+    j->r.body_size = 4;
+    j->r.id = 1;
+
+    // Durable + disabled: refuse.
+    Wal w = { .use = 0, .durable_sync = 1 };
+    int r = walresvput(&w, j);
+    assertf(r == 0,
+            "walresvput under -D with w->use=0 must refuse (return 0), got %d", r);
+
+    int ru = walresvupdate(&w);
+    assertf(ru == 0,
+            "walresvupdate under -D with w->use=0 must refuse (return 0), got %d", ru);
+
+    // Non-durable + disabled: legacy pass-through. reserve()'s
+    // "return 1" survives for async-mode callers whose whole purpose
+    // was to tolerate a disabled WAL silently.
+    Wal w2 = { .use = 0, .durable_sync = 0 };
+    int r2 = walresvput(&w2, j);
+    assertf(r2 > 0,
+            "walresvput non-durable with w->use=0 must pass through, got %d", r2);
+
+    int ru2 = walresvupdate(&w2);
+    assertf(ru2 > 0,
+            "walresvupdate non-durable with w->use=0 must pass through, got %d", ru2);
+
+    job_free(j);
+    tube_dref(t);
+}
+
+
+// #C2 regression: if writev succeeds but durable fdatasync fails, the bytes
+// must be rolled back from the file tail (ftruncate) so replay does NOT
+// resurrect a record whose client received INTERNAL_ERROR. Without the
+// rollback, server state and on-disk state diverge after the caller
+// rolls back its in-memory view — exactly the class of bug the -D
+// contract is supposed to prevent.
+//
+// Drive filewrjobfull directly to observe only the commit-durable ftruncate;
+// walwrite's own filewclose() would also ftruncate (to f->filesize - f->free)
+// and mask the rollback under test.
+void
+cttest_inject_durable_fdatasync_fail_rolls_back_tail(void)
+{
+    setup();
+
+    char tmppath[] = "/tmp/testinject_c2_rollback.XXXXXX";
+    int fd = mkstemp(tmppath);
+    assertf(fd >= 0, "mkstemp must succeed");
+
+    int ver = Walver;
+    ssize_t nver = write(fd, &ver, sizeof(ver));
+    assertf(nver == (ssize_t)sizeof(ver), "version header must write");
+
+    off_t pre_writev = lseek(fd, 0, SEEK_CUR);
+    assertf(pre_writev == (off_t)sizeof(int),
+            "offset must sit right after version header");
+
+    Wal w = {
+        .filesize = 4096,
+        .use = 1,
+        .durable_sync = 1,
+    };
+    File f = {0};
+    f.w = &w;
+    f.fd = fd;
+    f.iswopen = 1;
+    // Match what filewopen would produce: header written, rest free.
+    f.free = (int)(w.filesize - pre_writev);
+    f.resv = 300;
+    f.refs = 2;
+    f.jlist.fprev = &f.jlist;
+    f.jlist.fnext = &f.jlist;
+    w.cur = &f;
+    w.tail = &f;
+    w.head = &f;
+    w.resv = 300;
+
+    Tube *t = make_tube("c2");
+    assertf(t, "tube must allocate");
+
+    Job *j = allocate_job(10);
+    assertf(j, "job must allocate");
+    TUBE_ASSIGN(j->tube, t);
+    j->r.state = Ready;
+    j->r.body_size = 10;
+    j->r.id = 7;
+    memset(j->body, 'D', 10);
+    j->walresv = 300;
+    j->walused = 0;
+
+    // Arm the fdatasync fault. writev_all will complete, file will grow,
+    // then fdatasync returns EIO; filewrite_commit_durable must ftruncate
+    // the tail back to pre_writev before returning 0.
+    fault_set(FAULT_FDATASYNC, 0, EIO);
+    int r = filewrjobfull(&f, j);
+
+    assertf(r == 0,
+            "filewrjobfull must return 0 when durable fdatasync fails, got %d", r);
+    assertf(fault_hits(FAULT_FDATASYNC) == 1,
+            "fdatasync fault must fire exactly once, got %d",
+            fault_hits(FAULT_FDATASYNC));
+
+    // The rollback: file size must be back at pre_writev (just the
+    // version header), not pre_writev + writev payload.
+    struct stat st;
+    assertf(fstat(fd, &st) == 0, "fstat must succeed (fd still open)");
+    assertf(st.st_size == pre_writev,
+            "durable fdatasync fail must ftruncate the tail: expected "
+            "size=%lld, got %lld",
+            (long long)pre_writev, (long long)st.st_size);
+
+    // filewritev did NOT apply its accounting on failure, so w->resv
+    // and f->resv must be unchanged.
+    assertf(w.resv == 300,
+            "w.resv must be unchanged on failure, got %" PRId64, w.resv);
+
+    close(fd);
+    unlink(tmppath);
+    job_free(j);
+    tube_dref(t);
+}
+
+
+// ─── Async fsync thread plumbing (#4) ─────────────────────────
+// Production path spawned by walsyncstart when wal.wantsync is on,
+// but the normal test harness forces syncrate=0 to stay deterministic
+// and never exercises the thread. These three tests drive the thread
+// directly so a deadlock / race / fd-leak in walsyncstart/stop,
+// sync_thread_fn, or the mutex+cond handoff would surface under CI.
+
+// Poll `w->sync_fd < 0` under the mutex. Returns 1 if the handoff
+// was drained within max_iterations * 10ms, 0 if it timed out. The
+// thread sets sync_fd = -1 the instant it accepts the fd, so this
+// polls the "acceptance" edge, not the fdatasync completion.
+static int
+wait_for_sync_accept(Wal *w, int max_iterations)
+{
+    for (int i = 0; i < max_iterations; i++) {
+        pthread_mutex_lock(&w->sync_mu);
+        int done = (w->sync_fd < 0);
+        pthread_mutex_unlock(&w->sync_mu);
+        if (done) return 1;
+        usleep(10000); // 10ms
+    }
+    return 0;
+}
+
+// Spin until the atomic error slot is non-zero OR timeout.
+static int
+wait_for_sync_err(Wal *w, int max_iterations)
+{
+    for (int i = 0; i < max_iterations; i++) {
+        if (atomic_load_explicit(&w->sync_err, memory_order_relaxed))
+            return 1;
+        usleep(10000);
+    }
+    return 0;
+}
+
+// #5a — kick_buried_job / kick_delayed_job must propagate the C1
+// refusal from walresvupdate. Without this pair of checks, a hostile
+// kick in -D + disabled-WAL mode could change job state without WAL
+// persistence, ghost-acking the change to the client.
+void
+cttest_inject_kick_buried_job_refuses_when_durable_and_wal_disabled(void)
+{
+    setup();
+
+    // Minimal server shell with a disabled durable WAL.
+    Server s = {0};
+    s.wal.use = 0;
+    s.wal.durable_sync = 1;
+
+    Tube *t = make_tube("cdkick");
+    assertf(t, "tube must allocate");
+
+    // Buried setup: build a job, bury it by hand (we bypass the
+    // normal state machine to isolate the WAL-reservation gate).
+    Job *j = make_job(5, 0, 1000000000LL, 4, t);
+    assertf(j, "job must allocate");
+    memcpy(j->body, "kbry", 4);
+    j->r.state = Buried;
+    job_list_insert(&t->buried, j);
+    t->stat.buried_ct = 1;
+
+    int r = kick_buried_job(&s, j);
+    assertf(r == 0,
+            "kick_buried_job under -D with w->use=0 must refuse, got %d", r);
+    assertf(j->r.state == Buried,
+            "job state must remain Buried after refused kick, got %d",
+            j->r.state);
+
+    // Delayed branch: same gate, distinct code path.
+    Job *jd = make_job(6, 0, 1000000000LL, 4, t);
+    assertf(jd, "delayed job must allocate");
+    memcpy(jd->body, "kdly", 4);
+    jd->r.state = Delayed;
+    jd->r.deadline_at = now + 1000000000LL;
+    assertf(heapinsert(&t->delay, jd) == 1, "delay heap insert");
+
+    int rd = kick_delayed_job(&s, jd);
+    assertf(rd == 0,
+            "kick_delayed_job under -D with w->use=0 must refuse, got %d", rd);
+    assertf(jd->r.state == Delayed,
+            "delayed job state must remain Delayed, got %d", jd->r.state);
+
+    // Cleanup.
+    job_list_remove(j);
+    heapremove(&t->delay, jd->heap_index);
+    job_free(j);
+    job_free(jd);
+    tube_dref(t);
+}
+
+
+// #4a — full thread lifecycle: start → handoff fd → thread drains →
+// stop → join. No errors expected; sync_err must remain 0 at the end.
+void
+cttest_walsync_thread_roundtrip(void)
+{
+    setup();
+
+    char tmppath[] = "/tmp/testsync_rt.XXXXXX";
+    int fd = mkstemp(tmppath);
+    assertf(fd >= 0, "mkstemp must succeed");
+    ssize_t nw = write(fd, "x", 1);
+    assertf(nw == 1, "write must produce 1 byte");
+
+    Wal w = {0};
+    w.use = 1;
+
+    walsyncstart(&w);
+    assertf(w.sync_on == 1,
+            "walsyncstart must set sync_on, got %d", w.sync_on);
+
+    // Hand off a dup'd fd the same way walsync() would.
+    int dupfd = dup(fd);
+    assertf(dupfd >= 0, "dup must succeed");
+    pthread_mutex_lock(&w.sync_mu);
+    w.sync_fd = dupfd;
+    pthread_cond_signal(&w.sync_cond);
+    pthread_mutex_unlock(&w.sync_mu);
+
+    assertf(wait_for_sync_accept(&w, 200),
+            "sync thread must accept handoff within 2s");
+
+    int err = atomic_load_explicit(&w.sync_err, memory_order_relaxed);
+    assertf(err == 0,
+            "no fsync error expected on roundtrip, got errno=%d", err);
+
+    walsyncstop(&w);
+    assertf(w.sync_on == 0,
+            "walsyncstop must clear sync_on, got %d", w.sync_on);
+
+    close(fd);
+    unlink(tmppath);
+}
+
+
+// #4b — async fdatasync failure must surface via atomic sync_err. This
+// is the load-bearing contract for the main-thread walsync() caller:
+// without it, a silently-dropped fsync under async mode would look
+// like a successful durable write to the operator.
+void
+cttest_walsync_thread_error_surface(void)
+{
+    setup();
+
+    char tmppath[] = "/tmp/testsync_err.XXXXXX";
+    int fd = mkstemp(tmppath);
+    assertf(fd >= 0, "mkstemp must succeed");
+    ssize_t nw = write(fd, "x", 1);
+    assertf(nw == 1, "write must produce 1 byte");
+
+    Wal w = {0};
+    w.use = 1;
+
+    walsyncstart(&w);
+
+    // Arm one fdatasync failure. The thread fires it on the handoff
+    // we queue below; fault_fire auto-disarms after one hit.
+    fault_set(FAULT_FDATASYNC, 0, EIO);
+
+    int dupfd = dup(fd);
+    pthread_mutex_lock(&w.sync_mu);
+    w.sync_fd = dupfd;
+    pthread_cond_signal(&w.sync_cond);
+    pthread_mutex_unlock(&w.sync_mu);
+
+    assertf(wait_for_sync_accept(&w, 200),
+            "sync thread must accept handoff within 2s");
+    assertf(wait_for_sync_err(&w, 200),
+            "sync thread must propagate fdatasync error within 2s");
+
+    int err = atomic_load_explicit(&w.sync_err, memory_order_relaxed);
+    assertf(err == EIO,
+            "sync_err must surface EIO from fdatasync fault, got %d", err);
+    assertf(fault_hits(FAULT_FDATASYNC) == 1,
+            "FAULT_FDATASYNC must fire exactly once, got %d",
+            fault_hits(FAULT_FDATASYNC));
+
+    walsyncstop(&w);
+
+    close(fd);
+    unlink(tmppath);
+}
+
+
+// NOTE: a third test for the "busy slot persists without cond_signal"
+// invariant was considered, but POSIX allows spurious wake-ups from
+// pthread_cond_wait; relying on their absence makes the test flaky.
+// The busy-fallback logic in walsync() / dirsync() is `static` and not
+// directly reachable from unit tests anyway; its discipline is locked
+// by the roundtrip and error-surface tests above plus E2E coverage via
+// `cttest_wal_*` whenever an operator runs the server with -b.

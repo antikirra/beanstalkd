@@ -356,14 +356,25 @@ walsync(Wal *w)
 
 // Walwrite writes j to the log w (if w is enabled).
 // On failure, walwrite disables w and returns 0; on success, it returns 1.
-// Unlke walresv*, walwrite should never fail because of a full disk.
-// If w is disabled, then walwrite takes no action and returns 1.
+// Unlike walresv*, walwrite should never fail because of a full disk.
+//
+// Disabled-WAL semantics (#C1): legacy callers expect walwrite to be a
+// no-op returning 1 when the WAL is disabled at startup (no -b flag) or
+// after a prior I/O failure turned it off. That stays true for the async
+// / non-durable path: clients never relied on durability there. Durable
+// mode is different — it is a client-visible contract ("ack ⇒ on disk").
+// Silently succeeding after w->use=0 would break that contract for the
+// lifetime of the process. Refuse instead so the caller surfaces
+// BURIED / INTERNAL_ERROR rather than a ghost INSERTED.
 __attribute__((hot)) int
 walwrite(Wal *w, Job *j)
 {
     int r = 0;
 
-    if (!w->use) return 1;
+    if (!w->use) {
+        if (unlikely(w->durable_sync)) return 0;
+        return 1;
+    }
     if (likely(w->cur->resv > 0) || usenext(w)) {
         if (likely(j->file)) {
             r = filewrjobshort(w->cur, j);
@@ -371,30 +382,17 @@ walwrite(Wal *w, Job *j)
             r = filewrjobfull(w->cur, j);
         }
     }
+    // filewrjob{short,full} -> filewritev: when w->durable_sync is set,
+    // the durable fdatasync happens inside filewritev with an ftruncate
+    // tail rollback on failure. A zero return therefore covers both the
+    // writev error and the durable-sync error, and the on-disk tail is
+    // either fully committed or absent — never "present but unacked"
+    // (#C2).
     if (unlikely(!r)) {
+        twarnx("wal: disabling WAL after write failure");
         filewclose(w->cur);
         w->use = 0;
         return 0;
-    }
-
-    // Durable mode (-D): block until data is on disk before returning.
-    // Without this flag the async fsync thread may lag, and a crash
-    // between walwrite() and fdatasync() loses the record even though
-    // the client already received the success reply.
-    //
-    // fdatasync may be interrupted by a signal (EINTR); retry in that
-    // case. Any other error is treated as permanent — the WAL is
-    // disabled so the next walwrite call refuses cleanly.
-    if (unlikely(w->durable_sync)) {
-        int sr;
-        while ((sr = fdatasync(w->cur->fd)) == -1 && errno == EINTR)
-            ;
-        if (sr == -1) {
-            twarn("durable fdatasync");
-            filewclose(w->cur);
-            w->use = 0;
-            return 0;
-        }
     }
 
     w->nrec++;
@@ -405,7 +403,10 @@ walwrite(Wal *w, Job *j)
 int
 wal_write_truncate(Wal *w, Tube *t, uint64 cutoff_id)
 {
-    if (!w->use) return 1;
+    if (!w->use) {
+        if (unlikely(w->durable_sync)) return 0;
+        return 1;
+    }
 
     int needed = sizeof(int) + (int)t->name_len + sizeof(Jobrec) + 2 + sizeof(uint32);
     if (!reserve(w, needed)) return 0;
@@ -416,27 +417,19 @@ wal_write_truncate(Wal *w, Tube *t, uint64 cutoff_id)
         return 0;
     }
 
+    // filewrtruncate performs its own durable fdatasync + ftruncate-back
+    // rollback (#C2), so a zero return means the marker is NOT on disk
+    // and we can safely let the caller roll back t->purge_before_id.
     int r = filewrtruncate(w->cur, t, cutoff_id);
     if (!r) {
         // filewrtruncate left reservations untouched on failure. Return
         // them before WAL goes dark so w->resv matches reality for any
         // remaining jobs still trying to reserve (#702).
         walresvreturn(w, needed);
+        twarnx("wal: disabling WAL after truncate-marker write failure");
         filewclose(w->cur);
         w->use = 0;
         return 0;
-    }
-
-    if (unlikely(w->durable_sync)) {
-        int sr;
-        while ((sr = fdatasync(w->cur->fd)) == -1 && errno == EINTR)
-            ;
-        if (sr == -1) {
-            twarn("durable fdatasync (truncate)");
-            filewclose(w->cur);
-            w->use = 0;
-            return 0;
-        }
     }
 
     w->nrec++;
@@ -587,8 +580,16 @@ reserve(Wal *w, int n)
 {
     int r;
 
-    // return value must be nonzero but is otherwise ignored
-    if (!w->use) return 1;
+    // When WAL is disabled the legacy contract is: reserve succeeds
+    // silently (return nonzero) because nothing persists anyway. Under
+    // durable mode that would let a subsequent walwrite ghost-ack the
+    // client (see #C1), so refuse here too: walresvput/walresvupdate
+    // propagate 0 upward, and the dispatcher replies with a real error
+    // instead of an unconditional success.
+    if (!w->use) {
+        if (unlikely(w->durable_sync)) return 0;
+        return 1;
+    }
 
     if (likely(w->cur->free >= n)) {
         w->cur->free -= n;

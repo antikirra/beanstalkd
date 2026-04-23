@@ -2129,3 +2129,389 @@ cttest_http_health_closes_after_reply()
     close(fd);
 }
 
+
+// #P1 regression: 7-byte commands starting with 's' other than "stats"
+// must NOT dispatch as OP_STATS. The old which_cmd dispatched on the
+// length+offset alone, leaking the global stats block for "sleep\r\n",
+// "steal\r\n", "stash\r\n" etc. Also exercise the "stats-" prefix
+// tightening for "stats-job" and "stats-tube".
+void
+cttest_which_cmd_stats_prefix_strict()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    // Seven-byte 's-prefix' impostors: every must reply UNKNOWN_COMMAND.
+    const char *bogus[] = {
+        "sleep\r\n",
+        "steal\r\n",
+        "stash\r\n",
+        "slxxx\r\n",
+        "sXXXXX\r\n",     // 8 bytes — falls through via length gate anyway
+    };
+    for (size_t i = 0; i < sizeof bogus / sizeof *bogus; i++) {
+        snd(fd, (char *)bogus[i]);
+        ck(fd, "UNKNOWN_COMMAND\r\n");
+    }
+
+    // Trailing-garbage variants of the real OP_STATSJOB / OP_STATS_TUBE
+    // prefixes: must also be rejected. Missing '-' separator at offset 5
+    // is the exact path that used to be loose.
+    snd(fd, "sXXXXXjYYY\r\n");  // cmd[6]='j' but no "stats-" prefix
+    ck(fd, "UNKNOWN_COMMAND\r\n");
+    snd(fd, "sXXXXXtYYY\r\n");  // cmd[6]='t' but no "stats-" prefix
+    ck(fd, "UNKNOWN_COMMAND\r\n");
+
+    // Positive control: real "stats\r\n" still works. Only the first
+    // reply line is checked — do_list_tubes / do_stats follow with a
+    // YAML body that does NOT terminate with \r\n, which would hang the
+    // line-based rd() helper.
+    snd(fd, "stats\r\n");
+    char *reply = rd(fd);
+    assertf(strncmp(reply, "OK ", 3) == 0,
+            "stats must still work, got [%s]", reply);
+
+    close(fd);
+}
+
+
+// #P2 regression: 12-byte 'l...s\r\n' commands must require the literal
+// "list-tubes" prefix. The old dispatch accepted any byte soup with
+// cmd[9]=='s' and leaked the whole tube namespace.
+void
+cttest_which_cmd_list_tubes_prefix_strict()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    const char *bogus[] = {
+        "l12345678s\r\n",
+        "looking-us\r\n",
+        "l-banned-s\r\n",
+        "lXXXXXXXXs\r\n",
+    };
+    for (size_t i = 0; i < sizeof bogus / sizeof *bogus; i++) {
+        snd(fd, (char *)bogus[i]);
+        ck(fd, "UNKNOWN_COMMAND\r\n");
+    }
+
+    // Positive control: real "list-tubes\r\n" still works. As above,
+    // only inspect the first line of the reply.
+    snd(fd, "list-tubes\r\n");
+    char *reply = rd(fd);
+    assertf(strncmp(reply, "OK ", 3) == 0,
+            "list-tubes must still work, got [%s]", reply);
+
+    close(fd);
+}
+
+
+// #S1 regression: after reserve-with-timeout TIMED_OUT, the reply fast
+// path must re-arm epoll for read ('r'). The conn entered STATE_WAIT
+// with c->rw='h' (hangup-only); conn_timeout then fires the TIMED_OUT
+// reply via reply() fast path with state=STATE_WANT_COMMAND, but the
+// old code never switched the socket interest back to EPOLLIN. The
+// next command sat in the kernel buffer and epoll_wait never reported
+// it — the client hung until closing.
+//
+// We drive the regression directly: reserve-with-timeout 1 → wait for
+// TIMED_OUT → send stats and require a response. With the regression,
+// rd() would timeout (timeout2=5s) and fail the test.
+void
+cttest_reserve_timeout_then_next_command_does_not_hang()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    snd(fd, "watch s1tube\r\n");
+    ck(fd, "WATCHING 2\r\n");
+    snd(fd, "ignore default\r\n");
+    ck(fd, "WATCHING 1\r\n");
+
+    // 1-second reserve with no jobs in the tube — must produce TIMED_OUT.
+    snd(fd, "reserve-with-timeout 1\r\n");
+    ck(fd, "TIMED_OUT\r\n");
+
+    // The moment of truth: can the conn still receive a command?
+    // On the S1 regression, the socket events mask stays at 'h' and
+    // rd() blocks until timeout2 (5s).
+    snd(fd, "stats\r\n");
+    char *reply = rd(fd);
+    assertf(strncmp(reply, "OK ", 3) == 0,
+            "stats after TIMED_OUT must still work, got [%s]", reply);
+
+    close(fd);
+}
+
+
+// #S1 sister regression: DEADLINE_SOON — like TIMED_OUT — is emitted
+// from conn_timeout via reply_msg() and follows the same fast-path
+// under STATE_WAIT. If the re-arm branch were specific to TIMED_OUT,
+// DEADLINE_SOON would leak the same hang. Lock the property end-to-end.
+//
+// Timing: put ttr=1, reserve → c holds a Reserved job whose deadline
+// is ~now+1s. Sleep so that <1s remains (inside SAFETY_MARGIN). A new
+// reserve-with-timeout enters wait_for_job which sees conndeadlinesoon
+// and fires DEADLINE_SOON immediately.
+void
+cttest_deadline_soon_then_next_command_does_not_hang()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    snd(fd, "use s1ds\r\n");
+    ck(fd, "USING s1ds\r\n");
+    snd(fd, "watch s1ds\r\n");
+    ck(fd, "WATCHING 2\r\n");
+    snd(fd, "ignore default\r\n");
+    ck(fd, "WATCHING 1\r\n");
+
+    snd(fd, "put 0 0 1 4\r\nsoon\r\n");
+    ck(fd, "INSERTED 1\r\n");
+    snd(fd, "reserve-with-timeout 0\r\n");
+    cksub(fd, "RESERVED 1 4\r\n");
+    cksub(fd, "soon\r\n");
+
+    // 500ms closes the gap so that remaining ttr (~500ms) < the 1s
+    // SAFETY_MARGIN. The next reserve must immediately receive
+    // DEADLINE_SOON, not wait for timeout or ttr expiry.
+    usleep(500000);
+    snd(fd, "reserve-with-timeout 5\r\n");
+    ck(fd, "DEADLINE_SOON\r\n");
+
+    // The S1 re-arm path must put the socket back on EPOLLIN; a
+    // regression here would stall this next command until connclose.
+    snd(fd, "stats\r\n");
+    char *reply = rd(fd);
+    assertf(strncmp(reply, "OK ", 3) == 0,
+            "stats after DEADLINE_SOON must still work, got [%s]", reply);
+
+    close(fd);
+}
+
+
+// #TR-A1 regression: a second truncate on an already-truncated tube
+// must NOT count the still-present zombies from the previous truncate.
+// The fast-path "count = ready.len + delay.len + buried chain" would
+// inflate the reply. We pipeline both truncates so h_conn dispatches
+// them back-to-back with no prottick reap in between — that is the
+// precise window the fix addresses.
+void
+cttest_truncate_count_excludes_old_zombies()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    snd(fd, "use trcnt\r\n");
+    ck(fd, "USING trcnt\r\n");
+
+    // Seed three jobs so zombie presence is unambiguous.
+    snd(fd, "put 0 0 60 1\r\nA\r\n");
+    ck(fd, "INSERTED 1\r\n");
+    snd(fd, "put 0 0 60 1\r\nB\r\n");
+    ck(fd, "INSERTED 2\r\n");
+    snd(fd, "put 0 0 60 1\r\nC\r\n");
+    ck(fd, "INSERTED 3\r\n");
+
+    // Pipeline both truncates in a single write so that the server's
+    // h_conn loop processes both before the next prottick tick. With
+    // the regression, the second reply would be "TRUNCATED 3".
+    snd(fd, "truncate trcnt\r\ntruncate trcnt\r\n");
+    ck(fd, "TRUNCATED 3\r\n");
+    ck(fd, "TRUNCATED 0\r\n");
+
+    close(fd);
+}
+
+
+// #TR-A1 regression (mix pre/post-cutoff): the slow path iterates
+// ready/delay/buried and counts only `id > old_purge`. A mutation
+// from `>` to `>=` or a loop that accidentally includes zombies would
+// inflate the second TRUNCATED reply. Exercise the full discriminator.
+void
+cttest_truncate_count_mixed_new_and_old_jobs()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    snd(fd, "use trmix\r\n");
+    ck(fd, "USING trmix\r\n");
+
+    // First wave: 3 pre-cutoff jobs.
+    snd(fd, "put 0 0 60 1\r\nA\r\n");
+    ck(fd, "INSERTED 1\r\n");
+    snd(fd, "put 0 0 60 1\r\nB\r\n");
+    ck(fd, "INSERTED 2\r\n");
+    snd(fd, "put 0 0 60 1\r\nC\r\n");
+    ck(fd, "INSERTED 3\r\n");
+
+    // First truncate: cutoff=3. TRUNCATED 3.
+    snd(fd, "truncate trmix\r\n");
+    ck(fd, "TRUNCATED 3\r\n");
+
+    // Second wave: 2 post-cutoff jobs (id 4, 5). These are NOT zombies.
+    snd(fd, "put 0 0 60 1\r\nD\r\n");
+    ck(fd, "INSERTED 4\r\n");
+    snd(fd, "put 0 0 60 1\r\nE\r\n");
+    ck(fd, "INSERTED 5\r\n");
+
+    // Pipeline: a third truncate. Must count only id=4,5 = 2, NOT the
+    // zombie trio from wave 1. A `>=` mutation would report TRUNCATED 0
+    // (id 4,5 > 3 still — OK actually), but a mutation that re-counted
+    // zombies would report TRUNCATED 5.
+    snd(fd, "truncate trmix\r\n");
+    ck(fd, "TRUNCATED 2\r\n");
+
+    close(fd);
+}
+
+
+// #TR-A3 regression: a buried job replayed after a truncate marker
+// for its tube must not inflate buried_ct at boot. The old prot_replay
+// dispatched Buried state through bury_job() before the zombie guard
+// could fire, placing the doomed job on the buried chain and bumping
+// the counter until prottick's lazy reap caught it. The fix reaps
+// inline in prot_replay BEFORE bury_job runs.
+//
+// This is a behavioral lock-in rather than a state-visibility catch
+// (fmt_stats_tube subtracts zombies either way), so we assert every
+// observable post-boot property that matters to clients: current-jobs-
+// buried is 0, kick finds nothing, peek-buried returns NOT_FOUND, and
+// the tube's cmd-delete counter reflects the reap.
+void
+cttest_wal_truncate_replay_buried_does_not_inflate()
+{
+    srv.wal.dir = ctdir();
+    int port = startsrv_wal();
+    int fd = diallocal(port);
+
+    snd(fd, "use trbw\r\n");
+    ck(fd, "USING trbw\r\n");
+    snd(fd, "watch trbw\r\n");
+    ck(fd, "WATCHING 2\r\n");
+    snd(fd, "ignore default\r\n");
+    ck(fd, "WATCHING 1\r\n");
+
+    // Build the zombie-to-be: bury id=1 under this tube.
+    snd(fd, "put 0 0 60 4\r\ndoom\r\n");
+    ck(fd, "INSERTED 1\r\n");
+    snd(fd, "reserve-with-timeout 1\r\n");
+    cksub(fd, "RESERVED 1 4\r\n");
+    cksub(fd, "doom\r\n");
+    snd(fd, "bury 1 0\r\n");
+    ck(fd, "BURIED\r\n");
+
+    // Now set the cutoff so id=1's buried-state record will be a
+    // replay-time zombie.
+    snd(fd, "truncate trbw\r\n");
+    ck(fd, "TRUNCATED 1\r\n");
+
+    // A post-cutoff job keeps the tube alive in memory across restart
+    // (otherwise TR-A3's inline reap of the sole zombie would drop the
+    // tube's last ref and `stats-tube` would return NOT_FOUND — a
+    // correct server behavior but not what this test is looking at).
+    snd(fd, "put 0 0 60 4\r\nlive\r\n");
+    ck(fd, "INSERTED 2\r\n");
+
+    close(fd);
+    port = restartsrv_wal();
+    fd = diallocal(port);
+
+    // With TR-A3 the buried zombie is reaped inline in prot_replay;
+    // without TR-A3 it lingers on the buried chain until prottick's
+    // lazy reap sweeps it. fmt_stats_tube subtracts zombies in both
+    // cases, but a regression that also touched the subtract loop
+    // would surface here.
+    snd(fd, "stats-tube trbw\r\n");
+    cksub(fd, "OK ");
+    cksub(fd, "current-jobs-buried: 0\n");
+
+    // kick's bulk loop skips zombies inline (walk of buried chain), so
+    // even the regression cannot produce a bogus KICKED count.
+    snd(fd, "kick 100\r\n");
+    ck(fd, "KICKED 0\r\n");
+
+    // peek-buried's zombie guard at heap root also filters out the
+    // zombie — if present, NOT_FOUND is correct; the post-cutoff live
+    // job is not buried.
+    snd(fd, "peek-buried\r\n");
+    ck(fd, "NOT_FOUND\r\n");
+
+    // Finally, prove the live job survives intact.
+    snd(fd, "watch trbw\r\n");
+    ck(fd, "WATCHING 2\r\n");
+    snd(fd, "reserve-with-timeout 0\r\n");
+    cksub(fd, "RESERVED 2 4\r\n");
+    cksub(fd, "live\r\n");
+
+    close(fd);
+}
+
+
+// #TR-A1 regression (all 3 structures): the slow path touches ready,
+// delay, AND buried. A fix that forgot any of the loops would fail to
+// count jobs living there. Seed one job in each heap / list and verify
+// the second truncate's count covers all three.
+//
+// Strategy: build state = 1 buried + 1 delayed + 1 ready, then truncate.
+// Second round: repeat with fresh post-cutoff ids; second truncate must
+// count all three again, proving the slow path visits every structure.
+void
+cttest_truncate_count_covers_ready_delay_buried()
+{
+    int port = startsrv();
+    int fd = diallocal(port);
+
+    snd(fd, "use trall\r\n");
+    ck(fd, "USING trall\r\n");
+    snd(fd, "watch trall\r\n");
+    ck(fd, "WATCHING 2\r\n");
+    snd(fd, "ignore default\r\n");
+    ck(fd, "WATCHING 1\r\n");
+
+    // Round 1: build buried first (bury consumes from ready), then
+    // delayed, then ready. This leaves one job in each structure.
+    snd(fd, "put 0 0 60 1\r\nB\r\n");       // id=1 ready
+    ck(fd, "INSERTED 1\r\n");
+    snd(fd, "reserve-with-timeout 1\r\n");
+    cksub(fd, "RESERVED 1 1\r\n");
+    cksub(fd, "B\r\n");
+    snd(fd, "bury 1 0\r\n");                // id=1 buried
+    ck(fd, "BURIED\r\n");
+
+    snd(fd, "put 0 30 60 1\r\nD\r\n");      // id=2 delayed
+    ck(fd, "INSERTED 2\r\n");
+
+    snd(fd, "put 0 0 60 1\r\nR\r\n");       // id=3 ready
+    ck(fd, "INSERTED 3\r\n");
+
+    // State: id=1 buried, id=2 delayed, id=3 ready. All three below
+    // cutoff after the truncate fires.
+    snd(fd, "truncate trall\r\n");
+    ck(fd, "TRUNCATED 3\r\n");
+
+    // Round 2: fresh post-cutoff ids (4/5/6), same shape. Zombies from
+    // round 1 must NOT be re-counted; a missing-loop mutation would
+    // reply "TRUNCATED < 3".
+    snd(fd, "put 0 0 60 1\r\nb\r\n");       // id=4 ready
+    ck(fd, "INSERTED 4\r\n");
+    snd(fd, "reserve-with-timeout 1\r\n");
+    cksub(fd, "RESERVED 4 1\r\n");
+    cksub(fd, "b\r\n");
+    snd(fd, "bury 4 0\r\n");                // id=4 buried
+    ck(fd, "BURIED\r\n");
+
+    snd(fd, "put 0 30 60 1\r\nd\r\n");      // id=5 delayed
+    ck(fd, "INSERTED 5\r\n");
+
+    snd(fd, "put 0 0 60 1\r\nr\r\n");       // id=6 ready
+    ck(fd, "INSERTED 6\r\n");
+
+    // Final state: id=4 buried, id=5 delayed, id=6 ready. All three
+    // post-cutoff — every slow-path loop must contribute one.
+    snd(fd, "truncate trall\r\n");
+    ck(fd, "TRUNCATED 3\r\n");
+
+    close(fd);
+}
+

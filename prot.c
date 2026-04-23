@@ -504,15 +504,27 @@ reply(Conn *c, char *line, int len, int state)
                     job_free(c->out_job);
                 c->out_job = NULL;
             }
-            // Reschedule when (a) conn was in heap, (b) reserve timeout
-            // pending, or (c) -I is on. Case (c) covers the transition
-            // STATE_WANT_DATA → STATE_WANT_COMMAND where the conn fell
-            // out of the heap during the put body and now needs a fresh
-            // idle deadline. Without it, a slow-PUT-then-silent client
-            // would never be reaped.
-            if (unlikely(c->in_conns || c->pending_timeout >= 0
-                         || srv.idle_timeout > 0))
+            // Re-arm epoll for read when this fast-path reply comes
+            // from a state where the socket was registered for hangup-
+            // only ('h', e.g. STATE_WAIT → TIMED_OUT/DEADLINE_SOON) or
+            // for write ('w', partial-reply retry). Without this step
+            // the kernel holds the next command in its buffer and
+            // epoll_wait never fires EPOLLIN for the connection — the
+            // client stalls until it hangs up (#S1). epollq_add already
+            // calls connsched, so the heap side is covered in the same
+            // step.
+            if (c->rw != 'r') {
+                epollq_add(c, 'r');
+            } else if (unlikely(c->in_conns || c->pending_timeout >= 0
+                                || srv.idle_timeout > 0)) {
+                // Reschedule when (a) conn was in heap, (b) reserve
+                // timeout pending, or (c) -I is on. Case (c) covers
+                // STATE_WANT_DATA → STATE_WANT_COMMAND where the conn
+                // fell out of the heap during the put body and now
+                // needs a fresh idle deadline; without it, a slow-PUT-
+                // then-silent client would never be reaped.
                 connsched(c);
+            }
             return;
         }
         // Partial write: record progress for retry via epoll.
@@ -1003,6 +1015,13 @@ enqueue_reserved_jobs(Conn *c)
     c->soonest_job = NULL;
     while (!job_list_is_empty(&c->reserved_jobs)) {
         Job *j = job_list_remove(c->reserved_jobs.next);
+        // Drop the back-pointer to the closing Conn. The Conn struct
+        // will return to the pool (or be freed) moments later, so any
+        // read of j->reserver from that point forward would be a UAF
+        // on whoever inherits the slab. is_job_reserved_by_conn gates
+        // on state==Reserved today, but that is one refactor away from
+        // becoming a guard we can no longer rely on (#N5).
+        j->reserver = NULL;
         // Pin the tube across enqueue_job: if the job hits the purge
         // intercept, job_free drops the tube reference via TUBE_ASSIGN.
         // Without iref here, t may become dangling before reserved_ct--.
@@ -1332,11 +1351,21 @@ which_cmd(Conn *c)
         break;
     case 's':
         if (c->cmd_len < 7) break; // shortest: "stats\r\n" = 7
-        if (c->cmd_len == 7 && c->cmd[5] == '\r')
+        // Require the full "stats" prefix before accepting any dispatch
+        // branch. Without this, 7-byte commands like "sleep\r\n" matched
+        // the length test and returned OP_STATS, leaking the global stats
+        // block (#P1). Same trap for "stats-job " and "stats-tube ".
+        //
+        // Note: dispatch_cmd NUL-terminates at cmd[cmd_len - 2] before
+        // calling which_cmd, so for "stats\r\n" cmd[5] is '\0', not '\r'.
+        // The exact-length check is sufficient after the memcmp guard.
+        if (memcmp(c->cmd, CMD_STATS, CMD_STATS_LEN) != 0) break;
+        if (c->cmd_len == 7)
             return OP_STATS; // bare "stats\r\n"
-        if (c->cmd_len >= 12 && c->cmd[6] == 'j') return OP_STATSJOB;
-        if (c->cmd_len >= 13 && c->cmd[6] == 't') return OP_STATS_TUBE;
-        TEST_CMD(c->cmd, CMD_STATS, OP_STATS);
+        if (c->cmd_len >= 12 && c->cmd[5] == '-' && c->cmd[6] == 'j')
+            return OP_STATSJOB;
+        if (c->cmd_len >= 13 && c->cmd[5] == '-' && c->cmd[6] == 't')
+            return OP_STATS_TUBE;
         break;
     case 'u':
         TEST_CMD(c->cmd, CMD_USE, OP_USE);
@@ -1350,11 +1379,13 @@ which_cmd(Conn *c)
     case 'l':
         if (c->cmd_len < 12) break; // shortest: "list-tubes\r\n" = 12
         if (c->cmd[9] == 's') {
-            // Disambiguate with a strict prefix match: "list-tubes-watched"
-            // is 18 bytes + CRLF = 20. Without the strncmp, any 20+ byte
-            // cmd starting with "list-tubes" and cmd[9]='s' (i.e. "list-tubes"
-            // + garbage) would fall into OP_LIST_TUBES_WATCHED. Fixes
-            // a prefix-confusion gap noted in audit #721.
+            // Require the full "list-tubes" prefix; otherwise a 12-byte
+            // command shaped like "l12345678s\r\n" — cmd[0]='l', cmd[9]='s',
+            // cmd_len==12 — dispatched as OP_LIST_TUBES and leaked the
+            // tube namespace (#P2). The 20-byte branch already does the
+            // strict memcmp for "list-tubes-watched" (#721); generalize.
+            if (memcmp(c->cmd, CMD_LIST_TUBES, CMD_LIST_TUBES_LEN) != 0)
+                break;
             if (c->cmd_len == 20 && memcmp(c->cmd, CMD_LIST_TUBES_WATCHED,
                                            sizeof(CMD_LIST_TUBES_WATCHED) - 1) == 0)
                 return OP_LIST_TUBES_WATCHED;
@@ -2790,11 +2821,29 @@ dispatch_cmd(Conn *c)
             return;
         }
 
-        uint64 count = t->ready.len + t->delay.len;
-        for (Job *bj = t->buried.next; bj != &t->buried; bj = bj->next)
-            count++;
-
         uint64 old_purge = t->purge_before_id;
+        uint64 count;
+        if (likely(!old_purge)) {
+            // First truncate on this tube — every job is newly dead.
+            // Fast path: no per-job id comparison needed.
+            count = t->ready.len + t->delay.len;
+            for (Job *bj = t->buried.next; bj != &t->buried; bj = bj->next)
+                count++;
+        } else {
+            // Tube was already truncated and still holds zombies waiting
+            // for lazy reap. Do not count them again — clients see
+            // TRUNCATED N where N is "jobs made dead by THIS call", not
+            // "jobs invisible to clients right now". Prevents inflated
+            // counts on re-truncate (#TR-A1).
+            count = 0;
+            for (size_t i = 0; i < t->ready.len; i++)
+                if (((Job *)t->ready.data[i])->r.id > old_purge) count++;
+            for (size_t i = 0; i < t->delay.len; i++)
+                if (((Job *)t->delay.data[i])->r.id > old_purge) count++;
+            for (Job *bj = t->buried.next; bj != &t->buried; bj = bj->next)
+                if (bj->r.id > old_purge) count++;
+        }
+
         if (!old_purge) truncated_tubes_ct++;
         t->purge_before_id = cutoff;
         if (!wal_write_truncate(&c->srv->wal, t, cutoff)) {
@@ -3511,6 +3560,26 @@ prot_replay(Server *s, Job *list)
         nj = j->next;
         job_list_remove(j);
         Wal *w = &s->wal;
+
+        // Purge-guard FIRST: if a resurrected job is covered by the
+        // tube's truncate cutoff, it is already logically dead. Reap
+        // BEFORE walresvupdate so we don't (a) consume WAL space for a
+        // job about to be freed, and (b) fall through to bury_job on
+        // WAL-exhaustion — which would place a zombie on the buried
+        // chain and inflate buried_ct at boot. Hoisting the guard over
+        // the reservation also incidentally fixes the bury_ct double-
+        // increment on the walresvupdate-fail path (#668 analogue):
+        // zombies never reach bury_job, so their ct cannot be bumped.
+        // (#TR-A3).
+        if (unlikely(j->tube->purge_before_id
+                     && j->r.id <= j->tube->purge_before_id)) {
+            j->r.state = Invalid;
+            filermjob(j->file, j);
+            j->tube->stat.total_delete_ct++;
+            job_free(j);
+            continue;
+        }
+
         int z = walresvupdate(w);
         if (!z) {
             twarnx("failed to reserve space for job %"PRIu64", burying", j->r.id);

@@ -129,12 +129,18 @@ main(int argc, char **argv)
 
     optparse(&srv, argv+1);
 
-    // -D is a no-op without a WAL. The walwrite fast path returns
-    // before the durable_sync branch when wal.use == 0, so the user's
-    // expected "ack ⇒ durable" guarantee would silently not hold.
-    // Warn loudly at startup rather than later-in-the-night surprise.
+    // -D without a WAL makes every persistent command fail. Since #C1
+    // (2026-04-23), walwrite/wal_write_truncate/reserve explicitly
+    // refuse under `durable_sync && !w->use` and propagate 0 upward,
+    // so the dispatcher replies with BURIED/INTERNAL_ERROR/OUT_OF_MEMORY
+    // rather than silently ack'ing a ghost write. That is strictly
+    // better than the pre-#C1 "ack ⇒ durable" regression, but an
+    // operator who asked for durability without providing storage is
+    // getting a server that can accept a connection yet answer no
+    // requests. Warn loudly at startup rather than a night of BURIED.
     if (srv.wal.durable_sync && !srv.wal.use)
-        warnx("-D has no effect without -b: durable mode needs a WAL");
+        warnx("-D without -b: every persistent command will fail; "
+              "durable mode needs a WAL");
 
     if (srv.user)
         su(srv.user);

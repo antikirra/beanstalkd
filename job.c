@@ -323,6 +323,12 @@ job_copy(Job *j)
     n->body = (char *)n + sizeof(Job);
     memcpy(n->body, j->body, j->r.body_size);
     n->heap_index = 0;
+    // Null every pointer field. Omitting `reserver` here was the exact
+    // fingerprint of bug #22 (job_copy leaving prev/next dangling into
+    // the source list). Copy jobs are protected today only because
+    // is_job_reserved_by_conn gates on state==Reserved, but a future
+    // reader without that gate would dereference uninitialised memory.
+    n->reserver = NULL;
     job_list_reset(n);
     n->ht_next = NULL;
     n->file = NULL;

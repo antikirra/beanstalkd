@@ -37,6 +37,36 @@ cttest_job_copy_null_input()
     assertf(c == NULL, "job_copy(NULL) must return NULL");
 }
 
+// #J1 regression: job_copy must null every pointer field, including
+// reserver. Previously reserver was left uninitialised (malloc, not
+// calloc, and no explicit assignment) — a latent clone of bug #22.
+// Safe today only because is_job_reserved_by_conn gates on Reserved,
+// but a future reader without that gate would dereference garbage.
+void
+cttest_job_copy_reserver_is_null()
+{
+    TUBE_ASSIGN(dtube, make_tube("default"));
+    Job *j = make_job(7, 0, 1000000000, 4, dtube);
+    assertf(j != NULL, "make_job");
+    memcpy(j->body, "xxxx", 4);
+    // Simulate the state right before reply_job: a reserved job with
+    // a non-NULL reserver pointer. The copy must not inherit it.
+    j->r.state = Reserved;
+    j->reserver = (void *)0xDEADBEEFCAFEBABEULL;
+
+    Job *c = job_copy(j);
+    assertf(c != NULL, "job_copy must not return NULL");
+    assertf(c->reserver == NULL,
+            "job_copy must null reserver (was %p)", (void *)c->reserver);
+    assertf(c->r.state == Copy, "copy state must be Copy");
+
+    // Scrub source pointer before freeing so any accidental
+    // later use hits a predictable invalid address, not reserver.
+    j->reserver = NULL;
+    job_free(c);
+    job_free(j);
+}
+
 void
 cttest_job_state_names()
 {
