@@ -2,6 +2,7 @@
 #include "testinject.h"
 #include "ct/ct.h"
 #include <inttypes.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -1279,3 +1280,152 @@ cttest_walsync_thread_error_surface(void)
 // directly reachable from unit tests anyway; its discipline is locked
 // by the roundtrip and error-surface tests above plus E2E coverage via
 // `cttest_wal_*` whenever an operator runs the server with -b.
+
+
+// --- 2026-04-23 Tier-1+2 injection framework extension ---
+// These tests exercise two new wraps (FAULT_STAT, FAULT_PTHREAD_CREATE)
+// added to close gaps in coverage of the e7a97d0 TOCTOU hardening and
+// the walsyncstart graceful-fallback contract.
+
+// #6a — make_server_socket on "unix:<path>" must propagate stat()
+// failures other than ENOENT as a clean -1 return. Regression guard for
+// the EACCES / ELOOP branch of make_unix_socket added in e7a97d0; the
+// branch has no other path to exercise it in unit tests.
+void
+cttest_inject_make_server_socket_stat_eacces_rejects(void)
+{
+    setup();
+
+    // The path is irrelevant — stat is faulted before it is inspected.
+    char path[] = "unix:/tmp/testinject_stat_eacces.sock";
+
+    fault_set(FAULT_STAT, 0, EACCES);
+    int fd = make_server_socket(path, NULL);
+    assertf(fd == -1,
+            "make_server_socket must reject on stat EACCES, got fd=%d", fd);
+    assertf(fault_hits(FAULT_STAT) == 1,
+            "stat fault must fire exactly once, got %d",
+            fault_hits(FAULT_STAT));
+}
+
+// #6b — happy-path regression: stat wrap must not alter behaviour when
+// no fault is armed. Without this test, a future bug in fault_fire's
+// call-counting could silently break every stat() caller. Also asserts
+// that exactly one wrapped stat() call happens per make_server_socket:
+// if glibc ever routes the user-space stat() through a different symbol
+// (__xstat, __statx, …) the count goes to 0 and this fails loudly.
+void
+cttest_inject_make_server_socket_stat_happy_path_untouched(void)
+{
+    setup();
+
+    char path[64];
+    snprintf(path, sizeof(path),
+             "unix:/tmp/testinject_stat_happy_%d.sock", getpid());
+    // Pre-clean any leftover from an aborted prior run with the same PID.
+    unlink(path + 5);
+
+    int fd = make_server_socket(path, NULL);
+    assertf(fd >= 0,
+            "make_server_socket on fresh path must succeed, got fd=%d "
+            "(errno=%d)", fd, errno);
+    assertf(fault_calls(FAULT_STAT) == 1,
+            "exactly one wrapped stat() call expected, got %d — if 0, the "
+            "linker wrap is bypassed by a glibc alias (__xstat/__statx)",
+            fault_calls(FAULT_STAT));
+    assertf(fault_hits(FAULT_STAT) == 0,
+            "no fault armed → no hits expected, got %d",
+            fault_hits(FAULT_STAT));
+
+    if (fd >= 0) close(fd);
+    unlink(path + 5);
+}
+
+// #7a — walsyncstart must gracefully fall back to synchronous fsync
+// when pthread_create fails. sync_on must remain 0; subsequent dirsync
+// / walwrite calls (in -D mode) are expected to use the inline
+// durable_fsync branch.
+void
+cttest_inject_walsyncstart_pthread_create_fail_falls_back(void)
+{
+    setup();
+
+    Wal w = {0};
+    w.use = 1;
+
+    fault_set(FAULT_PTHREAD_CREATE, 0, EAGAIN);
+    walsyncstart(&w);
+
+    assertf(w.sync_on == 0,
+            "walsyncstart must leave sync_on=0 on pthread_create failure, "
+            "got %d", w.sync_on);
+    assertf(fault_hits(FAULT_PTHREAD_CREATE) == 1,
+            "pthread_create fault must fire exactly once, got %d",
+            fault_hits(FAULT_PTHREAD_CREATE));
+
+    // walsyncstop must be a no-op when sync_on==0; otherwise pthread_join
+    // on an uninitialised handle would segfault.
+    walsyncstop(&w);
+    assertf(w.sync_on == 0,
+            "walsyncstop no-op must keep sync_on=0, got %d", w.sync_on);
+}
+
+// #7b — happy path: unfaulted walsyncstart must still spawn a thread,
+// confirming our wrap does not corrupt the normal code path.
+void
+cttest_inject_walsyncstart_pthread_create_happy_path_untouched(void)
+{
+    setup();
+
+    Wal w = {0};
+    w.use = 1;
+
+    walsyncstart(&w);
+    assertf(w.sync_on == 1,
+            "walsyncstart must set sync_on=1 on success, got %d", w.sync_on);
+    assertf(fault_calls(FAULT_PTHREAD_CREATE) == 1,
+            "pthread_create must have been called exactly once, got %d",
+            fault_calls(FAULT_PTHREAD_CREATE));
+    assertf(fault_hits(FAULT_PTHREAD_CREATE) == 0,
+            "no fault armed → no hits, got %d",
+            fault_hits(FAULT_PTHREAD_CREATE));
+
+    walsyncstop(&w);
+    assertf(w.sync_on == 0,
+            "walsyncstop must clear sync_on, got %d", w.sync_on);
+}
+
+// #7c — "skip N then fail" contract verification for pthread_create.
+// Two walsyncstart / walsyncstop cycles: the second must trigger the
+// fault. This guards against a future regression where fault_fire's
+// countdown on pthread_create breaks (e.g. because the wrap forgot to
+// zero errno and subsequent callers saw a stale value).
+void
+cttest_inject_walsyncstart_pthread_create_skip_then_fail(void)
+{
+    setup();
+
+    Wal w1 = {0};
+    w1.use = 1;
+    Wal w2 = {0};
+    w2.use = 1;
+
+    fault_set(FAULT_PTHREAD_CREATE, 1, EAGAIN); // skip 1, fail on 2nd.
+
+    walsyncstart(&w1);
+    assertf(w1.sync_on == 1,
+            "first walsyncstart must succeed, got sync_on=%d", w1.sync_on);
+    walsyncstop(&w1);
+
+    walsyncstart(&w2);
+    assertf(w2.sync_on == 0,
+            "second walsyncstart must fall back, got sync_on=%d", w2.sync_on);
+    walsyncstop(&w2);
+
+    assertf(fault_hits(FAULT_PTHREAD_CREATE) == 1,
+            "exactly one fault hit expected, got %d",
+            fault_hits(FAULT_PTHREAD_CREATE));
+    assertf(fault_calls(FAULT_PTHREAD_CREATE) == 2,
+            "two real calls expected, got %d",
+            fault_calls(FAULT_PTHREAD_CREATE));
+}

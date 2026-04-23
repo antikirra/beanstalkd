@@ -7,6 +7,8 @@
 #include <stdarg.h>
 #include <sys/uio.h>
 #include <sys/types.h>
+#include <sys/stat.h>
+#include <pthread.h>
 
 struct fault faults[FAULT_COUNT];
 
@@ -21,6 +23,10 @@ default_err(int which)
     case FAULT_OPEN:
     case FAULT_UNLINK:
         return ENOENT;
+    case FAULT_STAT:
+        return EACCES;
+    case FAULT_PTHREAD_CREATE:
+        return EAGAIN;
     default:
         return EIO;
     }
@@ -98,6 +104,9 @@ extern int     __real_open(const char *, int, mode_t);
 extern int     __real_ftruncate(int, off_t);
 extern int     __real_unlink(const char *);
 extern int     __real_fdatasync(int);
+extern int     __real_stat(const char *, struct stat *);
+extern int     __real_pthread_create(pthread_t *, const pthread_attr_t *,
+                                      void *(*)(void *), void *);
 
 
 void *
@@ -191,4 +200,28 @@ __wrap_fdatasync(int fd)
     if (fault_fire(FAULT_FDATASYNC))
         return -1;
     return __real_fdatasync(fd);
+}
+
+int
+__wrap_stat(const char *path, struct stat *buf)
+{
+    if (fault_fire(FAULT_STAT))
+        return -1;
+    return __real_stat(path, buf);
+}
+
+// pthread_create returns the error code as its return value, NOT via errno.
+// fault_fire sets errno as a side-effect of the generic contract; we read
+// that value and return it, then clear errno so a subsequent syscall in the
+// same thread does not see a stale value.
+int
+__wrap_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
+                      void *(*start)(void *), void *arg)
+{
+    if (fault_fire(FAULT_PTHREAD_CREATE)) {
+        int err = errno;
+        errno = 0;
+        return err ? err : EAGAIN;
+    }
+    return __real_pthread_create(thread, attr, start, arg);
 }

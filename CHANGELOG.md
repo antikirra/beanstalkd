@@ -1,5 +1,66 @@
 # Changelog
 
+## 2026-04-24 — Injection framework coverage + SIGUSR1 snapshot
+
+Small hardening pass closing three gaps surfaced during the post-2026-04-23
+retrospective. All changes are additive or behaviour-preserving.
+
+### Fixed
+
+- **SIGUSR1 race in `http_health_reply`** — `drain_mode` is `volatile
+  sig_atomic_t`; the old code read it twice (line for `hdr`, line for
+  `body`). A SIGUSR1 delivered between those two reads shipped a
+  mismatched reply: `Content-Length: 2` + `"draining"` (probe reads the
+  truncated `"dr"` as 200 OK and silently masks the drain signal), or
+  the inverse (probe hangs until FIN). Fix: single-read snapshot into a
+  local `int draining`. Tiny window in practice, but guaranteed wrong
+  semantics when it hits. (`prot.c`)
+
+- **`walsyncstart` resource hygiene** — on `pthread_create` failure the
+  previous code left `sync_mu` and `sync_cond` initialised but never
+  destroyed. Production impact near zero (called once at startup), but
+  a retry or second-Wal scenario would re-init a still-live mutex/cond,
+  which POSIX classifies as UB. Fix: destroy the pair on fallback. Also
+  added matching destroy in `walsyncstop` after `pthread_join` so the
+  start/stop contract is symmetric. (`walg.c`)
+
+### Added
+
+- **Injection framework: two new wraps** (`FAULT_STAT`, `FAULT_PTHREAD_CREATE`).
+  The original 10-wrap set (malloc, calloc, realloc, write, writev, read,
+  open, ftruncate, unlink, fdatasync) did not cover `stat()` — the only
+  remaining gap in the `make_unix_socket` TOCTOU hardening shipped in
+  e7a97d0 — and did not cover `pthread_create()`, which gates the
+  `walsyncstart` graceful-fallback contract. These are the only
+  production call sites that were failure-path-unreachable from tests;
+  `fsync` and `rename` audit recommendations were dropped because the
+  production code uses neither (only `fdatasync` via `durable_fsync`,
+  and WAL rotation is open/write/unlink without a rename step).
+  (`testinject.h`, `testinject.c`, `Makefile`)
+
+- **5 new hostile tests** in `testinject2.c`:
+  - `cttest_inject_make_server_socket_stat_eacces_rejects` — injects
+    EACCES on stat, asserts make_unix_socket returns -1.
+  - `cttest_inject_make_server_socket_stat_happy_path_untouched` — no
+    fault armed; verifies exactly one wrapped `stat()` call per call
+    site. Flags glibc symbol-alias regressions (`__xstat`, `__statx`)
+    that would silently bypass the wrap.
+  - `cttest_inject_walsyncstart_pthread_create_fail_falls_back` —
+    injects EAGAIN, asserts `sync_on == 0`, verifies walsyncstop is a
+    safe no-op on the fallback Wal.
+  - `cttest_inject_walsyncstart_pthread_create_happy_path_untouched` —
+    unfaulted start spawns thread, call counter increments.
+  - `cttest_inject_walsyncstart_pthread_create_skip_then_fail` —
+    countdown=1 semantic: first start succeeds, second falls back.
+    Guards against regressions in fault_fire's skip-then-fire logic
+    that would break every wrap simultaneously.
+
+### Verification
+
+Dockerfile.build CI: UBSan + cppcheck + 360 hostile tests — green.
+
+---
+
 ## 2026-04-23 — Cloud Team audit hardening
 
 Tenth post-truncate hardening wave. Closes the regressions surfaced by

@@ -2052,8 +2052,14 @@ is_valid_tube(const char *name, size_t max)
 static void
 http_health_reply(Conn *c, int is_head)
 {
-    const char *hdr = drain_mode ? HTTP_503_HDR : HTTP_200_HDR;
-    const char *body = drain_mode ? HTTP_503_BODY : HTTP_200_BODY;
+    // Snapshot drain_mode ONCE. Reading the sig_atomic_t twice in a row
+    // lets SIGUSR1 flip it between the hdr and body branches and ship a
+    // mismatched reply: `Content-Length: 2` + "draining" (probe reads
+    // truncated "dr" as 200 OK — masks the drain signal) or the inverse
+    // (probe hangs on missing bytes until FIN).
+    int draining = (int)drain_mode;
+    const char *hdr = draining ? HTTP_503_HDR : HTTP_200_HDR;
+    const char *body = draining ? HTTP_503_BODY : HTTP_200_BODY;
     size_t hdr_len = strlen(hdr);
     size_t body_len = is_head ? 0 : strlen(body);
 

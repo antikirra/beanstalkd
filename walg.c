@@ -74,6 +74,13 @@ walsyncstart(Wal *w)
     w->sync_stop = 0;
     w->sync_err = 0;
     if (pthread_create(&w->sync_thread, NULL, sync_thread_fn, w) != 0) {
+        // Graceful fallback: no thread, sync_on stays 0, walsync() / dirsync()
+        // fall through to the inline durable_fsync branch. Destroy the pair
+        // we just initialised so a retry (or a second walsyncstart on the
+        // same Wal) does not re-init a still-live mutex/cond — POSIX forbids
+        // pthread_mutex_init on an initialised mutex.
+        pthread_cond_destroy(&w->sync_cond);
+        pthread_mutex_destroy(&w->sync_mu);
         twarnx("failed to start fsync thread, using synchronous fsync");
         return;
     }
@@ -89,6 +96,8 @@ walsyncstop(Wal *w)
     pthread_cond_signal(&w->sync_cond);
     pthread_mutex_unlock(&w->sync_mu);
     pthread_join(w->sync_thread, NULL);
+    pthread_cond_destroy(&w->sync_cond);
+    pthread_mutex_destroy(&w->sync_mu);
     w->sync_on = 0;
 }
 
