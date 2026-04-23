@@ -1,5 +1,37 @@
 # Changelog
 
+## 2026-04-24 — Wire-observable differences documented; systemd unit hardened
+
+No code changes — operator-facing documentation only, shipped ahead of the
+first tagged release so migration from upstream is an informed decision.
+
+### Documented
+
+- **Wire-observable differences from upstream** (`README.md` §Compatibility)
+  — exhaustive table of every point where a client can tell the two
+  binaries apart on the wire: the `truncate` command, the `touch`-after-
+  `truncate` → `NOT_FOUND` edge (behaviour change from upstream, accepted
+  per invariant #8), the additive `cmd-truncate` line in `stats` (shifts
+  later fields down one line for index-based parsers; key-value parsers
+  unaffected), strict-prefix dispatch upgrading trailing-space variants
+  (`"stats \r\n"`) from `BAD_FORMAT` to `UNKNOWN_COMMAND` (invariant #13),
+  and `-D` without `-b` surfacing real errors rather than ghost-acking
+  (invariant #14). The previous blanket claim "No new commands, no
+  changed responses, no modified stats fields" was literally false since
+  the `truncate` extension in 2026-04-17 and has been rewritten.
+
+### Changed
+
+- **`adm/systemd/beanstalkd.service`** — added `Restart=on-failure`,
+  `LimitNOFILE=65536`, `MemoryMax=2G` (OOM backstop since tubes/jobs are
+  unbounded inside the process), `StandardOutput=journal` +
+  `SyslogIdentifier=beanstalkd`, a commented `ExecStart` example with
+  `-b` and `--log-json`, and a graceful `ExecStop` that sends SIGUSR1
+  (drain) and sleeps 25s before systemd escalates to SIGTERM (total
+  `TimeoutStopSec=35s`). `User=nobody` and `ExecStart=/usr/bin/beanstalkd`
+  unchanged, so no new package metadata (sysusers, state dir) is required
+  to deploy.
+
 ## 2026-04-24 — Injection framework coverage + SIGUSR1 snapshot
 
 Small hardening pass closing three gaps surfaced during the post-2026-04-23

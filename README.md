@@ -2,7 +2,7 @@
 
 Linux-native work queue. Single C11 binary, requires only glibc.
 
-Fork of [upstream beanstalkd](https://github.com/beanstalkd/beanstalkd) with O(1) scheduling, per-syscall optimizations, and 48 bug fixes. Wire protocol unchanged — every existing client works unmodified. WAL format upgraded to v8 with per-record CRC32C; upstream v7 binlogs replay transparently on startup.
+Fork of [upstream beanstalkd](https://github.com/beanstalkd/beanstalkd) with O(1) scheduling, per-syscall optimizations, and dozens of crash/data-loss fixes. Drop-in replacement for the upstream binary: every upstream command, response, error string, and stats key works unchanged (see "Wire-observable differences" for the short list of additive extensions). WAL format upgraded to v8 with per-record CRC32C; upstream v7 binlogs replay transparently on startup.
 
 ## Quick start
 
@@ -16,7 +16,23 @@ Requires **Linux 6.1+**, glibc, gcc 12+. Compatible with GCC 15.
 
 ## Compatibility
 
-100% wire protocol compatible with upstream beanstalkd v1.13. No new commands, no changed responses, no modified stats fields. All client libraries (Go, Python, Ruby, PHP, Java, etc.) work without changes. WAL writer emits v8 (4-byte CRC32C trailer per record for silent-corruption detection); upstream v7 binlogs are read transparently on startup, so upgrade requires no migration. Downgrade to a pre-v8 binary is not supported. Legacy v5 (beanstalkd 1.4.6) reader removed — drain pre-v7 binlogs on the old binary before upgrading.
+Drop-in replacement for upstream beanstalkd v1.13 for every non-administrative workload. All client libraries (Go, Python, Ruby, PHP, Java, etc.) connect and drive jobs without changes; every upstream command, response, error string, and stats key is preserved. The differences are limited to one new command (`truncate`), one additive stats field (`cmd-truncate`), and a few strict-parsing edges — see "Wire-observable differences" below before migrating.
+
+WAL writer emits v8 (4-byte CRC32C trailer per record for silent-corruption detection); upstream v7 binlogs are read transparently on startup, so upgrade requires no migration. Downgrade to a pre-v8 binary is not supported. Legacy v5 (beanstalkd 1.4.6) reader removed — drain pre-v7 binlogs on the old binary before upgrading.
+
+### Wire-observable differences from upstream
+
+| Case | Upstream | This fork | Impact on legacy clients |
+|---|---|---|---|
+| `truncate <tube>\r\n` | `UNKNOWN_COMMAND` | `TRUNCATED <count>\r\n` | None — legacy clients never send `truncate`. |
+| `touch <id>` on a job whose tube was `truncate`d since it was reserved | `TOUCHED` | `NOT_FOUND` | Only observable in deployments that use `truncate`. |
+| `stats` YAML body | — | One additive line `cmd-truncate: N` inserted between `cmd-pause-tube` and `job-timeouts`. | Key-value (YAML) parsers: none. Line-index parsers: `job-timeouts` and later fields shift down one line. |
+| Command with trailing space (e.g. `"stats \r\n"`, `"list-tubes \r\n"`) | `BAD_FORMAT` | `UNKNOWN_COMMAND` | Only if the client specifically switches on `BAD_FORMAT`. Canonical clients send the bare verb and are unaffected. (Invariant #13: strict literal prefix dispatch closes a namespace-leak through `sleep\r\n` / `steal\r\n` / `l12345678s\r\n`.) |
+| `-D` without `-b` | flag does not exist | Server starts, but every persistent command (put, release, bury, kick) surfaces a real error (`BURIED` / `INTERNAL_ERROR` / `OUT_OF_MEMORY`) rather than ghost-acknowledging. Canonical durable use is `-D -b`. | Only affects deployments that misconfigure `-D`; no client sees this under `-D -b`. |
+
+Opt-in features that are silent unless enabled: HTTP health (`-H`) replies only to `GET `/`HEAD ` prefixes (no beanstalk verb starts with either); idle timeout (`-I SEC`) just closes connections that would otherwise idle forever; connection cap (`-c N`) is off by default.
+
+No upstream command, response string, error string, stats key, or CLI flag was removed or renamed.
 
 ## Fork vs upstream
 
@@ -29,20 +45,19 @@ Requires **Linux 6.1+**, glibc, gcc 12+. Compatible with GCC 15.
 | Syscalls per command | ~4 | ~2 (inline reply flush) |
 | Job hash rehash | Stop-the-world | Incremental, 16 buckets/op |
 | Job memory | malloc/free per job | 11 size classes, O(1) pool reuse |
-| WAL fsync | Synchronous | Async fsync thread |
 | WAL compaction | Broken on release cycles | Fixed alive tracking |
 | WAL integrity | None | CRC32C per record (v8 format, SSE4.2) |
-| WAL durability | Async only | Async + opt-in synchronous (`-D`) |
+| WAL durability | Async only, errors can be silently dropped | Async with `_Atomic` error signalling + EINTR retry; opt-in synchronous `-D` (`ack ⇒ durable`) |
 | Tube hash | Stock DJB2 | wyhash v4 (avalanche + length-aware) |
 | Heap layout | Binary (2-ary) | 4-ary (shallower, cache-line-fit children) |
-| Crash/data bugs | 22+ open | 48 fixed |
-| Tests | ~100 unit | 329 unit + hostile WAL + ASan + Valgrind |
+| Crash/data bugs | 22+ open in upstream tracker | see §Bug fixes and `CHANGELOG.md` |
+| Tests | ~100 unit | 360 unit + hostile WAL + ASan + Valgrind |
 | Status | Maintenance mode (last code 2020) | Active development |
 
 ## Build and test
 
 ```sh
-make check                                # 329 unit tests (UBSan in CI)
+make check                                # 360 unit tests (UBSan in CI)
 docker build -f Dockerfile.build .        # CI: UBSan + cppcheck (C11)
 docker build -f Dockerfile.benchmark .    # A/B benchmark vs upstream
 docker build -f test/Dockerfile.loadtest -t loadtest . && docker run --rm loadtest
@@ -51,7 +66,12 @@ docker build -f test/Dockerfile.loadtest -t loadtest . && docker run --rm loadte
 
 Tested with GCC 12 (Debian bookworm) and GCC 15 (Debian sid). Production Dockerfile uses `-O2 -flto -fipa-pta -fno-plt -fvisibility=hidden -Wl,--gc-sections` with branch prediction hints on hot paths.
 
-## Bug fixes (48)
+## Bug fixes
+
+The lists below are not exhaustive — they cover named regressions against
+upstream beanstalkd v1.13. The 2026-04-23/24 pre-production audit added a
+further ~75 fixes and hardening patches across WAL replay, truncate
+crosscutting, and fault-injection paths; see `CHANGELOG.md` for the canonical log.
 
 **Crashes:**
 NULL deref in conn_timeout, infinite loop in rawfalloc, WAL rollback corruption, unsafe signal handler exit, EPOLLERR 100% CPU, prot_init OOM SIGSEGV.

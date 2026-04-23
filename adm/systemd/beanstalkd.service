@@ -1,9 +1,35 @@
 [Unit]
-Description=Beanstalkd is a simple, fast work queue
+Description=Beanstalkd work queue
+Documentation=https://github.com/beanstalkd/beanstalkd
+After=network.target
 
 [Service]
+Type=simple
 User=nobody
+# Example with WAL and structured logs:
+#   ExecStart=/usr/bin/beanstalkd -b /var/lib/beanstalkd -F --log-json
 ExecStart=/usr/bin/beanstalkd
+
+# Graceful stop: SIGUSR1 enters drain mode (refuses new PUTs, lets
+# reserved jobs finish), then systemd sends SIGTERM after the sleep
+# window to break the event loop cleanly.
+ExecStop=/bin/sh -c '/bin/kill -USR1 $MAINPID; sleep 25'
+TimeoutStopSec=35s
+
+Restart=on-failure
+RestartSec=5s
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=beanstalkd
+
+# Connection ceiling. Raise if you expect many concurrent clients.
+LimitNOFILE=65536
+
+# OOM backstop: tubes/jobs/reservations are unbounded inside the
+# process, so without a cgroup limit a runaway producer can exhaust
+# host memory. Tune for the working set, or comment out to disable.
+MemoryMax=2G
 
 [Install]
 WantedBy=multi-user.target
