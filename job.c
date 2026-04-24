@@ -6,28 +6,36 @@
 static uint64 next_id = 1;
 
 // Size-classed free list for O(1) job reuse across varied body sizes.
-// Jobs are allocated at power-of-2 boundaries (64, 128, ..., 65536).
-// Any body_size within a class reuses entries from that class.
+// Slab sizes are power-of-2-of-user-body PLUS POOL_PAD: 66, 130, 258, 514,
+// 1026, 2050, 4098, 8194, 16386, 32770, 65538. POOL_PAD accommodates the
+// \r\n trailer that every caller stores after the body (PUT passes
+// body_size + 2; stats/list responders do the same; see prot.c). Without
+// POOL_PAD a user body of 1024 would be stored as 1026 bytes and round
+// UP one slab to 2048 — wasting ~1 KB per job on every power-of-2 body.
 // Entries linked via ht_next (safe: job is removed from hash before pooling).
-#define POOL_NCLASS     11          // classes: 64, 128, 256, ..., 65536
-_Static_assert((64 << (POOL_NCLASS - 1)) == 65536, "POOL_NCLASS must cover classes up to 65536");
+#define POOL_NCLASS     11          // 11 classes, user sizes up to 65536
+_Static_assert((64 << (POOL_NCLASS - 1)) == 65536, "POOL_NCLASS must cover user sizes up to 65536");
 #define POOL_PER_CLASS  512         // max entries per class
 #define POOL_MEM_MAX    (8 << 20)   // 8MB total across all classes
+#define POOL_PAD        2           // room for the \r\n trailer PUT/stats/list callers store
 
 static Job    *pool_head[POOL_NCLASS];
 static int     pool_len[POOL_NCLASS];
 static size_t  pool_mem;
 
 // pool_class returns the class index (0..POOL_NCLASS-1) for body_size,
-// or -1 if too large to pool. Uses CLZ for branchless size-class lookup.
+// or -1 if too large to pool. body_size is the stored size (user body +
+// POOL_PAD trailer). The class holds stored sizes up to (64 << cls) + POOL_PAD;
+// user body_size of exactly 2^k for k∈{6..16} lands at the class boundary
+// with zero waste.
 static inline int
 pool_class(int body_size)
 {
-    if (body_size <= 0)     return body_size == 0 ? 0 : -1;
-    if (body_size <= 64)    return 0;
-    if (body_size > 65536)  return -1;
-    // Classes: 0=64, 1=128, ..., 10=65536.  class = ceil(log2(n)) - 6.
-    int bits = 32 - __builtin_clz((unsigned)(body_size - 1));
+    if (body_size <= 0)                  return body_size == 0 ? 0 : -1;
+    if (body_size <= 64 + POOL_PAD)      return 0;
+    if (body_size > 65536 + POOL_PAD)    return -1;
+    // user = body_size - POOL_PAD ∈ (64, 65536]; class = ceil(log2(user)) - 6.
+    int bits = 32 - __builtin_clz((unsigned)(body_size - 1 - POOL_PAD));
     return bits - 6;
 }
 
@@ -150,7 +158,7 @@ allocate_job(int body_size)
 {
     Job *j = NULL;
     int cls = pool_class(body_size);
-    int asize = cls >= 0 ? (64 << cls) : body_size;
+    int asize = cls >= 0 ? ((64 << cls) + POOL_PAD) : body_size;
 
     // Reuse from size-class pool. O(1) lookup, guaranteed fit.
     if (likely(cls >= 0 && pool_head[cls])) {
@@ -264,7 +272,7 @@ job_free(Job *j)
     // Pool regular jobs for reuse; copies, oversized, and excess go to free().
     int cls = pool_class(j->r.body_size);
     if (likely(!is_copy) && likely(cls >= 0)) {
-        size_t entry_bytes = sizeof(Job) + (size_t)(64 << cls);
+        size_t entry_bytes = sizeof(Job) + (size_t)((64 << cls) + POOL_PAD);
         if (pool_len[cls] < POOL_PER_CLASS
             && pool_mem + entry_bytes <= POOL_MEM_MAX) {
             j->ht_next = pool_head[cls];
