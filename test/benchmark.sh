@@ -25,9 +25,9 @@ run_c() {
     $BENCH -p $1 -c $2 -n $3 -P $4 -B $5 2>/dev/null
 }
 
-# Parse bench output → "rate p50 p99 p999"
+# Parse bench output → "rate p50 p99 p999 p9999 max"
 parse() {
-    awk '/Rate:/{r=$2} /P50:/{p50=$3} /P99:/{p99=$3} /P999:/{p999=$3} END{print r,p50,p99,p999}'
+    awk '/Rate:/{r=$2} /P50:/{p50=$3} /P99:/{p99=$3} /P999:/{p999=$3} /P9999:/{p9999=$3} /Max:/{m=$3} END{print r,p50,p99,p999,p9999,m}'
 }
 
 # ── Run all scenarios for a binary ──────────────────────────
@@ -87,6 +87,58 @@ run_suite() {
     echo "  S5 Deep pipe:   $(echo $parsed | awk '{print $1}') ops/s"
     stop $pid $port; rm -rf "$w"
 
+    # S8: Tail-probe — 1 conn × 100K ops, pipeline=1, 4B body (long serial RTT)
+    # Investigates tail-latency regression seen in short S2. 100K samples gives
+    # statistically stable P99.99 / max numbers.
+    w="/tmp/wal-$label-s8-$$"; rm -rf "$w"; mkdir -p "$w"
+    $bin $extra -p $port -b "$w" -f 50 >/dev/null 2>&1 &
+    pid=$!; sleep 1
+    out=$($BENCH -p $port -c 1 -n 100000 -P 1 -B 4 2>/dev/null)
+    parsed=$(echo "$out" | parse)
+    eval "${label}_s8='$parsed'"
+    echo "  S8 tail-probe: $(echo $parsed | awk '{printf "%s ops/s  P50=%s P999=%s P9999=%s Max=%s μs", $1, $2, $4, $5, $6}')"
+    stop $pid $port; rm -rf "$w"
+
+    # S7: Deep-watch — 8 conns × 500 ops, pipeline=16, 128B, 500 tubes per conn
+    # Worst-case for reserve fast-path: PUTs target LAST-watched tube so server
+    # must scan all N watched tubes on every reserve. Tests O(watched_tubes) cost.
+    w="/tmp/wal-$label-s7-$$"; rm -rf "$w"; mkdir -p "$w"
+    $bin $extra -p $port -b "$w" -f 50 >/dev/null 2>&1 &
+    pid=$!; sleep 1
+    out=$($BENCH -p $port -c 8 -n 500 -P 16 -B 128 -W 500 2>/dev/null)
+    parsed=$(echo "$out" | parse)
+    eval "${label}_s7='$parsed'"
+    echo "  S7 deep-watch: $(echo $parsed | awk '{printf "%s ops/s  P50=%s P99.9=%s μs", $1, $2, $4}')"
+    stop $pid $port; rm -rf "$w"
+
+    # S9/S10: Durable mode (-D) — fork only. Upstream has no -D flag.
+    # Measures fsync cost per op (S9) and how pipelining amortizes it (S10).
+    if [ "$label" = "fk" ]; then
+        # S9: -D × 1 conn × 5K × pipeline=1 × 4B — serial fsync cost.
+        w="/tmp/wal-$label-s9-$$"; rm -rf "$w"; mkdir -p "$w"
+        $bin $extra -D -p $port -b "$w" >/dev/null 2>&1 &
+        pid=$!; sleep 1
+        out=$($BENCH -p $port -c 1 -n 5000 -P 1 -B 4 2>/dev/null)
+        parsed=$(echo "$out" | parse)
+        eval "${label}_s9='$parsed'"
+        echo "  S9 -D serial:  $(echo $parsed | awk '{printf "%s ops/s  P50=%s P99.9=%s μs", $1, $2, $4}')"
+        stop $pid $port; rm -rf "$w"
+
+        # S10: -D × 8 conn × 5K × pipeline=64 × 128B — parallel durable throughput.
+        w="/tmp/wal-$label-s10-$$"; rm -rf "$w"; mkdir -p "$w"
+        $bin $extra -D -p $port -b "$w" >/dev/null 2>&1 &
+        pid=$!; sleep 1
+        out=$($BENCH -p $port -c 8 -n 5000 -P 64 -B 128 2>/dev/null)
+        parsed=$(echo "$out" | parse)
+        eval "${label}_s10='$parsed'"
+        echo "  S10 -D pipe:   $(echo $parsed | awk '{printf "%s ops/s  P50=%s P99.9=%s μs", $1, $2, $4}')"
+        stop $pid $port; rm -rf "$w"
+    else
+        eval "${label}_s9='0 0 0 0 0 0'"
+        eval "${label}_s10='0 0 0 0 0 0'"
+        echo "  S9/S10 -D:     (upstream has no -D flag, skipped)"
+    fi
+
     # S6: 500 tubes (Python)
     w="/tmp/wal-$label-s6-$$"; rm -rf "$w"; mkdir -p "$w"
     $bin $extra -p $port -b "$w" -f 50 >/dev/null 2>&1 &
@@ -142,8 +194,8 @@ run_suite "fk" "$FORK"     11700 ""
 
 # ── Results ──────────────────────────────────────────────────
 
-export up_s1 up_s2 up_s3 up_s4 up_s5 up_s6
-export fk_s1 fk_s2 fk_s3 fk_s4 fk_s5 fk_s6
+export up_s1 up_s2 up_s3 up_s4 up_s5 up_s6 up_s7 up_s8 up_s9 up_s10
+export fk_s1 fk_s2 fk_s3 fk_s4 fk_s5 fk_s6 fk_s7 fk_s8 fk_s9 fk_s10
 
 python3 << PYEOF
 import os
@@ -167,6 +219,10 @@ up_s3 = e('up_s3'); fk_s3 = e('fk_s3')
 up_s4 = e('up_s4'); fk_s4 = e('fk_s4')
 up_s5 = e('up_s5'); fk_s5 = e('fk_s5')
 up_s6 = e('up_s6'); fk_s6 = e('fk_s6')
+up_s7 = e('up_s7'); fk_s7 = e('fk_s7')
+up_s8 = e('up_s8'); fk_s8 = e('fk_s8')
+up_s9 = e('up_s9'); fk_s9 = e('fk_s9')
+up_s10 = e('up_s10'); fk_s10 = e('fk_s10')
 
 fmt = '  {:<28s} {:>10s} {:>10s}  {:>8s}'
 print()
@@ -191,6 +247,36 @@ row('S3: Large body 16KB (ops/s)', v(up_s3,0), v(fk_s3,0))
 row('S4: 32 connections (ops/s)', v(up_s4,0), v(fk_s4,0))
 row('S5: Deep pipeline (ops/s)', v(up_s5,0), v(fk_s5,0))
 row('S6: 500 tubes (ops/s)', up_s6, fk_s6)
+row('S7: Deep-watch (ops/s)', v(up_s7,0), v(fk_s7,0))
+row('  P50 latency (μs)', v(up_s7,1), v(fk_s7,1), True)
+row('  P99.9 latency (μs)', v(up_s7,3), v(fk_s7,3), True)
+row('S8: Tail-probe (ops/s)', v(up_s8,0), v(fk_s8,0))
+row('  P50 latency (μs)', v(up_s8,1), v(fk_s8,1), True)
+row('  P99.9 latency (μs)', v(up_s8,3), v(fk_s8,3), True)
+row('  P99.99 latency (μs)', v(up_s8,4), v(fk_s8,4), True)
+row('  Max latency (μs)', v(up_s8,5), v(fk_s8,5), True)
+print()
+print('  Durable mode (-D) — fork-only (upstream has no -D flag):')
+row('S9: -D serial (ops/s)',          '-', v(fk_s9,0))
+row('  P50 latency (μs)',             '-', v(fk_s9,1))
+row('  P99.9 latency (μs)',           '-', v(fk_s9,3))
+row('S10: -D pipelined (ops/s)',      '-', v(fk_s10,0))
+row('  P50 latency (μs)',             '-', v(fk_s10,1))
+row('  P99.9 latency (μs)',           '-', v(fk_s10,3))
+
+# Durability cost ratios: fork durable vs fork async under same shape
+def pct(num, den):
+    try:
+        n, d_ = float(num), float(den)
+        if d_ == 0: return 'N/A'
+        return f'{(n/d_)*100:.1f}%'
+    except: return 'N/A'
+
+print()
+print('  Cost-of-durability (fork / fork):')
+print(f'    S9/S2   serial durable  vs serial async   : {pct(v(fk_s9,0), v(fk_s2,0))}')
+print(f'    S10/S1  pipelined dur.  vs pipelined async: {pct(v(fk_s10,0), v(fk_s1,0))}')
+print(f'    S9 P50 / S2 P50         (how slow one op) : {pct(v(fk_s9,1), v(fk_s2,1))}')
 
 print()
 print('  S1: 8 conn × 10K put+reserve+delete, 128B body, pipeline=64')
@@ -199,6 +285,11 @@ print('  S3: 8 conn × 2K put+reserve+delete, 16KB body, pipeline=16')
 print('  S4: 32 conn × 5K put+reserve+delete, 128B body, pipeline=32')
 print('  S5: 1 conn × 20K put+reserve+delete, 128B body, pipeline=256')
 print('  S6: 500 tubes × 100 jobs each, 4 clients, 16-256B mixed bodies')
+print('  S7: 8 conn × 500 ops, 500 watched tubes each, PUTs target LAST-watched')
+print('      (reserve fast-path forced to scan all 500 — measures O(watched_tubes))')
+print('  S8: 1 conn × 100K ops, pipeline=1, 4B body (long serial RTT for tail study)')
+print('  S9: -D × 1 conn × 5K ops, pipeline=1, 4B (serial fsync cost)')
+print('  S10: -D × 8 conn × 5K ops, pipeline=64, 128B (durable under pipeline load)')
 print()
 print('╚══════════════════════════════════════════════════════════════╝')
 PYEOF

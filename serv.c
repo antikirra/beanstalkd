@@ -82,6 +82,14 @@ srvserve(Server *s)
             twarnx("socknext");
             exit(1);
         }
+
+        // Group commit: one fdatasync covers every walwrite staged in
+        // this tick's prottick + event drain; dur_flush_all then sends
+        // the acks buffered while waiting (INTERNAL_ERROR on commit
+        // failure). Upholds invariants #14 and #16. No-op in non-durable
+        // mode — async fsync runs via walsync() inside walmaint.
+        int commit_ok = walcommit(&s->wal);
+        dur_flush_all(commit_ok);
     }
 }
 

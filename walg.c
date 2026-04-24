@@ -363,18 +363,16 @@ walsync(Wal *w)
 }
 
 
-// Walwrite writes j to the log w (if w is enabled).
-// On failure, walwrite disables w and returns 0; on success, it returns 1.
-// Unlike walresv*, walwrite should never fail because of a full disk.
+// walwrite stages a WAL record: the writev and accounting happen now,
+// the fdatasync is deferred to walcommit() which the serv main loop
+// fires once per epoll drain (group commit — see invariant #16). One
+// fdatasync amortises across every WAL-dirty command in the tick.
 //
-// Disabled-WAL semantics (#C1): legacy callers expect walwrite to be a
-// no-op returning 1 when the WAL is disabled at startup (no -b flag) or
-// after a prior I/O failure turned it off. That stays true for the async
-// / non-durable path: clients never relied on durability there. Durable
-// mode is different — it is a client-visible contract ("ack ⇒ on disk").
-// Silently succeeding after w->use=0 would break that contract for the
-// lifetime of the process. Refuse instead so the caller surfaces
-// BURIED / INTERNAL_ERROR rather than a ghost INSERTED.
+// On writev failure w->use is cleared and we return 0. The
+// "durable_sync without -b or after fail" refusal (invariant #14) is
+// the first check so a disabled WAL in -D mode surfaces a real error
+// to the caller rather than ghost-acking; non-durable keeps the
+// legacy "silently succeed" contract for backward compatibility.
 __attribute__((hot)) int
 walwrite(Wal *w, Job *j)
 {
@@ -391,12 +389,6 @@ walwrite(Wal *w, Job *j)
             r = filewrjobfull(w->cur, j);
         }
     }
-    // filewrjob{short,full} -> filewritev: when w->durable_sync is set,
-    // the durable fdatasync happens inside filewritev with an ftruncate
-    // tail rollback on failure. A zero return therefore covers both the
-    // writev error and the durable-sync error, and the on-disk tail is
-    // either fully committed or absent — never "present but unacked"
-    // (#C2).
     if (unlikely(!r)) {
         twarnx("wal: disabling WAL after write failure");
         filewclose(w->cur);
@@ -408,7 +400,30 @@ walwrite(Wal *w, Job *j)
     return r;
 }
 
+// walcommit — fdatasync w->cur, flushing every record staged by
+// walwrite / wal_write_truncate since the last commit. On failure,
+// filewrcommit ftruncates the tail back and rolls back global
+// counters; we then disable the WAL so the "ack ⇒ durable" contract
+// (invariant #14) is not regressed.
+//
+// In non-durable mode this is a no-op (the async fsync thread handles
+// durability via walsync/walmaint). w->nrec is unchanged because
+// records were already counted by walwrite.
+int
+walcommit(Wal *w)
+{
+    if (!w->use) return 1;  // WAL disabled — nothing to commit
+    if (!filewrcommit(w->cur)) {
+        twarnx("wal: disabling WAL after commit failure");
+        filewclose(w->cur);
+        w->use = 0;
+        return 0;
+    }
+    return 1;
+}
 
+// wal_write_truncate stages a truncate-marker record. Same staging
+// semantics as walwrite above — fdatasync is deferred to walcommit().
 int
 wal_write_truncate(Wal *w, Tube *t, uint64 cutoff_id)
 {
@@ -426,9 +441,6 @@ wal_write_truncate(Wal *w, Tube *t, uint64 cutoff_id)
         return 0;
     }
 
-    // filewrtruncate performs its own durable fdatasync + ftruncate-back
-    // rollback (#C2), so a zero return means the marker is NOT on disk
-    // and we can safely let the caller roll back t->purge_before_id.
     int r = filewrtruncate(w->cur, t, cutoff_id);
     if (!r) {
         // filewrtruncate left reservations untouched on failure. Return

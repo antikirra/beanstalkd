@@ -3,7 +3,11 @@
 // Measures the TRUE server ceiling, not Python interpreter overhead.
 //
 // Build: gcc -O2 -o bench bench.c -lm
-// Usage: bench [-h host] [-p port] [-c conns] [-n ops] [-P pipeline] [-B body]
+// Usage: bench [-h host] [-p port] [-c conns] [-n ops] [-P pipeline] [-B body] [-W watch]
+//
+// -W N: deep-watch mode. Each conn watches N tubes total; PUTs target the
+//       LAST-watched tube so reserve fast-path must scan all N entries
+//       (worst-case for prot.c reserve O(watched_tubes)).
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,9 +52,11 @@ static int cmp64(const void *a, const void *b) {
 static void lat_report(void) {
     if (!lat_n) return;
     qsort(lat_buf, lat_n, sizeof(int64_t), cmp64);
-    printf("  Latency P50:  %7.1f us\n", lat_buf[lat_n/2] / 1000.0);
-    printf("  Latency P99:  %7.1f us\n", lat_buf[(int)(lat_n*0.99)] / 1000.0);
-    printf("  Latency P999: %7.1f us\n", lat_buf[(int)(lat_n*0.999)] / 1000.0);
+    printf("  Latency P50:   %8.1f us\n", lat_buf[lat_n/2] / 1000.0);
+    printf("  Latency P99:   %8.1f us\n", lat_buf[(int)(lat_n*0.99)] / 1000.0);
+    printf("  Latency P999:  %8.1f us\n", lat_buf[(int)(lat_n*0.999)] / 1000.0);
+    printf("  Latency P9999: %8.1f us\n", lat_buf[(int)(lat_n*0.9999)] / 1000.0);
+    printf("  Latency Max:   %8.1f us\n", lat_buf[lat_n-1] / 1000.0);
 }
 
 // ── Connection state machine ────────────────────────────────
@@ -69,6 +75,7 @@ typedef struct {
 
     int  sent, recvd, target;
     int  pipeline;
+    int  setup_expected; // number of setup-phase replies to consume
     int  body_skip;     // bytes of body+\r\n to skip after RESERVED line
 
     int64_t send_ts[PIPELINE_MAX]; // per-command send timestamps
@@ -90,6 +97,7 @@ static int  body_size = 128;
 static int  n_conns = 8;
 static int  n_ops = 10000;
 static int  pipeline = 64;
+static int  n_watch = 0;  // 0 = legacy single-tube mode; >0 = deep-watch
 static char *host = "127.0.0.1";
 static int  port = 11300;
 
@@ -234,7 +242,7 @@ static void process(Bench *b) {
         case PH_SETUP:
             consume(b, llen + 2);
             b->recvd++;
-            if (b->recvd >= 2) { // use + watch replies
+            if (b->recvd >= b->setup_expected) {
                 b->recvd = b->sent = 0;
                 b->phase = PH_PUT;
                 fill_puts(b);
@@ -313,9 +321,28 @@ static void run(void) {
         b->phase = PH_SETUP;
         mk_conn(b);
 
-        char cmd[128];
-        int len = snprintf(cmd, sizeof cmd, "use t%d\r\nwatch t%d\r\n", i, i);
-        enqueue(b, cmd, len);
+        if (n_watch > 0) {
+            // Deep-watch mode: build watch.items = [wC_0, wC_1, ..., wC_{N-1}].
+            // PUTs target wC_{N-1} (last → worst-case scan position).
+            char cmd[48];
+            int len;
+            len = snprintf(cmd, sizeof cmd, "watch w%d_0\r\n", i);
+            enqueue(b, cmd, len);
+            len = snprintf(cmd, sizeof cmd, "ignore default\r\n");
+            enqueue(b, cmd, len);
+            for (int k = 1; k < n_watch; k++) {
+                len = snprintf(cmd, sizeof cmd, "watch w%d_%d\r\n", i, k);
+                enqueue(b, cmd, len);
+            }
+            len = snprintf(cmd, sizeof cmd, "use w%d_%d\r\n", i, n_watch - 1);
+            enqueue(b, cmd, len);
+            b->setup_expected = n_watch + 2; // N watches + 1 ignore + 1 use
+        } else {
+            char cmd[128];
+            int len = snprintf(cmd, sizeof cmd, "use t%d\r\nwatch t%d\r\n", i, i);
+            enqueue(b, cmd, len);
+            b->setup_expected = 2;
+        }
         flush_send(b);
     }
 
@@ -336,8 +363,13 @@ static void run(void) {
     for (int i = 0; i < n_conns; i++) total += bench[i].ops;
 
     printf("═══════════════════════════════════════════════════\n");
-    printf("  C Benchmark: %d conns x %d ops, pipeline=%d, body=%dB\n",
-           n_conns, n_ops, pipeline, body_size);
+    if (n_watch > 0) {
+        printf("  C Benchmark: %d conns x %d ops, pipeline=%d, body=%dB, watch=%d (deep)\n",
+               n_conns, n_ops, pipeline, body_size, n_watch);
+    } else {
+        printf("  C Benchmark: %d conns x %d ops, pipeline=%d, body=%dB\n",
+               n_conns, n_ops, pipeline, body_size);
+    }
     printf("  Wall:   %.4f s\n", secs);
     printf("  Total:  %ld ops (put + reserve+delete)\n", total);
     printf("  Rate:   %.0f ops/s\n", total / secs);
@@ -350,7 +382,7 @@ static void run(void) {
 
 int main(int argc, char **argv) {
     int opt;
-    while ((opt = getopt(argc, argv, "h:p:c:n:P:B:")) != -1) {
+    while ((opt = getopt(argc, argv, "h:p:c:n:P:B:W:")) != -1) {
         switch (opt) {
         case 'h': host = optarg; break;
         case 'p': port = atoi(optarg); break;
@@ -358,10 +390,12 @@ int main(int argc, char **argv) {
         case 'n': n_ops = atoi(optarg); break;
         case 'P': pipeline = atoi(optarg); break;
         case 'B': body_size = atoi(optarg); break;
+        case 'W': n_watch = atoi(optarg); break;
         }
     }
     if (n_conns > MAX_CONNS) n_conns = MAX_CONNS;
     if (pipeline > PIPELINE_MAX) pipeline = PIPELINE_MAX;
+    if (n_watch < 0) n_watch = 0;
     run();
     return 0;
 }

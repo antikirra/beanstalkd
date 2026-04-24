@@ -495,6 +495,19 @@ struct Conn {
     Ms     watch;               // set of watched tubes (upstream-compatible)
     Job reserved_jobs;          // linked list header
 
+    // --- deferred-reply batch for durable group commit (invariant #16) ---
+    // in_dur_batch = 1 iff this conn has staged walwrite's this tick
+    // whose ack is still waiting for the epoll-end walcommit(). When set,
+    // reply() appends to dur_reply_buf instead of writing to the socket;
+    // the flush pass in dur_flush_all() drains the buffer after fdatasync
+    // completes (or sends INTERNAL_ERROR if the commit failed).
+    // dur_batch_idx is the position in the global batch array, used by
+    // connclose() for O(1) swap-remove.
+    int    in_dur_batch;
+    int    dur_batch_idx;
+    int    dur_reply_len;
+    char   dur_reply_buf[4096];
+
     // --- large buffers at end to avoid cache pollution ---
     char   cmd[LINE_BUF_SIZE];     // this string is NOT NUL-terminated
     char   reply_buf[LINE_BUF_SIZE]; // this string IS NUL-terminated
@@ -513,6 +526,16 @@ int  conndeadlinesoon(Conn *c);
 int conn_ready(Conn *c);
 void conn_reserve_job(Conn *c, Job *j);
 #define conn_waiting(c) ((c)->type & CONN_TYPE_WAITING)
+
+// Durable group-commit batch (invariant #16). WAL-dirty callsites mark
+// the conn via dur_enqueue() before reply(); reply() then appends the
+// ack text to c->dur_reply_buf instead of writing to the socket. After
+// the main loop's walcommit(), dur_flush_all(ok) drains every buffered
+// conn — sending the acks on success or INTERNAL_ERROR on commit
+// failure. No-op outside durable mode.
+void dur_enqueue(Conn *c);
+void dur_remove(Conn *c);
+void dur_flush_all(int ok);
 
 
 
@@ -560,8 +583,13 @@ struct Wal {
 };
 int  waldirlock(Wal*);
 void walinit(Wal*, Job *list);
+// walwrite / wal_write_truncate stage a record: writev + accounting,
+// fdatasync deferred. walcommit() issues one fdatasync covering every
+// staged record in w->cur; the serv main loop calls it once per epoll
+// drain (group commit — invariant #16).
 int  walwrite(Wal*, Job*);
 int  wal_write_truncate(Wal*, Tube*, uint64);
+int  walcommit(Wal*);
 int  walmaint(Wal*);
 int  walresvput(Wal*, Job*);
 int  walresvupdate(Wal*);
@@ -586,6 +614,12 @@ struct File {
     int  fd;
     int  free;
     int  resv;
+    // uncommitted_bytes: sum of bytes staged by filewritev since the last
+    // successful filewrcommit. Used for group-commit rollback: if the
+    // deferred fdatasync fails, we ftruncate this many bytes off the tail
+    // and undo accounting (see filewrcommit). Always 0 outside durable
+    // mode; async mode leaves filewrcommit a no-op and this stays at 0.
+    int  uncommitted_bytes;
     char *path;
     Wal  *w;
     ReadBuf *rbuf; // optional buffered reader, set during recovery
@@ -601,9 +635,15 @@ void filermjob(File*, Job*);
 int  fileread(File*, Job *list);
 void filewopen(File*);
 void filewclose(File*);
+// filewrjob{short,full} / filewrtruncate stage a WAL record (writev +
+// accounting; fdatasync deferred). filewrcommit issues one fdatasync
+// covering every staged record in f and either clears uncommitted_bytes
+// on success or ftruncates the tail + rolls back global counters on
+// failure. See invariant #16.
 int  filewrjobshort(File*, Job*);
 int  filewrjobfull(File*, Job*);
 int  filewrtruncate(File*, Tube*, uint64);
+int  filewrcommit(File*);
 
 
 #define Portdef "11300"

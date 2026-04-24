@@ -818,11 +818,19 @@ filewrite_commit_durable(File *f, int total)
     return 0;
 }
 
-// filewritev writes multiple buffers to f in a single writev syscall.
-// Performs the durable fdatasync inside the same function under -D so
-// that a zero return is unambiguous: bytes either not on disk, or their
-// durability cannot be verified and the tail has been rolled back.
-// Updates WAL accounting only on success. Returns 1 on success, 0 otherwise.
+// filewritev stages a WAL record: writev_all + accounting, NO fdatasync.
+// Accounting is applied immediately on success so each stage looks the
+// same to subsequent stages in the same batch; filewrcommit() later
+// issues one fdatasync covering every stage and rolls back both the
+// tail (ftruncate) and the global counters on failure. f->uncommitted_bytes
+// accumulates so the commit path knows how many bytes to reverse.
+//
+// Returns 1 on writev success (record is in page cache, not yet durable),
+// 0 on writev error (WAL caller disables w->use; tail best-effort
+// rolled back by writev_all's own rollback path). Per-job counters
+// (j->walresv, j->walused) are applied upfront and NOT reversed on
+// commit fail — acceptable because a commit fail disables the WAL and
+// the per-job slop is reclaimed at job_free (documented on filewrcommit).
 __attribute__((hot)) static int
 filewritev(File *f, Job *j, struct iovec *iov, int iovcnt)
 {
@@ -831,14 +839,54 @@ filewritev(File *f, Job *j, struct iovec *iov, int iovcnt)
         total += iov[i].iov_len;
 
     if (!writev_all(f->fd, iov, iovcnt, total)) return 0;
-    if (!filewrite_commit_durable(f, total)) return 0;
 
+    f->uncommitted_bytes += total;
     f->w->resv -= total;
     f->resv -= total;
     j->walresv -= total;
     j->walused += total;
     f->w->alive += total;
     return 1;
+}
+
+// filewrcommit — issue one fdatasync covering every filewritev
+// stage that landed on f since the last commit. On success, clears the
+// uncommitted_bytes counter. On failure, the existing
+// filewrite_commit_durable helper ftruncates the tail back by
+// uncommitted_bytes and the caller is expected to disable w->use.
+//
+// Accounting rollback on commit fail:
+//   filewritev applies accounting upfront so every stage in a batch
+//   looks the same to subsequent stages. If the batch commit fails and
+//   the tail is ftruncate'd away, those adjustments must be reversed
+//   or w->resv / w->alive drift from what the disk actually holds.
+//   Per-job counters (j->walresv, j->walused) would require a
+//   pending-job list on File; left as a known gap since walcommit
+//   disables the WAL on fail, after which no further walresv* /
+//   walwrite call references those per-job fields.
+//
+// In durable_sync=0 mode this is a no-op (matches legacy behaviour of
+// filewritev: fdatasync only fires under -D).
+int
+filewrcommit(File *f)
+{
+    int total = f->uncommitted_bytes;
+    if (total == 0) return 1;  // nothing staged — commit is a no-op
+    int r = filewrite_commit_durable(f, total);
+    if (!r) {
+        // Rollback global counters so they match the post-ftruncate
+        // tail. Matches the invariant that after a failed commit every
+        // byte the batch claimed to add to the file is gone from both
+        // disk AND accounting.
+        f->w->resv  += total;
+        f->resv     += total;
+        f->w->alive -= total;
+    }
+    // On success or rollback, the counter is drained: success leaves bytes
+    // durable, rollback has removed them from the tail. Either way the
+    // next batch starts fresh.
+    f->uncommitted_bytes = 0;
+    return r;
 }
 
 
@@ -918,6 +966,12 @@ filewrjobfull(File *f, Job *j)
 }
 
 
+// filewrtruncate stages a truncate-marker record (Invalid job, namelen>0,
+// jr.id=cutoff_id). Same stage semantics as filewrjob{short,full}: writev
+// + accounting now, fdatasync deferred to filewrcommit; tail ftruncate
+// and counter rollback on commit fail. Marker bytes are counted as live
+// so walgc's ratio() does not unlink a marker-only binlog before the
+// next compact_post re-emits the marker into w->cur (#701).
 int
 filewrtruncate(File *f, Tube *t, uint64 cutoff_id)
 {
@@ -951,16 +1005,10 @@ filewrtruncate(File *f, Tube *t, uint64 cutoff_id)
 
     int total = sizeof(int) + nl + sizeof(Jobrec) + sizeof body + sizeof(uint32);
     if (!writev_all(f->fd, iov, 5, total)) return 0;
-    // Durable commit BEFORE applying accounting. On fdatasync fail the
-    // tail is rolled back, so the caller's in-memory rollback of
-    // t->purge_before_id will match the disk state (#C2).
-    if (!filewrite_commit_durable(f, total)) return 0;
 
+    f->uncommitted_bytes += total;
     f->w->resv -= total;
     f->resv -= total;
-    // Count marker bytes as live so walgc's ratio() does not see a
-    // marker-only binlog as pure dead space and unlink it before the
-    // next compact_post re-emits the marker into w->cur (#701).
     f->w->alive += total;
     return 1;
 }

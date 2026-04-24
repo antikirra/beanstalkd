@@ -296,6 +296,11 @@ connclose(Conn *c)
         return; // already closed — guard against double-close/double-pool
     }
 
+    // Detach from durable-commit batch if pending; must happen before
+    // the pool slot could be reused, otherwise dur_flush_all() would
+    // write buffered acks to a recycled conn's fd.
+    dur_remove(c);
+
     job_free(c->in_job);
 
     /* was this a peek or stats command? */

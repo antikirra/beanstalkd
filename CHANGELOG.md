@@ -1,5 +1,103 @@
 # Changelog
 
+## 2026-04-24 — Durable group commit (-D)
+
+Group commit for `-D` mode. No wire-protocol change. Invariant #14
+(`ack ⇒ durable`) preserved; new invariant #16 documents the batch
+lifecycle.
+
+### Performance (Docker A/B, `-O2 -DNDEBUG`)
+
+Durable-pipelined workload (8 conns × pipeline=64 × 128B × -D):
+
+| Metric | Before | After | Δ |
+|---|---|---|---|
+| Throughput | 13K ops/s | 366K ops/s | **+2720%** |
+| P50 latency | 43 ms | 1.24 ms | **-97%** |
+| S10 / S1 ratio | 6.1% | 175% | — |
+
+Durable-serial (1 conn × pipeline=1 × 4B × -D) also improved (13K → 22K,
+P50 87µs → 54µs). Async mode (no `-D`) unchanged on all scenarios (S1–S8
+within variance). Deep-watch regression suspected at start of this
+iteration (S6, 500 tubes) was disproven — the `O(watched_tubes)` scan
+in the reserve fast-path is not a real bottleneck at current scale;
+the flat S6 result is Python-client GIL overhead, not server-side.
+
+### Changed
+
+- **`walwrite` / `wal_write_truncate` now stage records.** They perform
+  the writev and accounting but defer the fdatasync. The serv main
+  loop runs `walcommit(&s->wal); dur_flush_all(commit_ok);` once per
+  epoll drain, amortising one `fdatasync` over every WAL-dirty command
+  in the tick.
+- **`filewrjobshort`, `filewrjobfull`, `filewrtruncate`, `filewrcommit`,
+  `File::uncommitted_bytes`** — `file.c` API staged: writev + accounting
+  now, fdatasync deferred to `filewrcommit`. Commit failure ftruncates
+  the tail AND rolls back global WAL counters (`w->resv`, `f->resv`,
+  `w->alive`) so accounting matches the post-ftruncate disk.
+- **`Conn::dur_reply_buf` (4 KiB)** — deferred-ack buffer. WAL-dirty
+  callsites (OP_PUT success, OP_DELETE, OP_RELEASE, OP_BURY, OP_KICK,
+  OP_KICKJOB, OP_TOUCH, OP_TRUNCATE) now call `dur_enqueue(c)` before
+  `reply_*`; the hook at the top of `reply()` appends to the buffer
+  instead of the socket. `dur_flush_all(ok)` sends batched acks on
+  commit success or `INTERNAL_ERROR\r\n` on commit failure.
+- **`connclose` → `dur_remove`** — O(1) swap-remove from the batch
+  array so a conn that drops mid-tick cannot be followed to a dangling
+  pointer by the flush pass.
+
+### Tests
+
+Nine new hostile tests in `testinject2.c` (one pre-existing
+`zalloc_oom` failure, unrelated):
+
+- `cttest_inject_group_commit_fires_fdatasync_once_for_batch` — 5 stages
+  + 1 commit = 1 fdatasync; empty commit = no-op.
+- `cttest_inject_group_commit_rollback_disables_wal` — commit fail
+  ftruncates, disables WAL, `walwrite` refuses afterwards (#14).
+- `cttest_inject_group_commit_fail_rolls_back_global_counters` — w.resv,
+  f.resv, w.alive restored to pre-batch values on commit fail.
+- `cttest_dur_batch_swap_remove_preserves_indices` — middle-removal
+  updates survivors' `dur_batch_idx` correctly.
+- `cttest_dur_enqueue_noop_in_async_mode` — enqueue is a no-op without
+  `-D`.
+- `cttest_dur_enqueue_idempotent` — duplicate enqueue does not corrupt
+  indices.
+- `cttest_dur_flush_all_success_emits_buffered_replies` — socketpair:
+  buffered acks reach the peer byte-exact on commit success.
+- `cttest_dur_flush_all_failure_emits_internal_error` — socketpair:
+  `INTERNAL_ERROR\r\n` (not the buffered acks) reaches the peer on
+  commit fail. Protects invariant #14 on the wire.
+- `cttest_dur_flush_all_partial_write_saves_remainder` — socketpair
+  with saturated send buffer: partial write parks remainder on
+  `c->reply`/`c->reply_sent` with state `SEND_WORD` so the epoll 'w'
+  handler can finish.
+
+Two `testinject2.c` tests updated to match the new contract (walwrite
+stages; walcommit issues fdatasync): `cttest_inject_durable_fdatasync_fail_disables_wal`
+and `cttest_inject_durable_fdatasync_fires_once_on_success`.
+
+One `testinject2.c` test removed as now fully duplicated by the new
+group-commit coverage: `cttest_inject_durable_fdatasync_fail_rolls_back_tail`
+(its ftruncate + counter assertions live in
+`cttest_inject_group_commit_rollback_disables_wal` and
+`cttest_inject_group_commit_fail_rolls_back_global_counters`).
+
+### Known gap (documented, not blocking)
+
+Per-job counters (`j->walresv`, `j->walused`) are not rolled back on
+commit fail. Acceptable because `walcommit` fail disables the WAL and
+all subsequent `walresv*` / `walwrite` refuse (#14), so the per-job
+slop is reclaimed at `job_free`. Will need a pending-job list on `File`
+if a future design retries commits without disabling the WAL.
+
+### Benchmark harness additions
+
+`test/bench.c` gained `-W N` (deep-watch mode) and now reports P99.99
+and max. `test/benchmark.sh` gained S7 (deep-watch, tests
+`O(watched_tubes)` in reserve fast-path), S8 (100K-sample tail probe,
+replaces the too-noisy S2 P99.9 signal), S9 (`-D` serial), S10 (`-D`
+pipelined), plus `S9/S2` and `S10/S1` cost-of-durability ratios.
+
 ## 2026-04-24 — Wire-observable differences documented; systemd unit hardened
 
 No code changes — operator-facing documentation only, shipped ahead of the

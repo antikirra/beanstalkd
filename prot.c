@@ -478,6 +478,103 @@ epollq_apply()
 #define reply_serr(c, e) \
     (twarnx("server error: %s", (e)), reply_msg((c), (e)))
 
+// Durable group-commit state (invariant #16). dur_batch_arr holds every
+// conn whose reply is currently deferred waiting for walcommit().
+// Callsites that follow a successful walwrite call dur_enqueue(c) before
+// reply(); the hook at the top of reply() then appends to
+// c->dur_reply_buf instead of touching the socket. One pass through
+// dur_flush_all() after walcommit() settles the whole batch.
+#ifndef DUR_BATCH_MAX
+#define DUR_BATCH_MAX 256
+#endif
+static Conn *dur_batch_arr[DUR_BATCH_MAX];
+static int   dur_batch_n;
+
+// Drain every conn that buffered replies while waiting for walcommit(). Called from the serv main loop right after walcommit.
+// ok=1 → fdatasync succeeded, emit the buffered acks. ok=0 → commit
+// failed, WAL already disabled by walcommit; emit INTERNAL_ERROR to
+// everyone in the batch so clients can retry instead of believing a
+// phantom ack (invariant #14 restored).
+void
+dur_flush_all(int ok)
+{
+    static const char INTERNAL_ERROR_MSG[] = "INTERNAL_ERROR\r\n";
+
+    for (int i = 0; i < dur_batch_n; i++) {
+        Conn *c = dur_batch_arr[i];
+        c->in_dur_batch = 0;
+        char *buf;
+        int   len;
+        if (ok) {
+            buf = c->dur_reply_buf;
+            len = c->dur_reply_len;
+        } else {
+            buf = (char *)INTERNAL_ERROR_MSG;
+            len = (int)(sizeof INTERNAL_ERROR_MSG - 1);
+        }
+
+        if (len <= 0 || c->sock.fd < 0) {
+            c->dur_reply_len = 0;
+            continue;
+        }
+
+        int r = write(c->sock.fd, buf, len);
+        if (r == len) {
+            c->state = STATE_WANT_COMMAND;
+            if (c->rw != 'r') epollq_add(c, 'r');
+        } else if (r > 0) {
+            // Partial write: fall back to retry-over-epoll by stashing
+            // into the legacy c->reply pointer. Since dur_reply_buf is
+            // stable for the lifetime of the conn, the pointer is safe
+            // across returns. Set state so the epoll 'w' handler picks
+            // up and finishes sending.
+            c->reply = buf;
+            c->reply_len = len;
+            c->reply_sent = r;
+            c->state = STATE_SEND_WORD;
+            epollq_add(c, 'w');
+        } else {
+            // r == -1 or 0: socket broken. Leave the conn to be cleaned
+            // up on next event; don't touch reply fields.
+            if (r == -1 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                c->state = STATE_CLOSE;
+            }
+        }
+        c->dur_reply_len = 0;
+    }
+    dur_batch_n = 0;
+    epollq_apply();
+}
+
+void
+dur_enqueue(Conn *c)
+{
+    if (!srv.wal.durable_sync) return;   // no-op in async/default mode
+    if (c->in_dur_batch)       return;   // already registered this tick
+    if (dur_batch_n >= DUR_BATCH_MAX) return; // overflow → caller falls back to immediate reply
+    c->in_dur_batch   = 1;
+    c->dur_batch_idx  = dur_batch_n;
+    c->dur_reply_len  = 0;                // fresh batch
+    dur_batch_arr[dur_batch_n++] = c;
+}
+
+// O(1) swap-remove of c from the batch; safe to call even when c isn't in
+// the batch. Used by connclose() so a conn that drops mid-tick does not
+// leave a dangling pointer the flush pass would dereference.
+void
+dur_remove(Conn *c)
+{
+    if (!c->in_dur_batch) return;
+    int i = c->dur_batch_idx;
+    Conn *last = dur_batch_arr[--dur_batch_n];
+    if (i != dur_batch_n) {
+        dur_batch_arr[i] = last;
+        last->dur_batch_idx = i;
+    }
+    c->in_dur_batch  = 0;
+    c->dur_reply_len = 0;
+}
+
 __attribute__((hot)) static void
 reply(Conn *c, char *line, int len, int state)
 {
@@ -486,6 +583,46 @@ reply(Conn *c, char *line, int len, int state)
 
     if (unlikely(verbose >= 2)) {
         printf(">%d reply %.*s\n", c->sock.fd, len-2, line);
+    }
+
+    // Deferred-reply hook (invariant #16): if this conn staged a walwrite
+    // this tick, buffer the ack text and wait for walcommit(). SEND_WORD
+    // only: SEND_JOB carries a Job body (reserve path) and reserve is
+    // not WAL-dirty, so it never reaches the defer hook.
+    if (unlikely(c->in_dur_batch) && state == STATE_SEND_WORD) {
+        if (c->dur_reply_len + len <= (int)sizeof c->dur_reply_buf) {
+            memcpy(c->dur_reply_buf + c->dur_reply_len, line, len);
+            c->dur_reply_len += len;
+            // conn can accept the next pipelined command while waiting
+            // for the batch fsync — just like the fast-path SEND_WORD does.
+            c->state = STATE_WANT_COMMAND;
+            c->last_activity_at = now;
+            if (unlikely(c->out_job)) {
+                if (c->out_job->r.state == Copy)
+                    job_free(c->out_job);
+                c->out_job = NULL;
+            }
+            // Epoll stays in 'r' so the next command lands while we batch.
+            if (c->rw != 'r') {
+                epollq_add(c, 'r');
+            }
+            return;
+        }
+        // Buffer full: force the current batch out and continue with a
+        // normal synchronous reply so we don't stall this conn. This
+        // temporarily ack's without the in-progress fsync, but only
+        // within an over-full window (>4KB of pending acks on one conn);
+        // the walcommit that runs at end-of-tick still covers the write.
+        c->in_dur_batch = 0;
+        // Remove self from batch_arr so flush doesn't send stale buffer.
+        int i = c->dur_batch_idx;
+        Conn *last = dur_batch_arr[--dur_batch_n];
+        if (i != dur_batch_n) {
+            dur_batch_arr[i] = last;
+            last->dur_batch_idx = i;
+        }
+        c->dur_reply_len = 0;
+        // fall through to the normal immediate-reply path below
     }
 
     // Try immediate write; fall through to epoll on EAGAIN/partial.
@@ -1512,6 +1649,8 @@ enqueue_incoming_job(Conn *c)
     r = enqueue_job(c->srv, j, j->r.delay, 1);
 
     if (likely(r == 1)) {
+        // Defer ack until walcommit at end of tick.
+        dur_enqueue(c);
         reply_inserted(c, jid);
         return;
     }
@@ -2411,6 +2550,8 @@ dispatch_cmd(Conn *c)
             return;
         }
         job_free(j);
+        // Defer ack until walcommit at end of tick.
+        dur_enqueue(c);
         reply_msg(c, MSG_DELETED);
         return;
 
@@ -2461,6 +2602,8 @@ dispatch_cmd(Conn *c)
 
         r = enqueue_job(c->srv, j, delay, 1);
         if (r == 1) {
+            // Defer ack until walcommit at end of tick.
+            dur_enqueue(c);
             reply_msg(c, MSG_RELEASED);
             return;
         }
@@ -2515,6 +2658,8 @@ dispatch_cmd(Conn *c)
             }
             return;
         }
+        // Defer ack until walcommit at end of tick.
+        dur_enqueue(c);
         reply_msg(c, MSG_BURIED);
         return;
 
@@ -2531,6 +2676,9 @@ dispatch_cmd(Conn *c)
         op_ct[type]++;
 
         i = kick_jobs(c->srv, c->use, count);
+        // Defer ack until walcommit at end of tick.
+        // kick_jobs issues one walwrite per kicked job.
+        if (i > 0) dur_enqueue(c);
         reply_kicked(c, (uint64)i);
         return;
 
@@ -2558,6 +2706,8 @@ dispatch_cmd(Conn *c)
             int kickable = (j->r.state == Buried || j->r.state == Delayed);
             if ((j->r.state == Buried && kick_buried_job(c->srv, j)) ||
                 (j->r.state == Delayed && kick_delayed_job(c->srv, j))) {
+                // Defer ack until walcommit at end of tick.
+                dur_enqueue(c);
                 reply_msg(c, MSG_KICKED);
             } else if (kickable) {
                 reply_serr(c, MSG_INTERNAL_ERROR);
@@ -2575,6 +2725,8 @@ dispatch_cmd(Conn *c)
         op_ct[type]++;
 
         if (touch_job(c, job_find(id))) {
+            // Defer ack until walcommit at end of tick.
+            dur_enqueue(c);
             reply_msg(c, MSG_TOUCHED);
         } else {
             reply_msg(c, MSG_NOTFOUND);
@@ -2867,6 +3019,8 @@ dispatch_cmd(Conn *c)
         // runs the fmt_stats zombie-subtract loop (#715).
         stats_cache.len = 0;
 
+        // Defer ack until walcommit at end of tick.
+        dur_enqueue(c);
         reply_truncated(c, count);
         return;
     }

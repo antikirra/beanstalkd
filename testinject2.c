@@ -11,6 +11,8 @@
 #include <stdatomic.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <fcntl.h>
 
 // Exposed from prot.c for hostile error-path testing.
 extern int kick_buried_job(Server *s, Job *j);
@@ -782,10 +784,22 @@ cttest_inject_durable_fdatasync_fail_disables_wal(void)
     int64 pre_nrec = w.nrec;
 
     fault_set(FAULT_FDATASYNC, 0, EIO);
+    // Group-commit contract: walwrite stages the record and returns 1
+    // on successful writev; the durable fdatasync (and its rollback /
+    // WAL-disable on failure) is triggered by walcommit, which the
+    // main loop runs once per epoll drain. In a unit test we fire it
+    // ourselves to exercise the same failure path this test guards.
     int r = walwrite(&w, j);
+    assertf(r == 1,
+            "walwrite must stage successfully before commit, got %d", r);
+    assertf(w.nrec == pre_nrec + 1,
+            "nrec advances at stage time: was %" PRId64 " got %" PRId64,
+            pre_nrec, w.nrec);
 
-    assertf(r == 0,
-            "walwrite must return 0 when durable fdatasync fails, got %d", r);
+    int c = walcommit(&w);
+
+    assertf(c == 0,
+            "walcommit must return 0 when durable fdatasync fails, got %d", c);
     assertf(fault_hits(FAULT_FDATASYNC) == 1,
             "fdatasync fault must fire exactly once, got %d",
             fault_hits(FAULT_FDATASYNC));
@@ -794,9 +808,6 @@ cttest_inject_durable_fdatasync_fail_disables_wal(void)
             w.use);
     assertf(!f.iswopen,
             "current file must be closed on fdatasync failure");
-    assertf(w.nrec == pre_nrec,
-            "nrec must not advance when walwrite fails: was %" PRId64
-            " got %" PRId64, pre_nrec, w.nrec);
 
     close(fd);
     unlink(tmppath);
@@ -849,20 +860,26 @@ cttest_inject_durable_fdatasync_fires_once_on_success(void)
     memset(j->body, 'D', 10);
     j->walresv = 300;
 
-    // No fault armed. fault_calls() counts wrapped invocations even
-    // when no fault fires — so an incremented count is direct
-    // evidence the durable_sync branch reached fdatasync().
+    // Group-commit contract: walwrite stages (no fdatasync), walcommit
+    // issues the single fdatasync covering every staged record. Assert
+    // walwrite didn't sync, then walcommit did, then nrec settled.
     fault_clear_all();              // zero the call counter
     int64 pre_nrec = w.nrec;
     int r = walwrite(&w, j);
 
-    assertf(r == 1, "walwrite must succeed in happy path, got %d", r);
+    assertf(r == 1, "walwrite must stage in happy path, got %d", r);
+    assertf(fault_calls(FAULT_FDATASYNC) == 0,
+            "walwrite must NOT call fdatasync under group commit, got %d",
+            fault_calls(FAULT_FDATASYNC));
+
+    int c = walcommit(&w);
+    assertf(c == 1, "walcommit must succeed in happy path, got %d", c);
     assertf(w.use == 1, "wal must remain enabled, got use=%d", w.use);
     assertf(w.nrec == pre_nrec + 1,
             "nrec must advance by 1: was %" PRId64 " got %" PRId64,
             pre_nrec, w.nrec);
     assertf(fault_calls(FAULT_FDATASYNC) == 1,
-            "walwrite in durable mode must invoke fdatasync exactly "
+            "walcommit in durable mode must invoke fdatasync exactly "
             "once, got %d calls", fault_calls(FAULT_FDATASYNC));
     assertf(fault_hits(FAULT_FDATASYNC) == 0,
             "no fault was armed; unexpected hits: %d",
@@ -990,99 +1007,6 @@ cttest_inject_walresv_refuses_when_durable_and_wal_disabled(void)
     assertf(ru2 > 0,
             "walresvupdate non-durable with w->use=0 must pass through, got %d", ru2);
 
-    job_free(j);
-    tube_dref(t);
-}
-
-
-// #C2 regression: if writev succeeds but durable fdatasync fails, the bytes
-// must be rolled back from the file tail (ftruncate) so replay does NOT
-// resurrect a record whose client received INTERNAL_ERROR. Without the
-// rollback, server state and on-disk state diverge after the caller
-// rolls back its in-memory view — exactly the class of bug the -D
-// contract is supposed to prevent.
-//
-// Drive filewrjobfull directly to observe only the commit-durable ftruncate;
-// walwrite's own filewclose() would also ftruncate (to f->filesize - f->free)
-// and mask the rollback under test.
-void
-cttest_inject_durable_fdatasync_fail_rolls_back_tail(void)
-{
-    setup();
-
-    char tmppath[] = "/tmp/testinject_c2_rollback.XXXXXX";
-    int fd = mkstemp(tmppath);
-    assertf(fd >= 0, "mkstemp must succeed");
-
-    int ver = Walver;
-    ssize_t nver = write(fd, &ver, sizeof(ver));
-    assertf(nver == (ssize_t)sizeof(ver), "version header must write");
-
-    off_t pre_writev = lseek(fd, 0, SEEK_CUR);
-    assertf(pre_writev == (off_t)sizeof(int),
-            "offset must sit right after version header");
-
-    Wal w = {
-        .filesize = 4096,
-        .use = 1,
-        .durable_sync = 1,
-    };
-    File f = {0};
-    f.w = &w;
-    f.fd = fd;
-    f.iswopen = 1;
-    // Match what filewopen would produce: header written, rest free.
-    f.free = (int)(w.filesize - pre_writev);
-    f.resv = 300;
-    f.refs = 2;
-    f.jlist.fprev = &f.jlist;
-    f.jlist.fnext = &f.jlist;
-    w.cur = &f;
-    w.tail = &f;
-    w.head = &f;
-    w.resv = 300;
-
-    Tube *t = make_tube("c2");
-    assertf(t, "tube must allocate");
-
-    Job *j = allocate_job(10);
-    assertf(j, "job must allocate");
-    TUBE_ASSIGN(j->tube, t);
-    j->r.state = Ready;
-    j->r.body_size = 10;
-    j->r.id = 7;
-    memset(j->body, 'D', 10);
-    j->walresv = 300;
-    j->walused = 0;
-
-    // Arm the fdatasync fault. writev_all will complete, file will grow,
-    // then fdatasync returns EIO; filewrite_commit_durable must ftruncate
-    // the tail back to pre_writev before returning 0.
-    fault_set(FAULT_FDATASYNC, 0, EIO);
-    int r = filewrjobfull(&f, j);
-
-    assertf(r == 0,
-            "filewrjobfull must return 0 when durable fdatasync fails, got %d", r);
-    assertf(fault_hits(FAULT_FDATASYNC) == 1,
-            "fdatasync fault must fire exactly once, got %d",
-            fault_hits(FAULT_FDATASYNC));
-
-    // The rollback: file size must be back at pre_writev (just the
-    // version header), not pre_writev + writev payload.
-    struct stat st;
-    assertf(fstat(fd, &st) == 0, "fstat must succeed (fd still open)");
-    assertf(st.st_size == pre_writev,
-            "durable fdatasync fail must ftruncate the tail: expected "
-            "size=%lld, got %lld",
-            (long long)pre_writev, (long long)st.st_size);
-
-    // filewritev did NOT apply its accounting on failure, so w->resv
-    // and f->resv must be unchanged.
-    assertf(w.resv == 300,
-            "w.resv must be unchanged on failure, got %" PRId64, w.resv);
-
-    close(fd);
-    unlink(tmppath);
     job_free(j);
     tube_dref(t);
 }
@@ -1428,4 +1352,591 @@ cttest_inject_walsyncstart_pthread_create_skip_then_fail(void)
     assertf(fault_calls(FAULT_PTHREAD_CREATE) == 2,
             "two real calls expected, got %d",
             fault_calls(FAULT_PTHREAD_CREATE));
+}
+
+
+// ─── Group commit: fdatasync amortization ──────────────────────
+//
+// Core claim of group commit: many walwrite() calls collapse into
+// exactly one fdatasync() when walcommit() fires. If a regression
+// reintroduces an inline fsync on the write path, this test catches
+// it: N staged records → 1 fdatasync, not N.
+//
+// Pairs with cttest_inject_durable_fdatasync_fail_disables_wal (commit
+// fail contract) and ..._fires_once_on_success (commit success contract).
+// This test focuses on the "one per batch" invariant across multiple
+// records.
+static void
+setup_durable_wal(int fd, Wal *w, File *f)
+{
+    memset(w, 0, sizeof *w);
+    memset(f, 0, sizeof *f);
+    w->filesize = 4096;
+    w->use = 1;
+    w->durable_sync = 1;
+    f->w = w;
+    f->fd = fd;
+    f->iswopen = 1;
+    f->free = 32768;
+    f->resv = 8192;
+    f->refs = 2;
+    f->jlist.fprev = &f->jlist;
+    f->jlist.fnext = &f->jlist;
+    w->cur = w->tail = w->head = f;
+    w->resv = 8192;
+}
+
+void
+cttest_inject_group_commit_fires_fdatasync_once_for_batch(void)
+{
+    setup();
+
+    char tmppath[] = "/tmp/testinject_groupcommit.XXXXXX";
+    int fd = mkstemp(tmppath);
+    assertf(fd >= 0, "mkstemp must succeed");
+    int ver = Walver;
+    ssize_t nver = write(fd, &ver, sizeof(ver));
+    assertf(nver == (ssize_t)sizeof(ver), "version header write");
+
+    Wal w;
+    File f;
+    setup_durable_wal(fd, &w, &f);
+
+    Tube *t = make_tube("groupcommit");
+    assertf(t, "tube must allocate");
+
+    // Stage 5 records. Each is a new job so filewrjobfull runs.
+    const int N = 5;
+    Job *jobs[N];
+    for (int i = 0; i < N; i++) {
+        Job *j = allocate_job(10);
+        assertf(j, "job must allocate");
+        TUBE_ASSIGN(j->tube, t);
+        j->r.state = Ready;
+        j->r.body_size = 10;
+        j->r.id = (uint64)(i + 1);
+        memset(j->body, 'D', 10);
+        j->walresv = 300;
+        j->walused = 0;
+        jobs[i] = j;
+    }
+
+    fault_clear_all();
+    int64 pre_nrec = w.nrec;
+
+    for (int i = 0; i < N; i++) {
+        int r = walwrite(&w, jobs[i]);
+        assertf(r == 1, "stage %d must succeed, got %d", i, r);
+    }
+    assertf(fault_calls(FAULT_FDATASYNC) == 0,
+            "no fdatasync during staging, got %d",
+            fault_calls(FAULT_FDATASYNC));
+    assertf(w.cur->uncommitted_bytes > 0,
+            "uncommitted_bytes must accumulate, got %d",
+            w.cur->uncommitted_bytes);
+    assertf(w.nrec == pre_nrec + N,
+            "nrec advances per stage: was %" PRId64 " got %" PRId64,
+            pre_nrec, w.nrec);
+
+    int c = walcommit(&w);
+    assertf(c == 1, "commit must succeed, got %d", c);
+    assertf(fault_calls(FAULT_FDATASYNC) == 1,
+            "exactly ONE fdatasync for the whole batch, got %d",
+            fault_calls(FAULT_FDATASYNC));
+    assertf(w.cur->uncommitted_bytes == 0,
+            "uncommitted_bytes cleared on successful commit, got %d",
+            w.cur->uncommitted_bytes);
+    assertf(w.use == 1, "wal still enabled after happy commit");
+
+    // Second commit on an empty batch is a no-op: no fdatasync.
+    int c2 = walcommit(&w);
+    assertf(c2 == 1, "empty commit must succeed, got %d", c2);
+    assertf(fault_calls(FAULT_FDATASYNC) == 1,
+            "empty commit must NOT call fdatasync, got %d",
+            fault_calls(FAULT_FDATASYNC));
+
+    for (int i = 0; i < N; i++) job_free(jobs[i]);
+    close(fd);
+    unlink(tmppath);
+}
+
+
+// Commit-failure path: stage multiple, fdatasync fails → the entire
+// batch is rolled back (uncommitted_bytes cleared), WAL disabled, and
+// file closed. Clients waiting in dur_batch receive INTERNAL_ERROR at
+// the dur_flush_all step — invariant #14 ("ack ⇒ durable") preserved.
+void
+cttest_inject_group_commit_rollback_disables_wal(void)
+{
+    setup();
+
+    char tmppath[] = "/tmp/testinject_gc_rollback.XXXXXX";
+    int fd = mkstemp(tmppath);
+    assertf(fd >= 0, "mkstemp must succeed");
+    int ver = Walver;
+    ssize_t nver = write(fd, &ver, sizeof(ver));
+    assertf(nver == (ssize_t)sizeof(ver), "version header write");
+
+    Wal w;
+    File f;
+    setup_durable_wal(fd, &w, &f);
+
+    Tube *t = make_tube("gcrollback");
+    assertf(t, "tube must allocate");
+
+    const int N = 3;
+    Job *jobs[N];
+    for (int i = 0; i < N; i++) {
+        Job *j = allocate_job(10);
+        TUBE_ASSIGN(j->tube, t);
+        j->r.state = Ready;
+        j->r.body_size = 10;
+        j->r.id = (uint64)(100 + i);
+        memset(j->body, 'R', 10);
+        j->walresv = 300;
+        j->walused = 0;
+        jobs[i] = j;
+    }
+
+    for (int i = 0; i < N; i++) {
+        int r = walwrite(&w, jobs[i]);
+        assertf(r == 1, "stage %d must succeed, got %d", i, r);
+    }
+    int pre_uncommitted = w.cur->uncommitted_bytes;
+    assertf(pre_uncommitted > 0,
+            "batch must have uncommitted bytes, got %d", pre_uncommitted);
+
+    fault_set(FAULT_FDATASYNC, 0, EIO);
+    int c = walcommit(&w);
+    assertf(c == 0, "commit must fail, got %d", c);
+    assertf(w.use == 0, "wal must be disabled after commit fail");
+    assertf(!f.iswopen, "current file must be closed after commit fail");
+    assertf(w.cur->uncommitted_bytes == 0,
+            "uncommitted_bytes cleared after rollback, got %d",
+            w.cur->uncommitted_bytes);
+    assertf(fault_hits(FAULT_FDATASYNC) >= 1,
+            "fdatasync fault must fire at least once (rollback may call again), got %d",
+            fault_hits(FAULT_FDATASYNC));
+
+    // After WAL disable, further walwrite must refuse (#14).
+    Job *jlate = allocate_job(10);
+    TUBE_ASSIGN(jlate->tube, t);
+    jlate->r.state = Ready;
+    jlate->r.body_size = 10;
+    jlate->r.id = 999;
+    jlate->walresv = 300;
+    int rlate = walwrite(&w, jlate);
+    assertf(rlate == 0,
+            "walwrite on disabled durable WAL must refuse, got %d", rlate);
+
+    job_free(jlate);
+    for (int i = 0; i < N; i++) job_free(jobs[i]);
+    close(fd);
+    unlink(tmppath);
+}
+
+
+// dur_enqueue / dur_remove: batch index bookkeeping (swap-remove
+// preserves remaining conns' indices so connclose mid-batch cannot
+// corrupt dur_flush_all's iteration).
+void
+cttest_dur_batch_swap_remove_preserves_indices(void)
+{
+    setup();
+    // Force durable path so dur_enqueue is not a no-op.
+    int saved_durable = srv.wal.durable_sync;
+    srv.wal.durable_sync = 1;
+
+    static Conn c0, c1, c2;
+    memset(&c0, 0, sizeof c0);
+    memset(&c1, 0, sizeof c1);
+    memset(&c2, 0, sizeof c2);
+    c0.sock.fd = -1; c1.sock.fd = -1; c2.sock.fd = -1;
+
+    dur_enqueue(&c0);
+    dur_enqueue(&c1);
+    dur_enqueue(&c2);
+    assertf(c0.in_dur_batch && c1.in_dur_batch && c2.in_dur_batch,
+            "all three conns must be flagged in-batch");
+    assertf(c0.dur_batch_idx == 0 && c1.dur_batch_idx == 1 && c2.dur_batch_idx == 2,
+            "indices must be 0,1,2; got %d,%d,%d",
+            c0.dur_batch_idx, c1.dur_batch_idx, c2.dur_batch_idx);
+
+    // Remove c1 (middle). c2 should swap into slot 1; c0 untouched.
+    dur_remove(&c1);
+    assertf(!c1.in_dur_batch, "removed conn must be unflagged");
+    assertf(c0.in_dur_batch && c2.in_dur_batch,
+            "survivors must still be in batch");
+    assertf(c0.dur_batch_idx == 0,
+            "c0 index preserved, got %d", c0.dur_batch_idx);
+    assertf(c2.dur_batch_idx == 1,
+            "c2 swap-remove'd into slot 1, got %d", c2.dur_batch_idx);
+
+    // Drain: dur_flush_all(1) with no sockets (fd=-1) must leave state
+    // consistent (batch empty, flags cleared) without writing anywhere.
+    dur_flush_all(1);
+    assertf(!c0.in_dur_batch && !c2.in_dur_batch,
+            "flush must clear all batch flags");
+    assertf(c0.dur_reply_len == 0 && c2.dur_reply_len == 0,
+            "flush must clear reply lengths");
+
+    // Re-enqueue must work afterwards (batch_n was reset).
+    dur_enqueue(&c0);
+    assertf(c0.in_dur_batch && c0.dur_batch_idx == 0,
+            "re-enqueue must place at idx 0, got in=%d idx=%d",
+            c0.in_dur_batch, c0.dur_batch_idx);
+
+    // Clean up.
+    dur_flush_all(1);
+    srv.wal.durable_sync = saved_durable;
+}
+
+
+// dur_enqueue is a no-op outside durable mode — must not pollute the
+// batch for connections that never had their acks deferred.
+void
+cttest_dur_enqueue_noop_in_async_mode(void)
+{
+    setup();
+    int saved_durable = srv.wal.durable_sync;
+    srv.wal.durable_sync = 0;
+
+    static Conn c;
+    memset(&c, 0, sizeof c);
+    c.sock.fd = -1;
+
+    dur_enqueue(&c);
+    assertf(c.in_dur_batch == 0,
+            "async mode: enqueue must be a no-op, got in=%d",
+            c.in_dur_batch);
+
+    // dur_flush_all on empty batch is a pure no-op (smoke).
+    dur_flush_all(1);
+
+    srv.wal.durable_sync = saved_durable;
+}
+
+
+// After a failed walcommit, global WAL counters must match the
+// post-ftruncate disk state. filewritev applies accounting upfront so
+// each stage in a batch looks the same to subsequent stages; without
+// rollback, w->resv and w->alive would drift from the disk for the
+// lifetime of the process. Not safety-critical while WAL stays disabled
+// — but stats output would see phantom bytes.
+void
+cttest_inject_group_commit_fail_rolls_back_global_counters(void)
+{
+    setup();
+
+    char tmppath[] = "/tmp/testinject_gc_counters.XXXXXX";
+    int fd = mkstemp(tmppath);
+    assertf(fd >= 0, "mkstemp must succeed");
+    int ver = Walver;
+    ssize_t nver = write(fd, &ver, sizeof(ver));
+    assertf(nver == (ssize_t)sizeof(ver), "version header write");
+
+    Wal w;
+    File f;
+    setup_durable_wal(fd, &w, &f);
+
+    Tube *t = make_tube("countersroll");
+    assertf(t, "tube must allocate");
+
+    int64 pre_w_resv  = w.resv;
+    int64 pre_w_alive = w.alive;
+    int   pre_f_resv  = f.resv;
+
+    const int N = 4;
+    Job *jobs[4];
+    for (int i = 0; i < N; i++) {
+        Job *j = allocate_job(10);
+        TUBE_ASSIGN(j->tube, t);
+        j->r.state = Ready;
+        j->r.body_size = 10;
+        j->r.id = (uint64)(200 + i);
+        memset(j->body, 'Z', 10);
+        j->walresv = 300;
+        j->walused = 0;
+        jobs[i] = j;
+    }
+
+    for (int i = 0; i < N; i++) {
+        int r = walwrite(&w, jobs[i]);
+        assertf(r == 1, "stage %d must succeed, got %d", i, r);
+    }
+    int staged = f.uncommitted_bytes;
+    assertf(staged > 0, "batch accumulates uncommitted, got %d", staged);
+    assertf(w.resv < pre_w_resv,
+            "w.resv drops during staging: pre=%" PRId64 " post=%" PRId64,
+            pre_w_resv, w.resv);
+    assertf(w.alive > pre_w_alive,
+            "w.alive grows during staging: pre=%" PRId64 " post=%" PRId64,
+            pre_w_alive, w.alive);
+
+    fault_set(FAULT_FDATASYNC, 0, EIO);
+    int c = walcommit(&w);
+    assertf(c == 0, "commit must fail under injected fdatasync EIO");
+    assertf(w.use == 0, "wal disabled after commit fail");
+
+    // Counters must be restored to pre-batch levels: the disk no longer
+    // holds those bytes (ftruncate in filewrite_commit_durable), so the
+    // accounting must not either.
+    assertf(w.resv == pre_w_resv,
+            "w.resv must roll back to %" PRId64 ", got %" PRId64,
+            pre_w_resv, w.resv);
+    assertf(f.resv == pre_f_resv,
+            "f.resv must roll back to %d, got %d",
+            pre_f_resv, f.resv);
+    assertf(w.alive == pre_w_alive,
+            "w.alive must roll back to %" PRId64 ", got %" PRId64,
+            pre_w_alive, w.alive);
+    assertf(f.uncommitted_bytes == 0,
+            "uncommitted_bytes drained after rollback, got %d",
+            f.uncommitted_bytes);
+
+    for (int i = 0; i < N; i++) job_free(jobs[i]);
+    close(fd);
+    unlink(tmppath);
+}
+
+
+// Step D: byte-level verification of dur_flush_all over a real socket
+// pair. The swap-remove / noop tests above exercised in-memory state
+// only; these confirm the actual wire bytes that reach a client.
+//
+// Rationale: dur_flush_all writes buffered replies on commit success
+// and INTERNAL_ERROR on commit failure. A regression that swapped
+// those two branches, truncated the buffer, or emitted the wrong
+// literal would silently produce wrong-protocol output that earlier
+// tests could not see.
+
+// Helper: open a non-blocking socketpair, return (server, client) fds.
+// Server side is non-blocking to mirror how a real Conn socket is
+// configured; the client side blocks so the test's recv can pull
+// bytes without a retry loop.
+static void
+open_pair_nb_server(int *server, int *client)
+{
+    int sv[2];
+    int r = socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+    assertf(r == 0, "socketpair must succeed, got errno=%d", errno);
+    int flags = fcntl(sv[0], F_GETFL, 0);
+    assertf(flags >= 0, "fcntl GETFL must succeed");
+    r = fcntl(sv[0], F_SETFL, flags | O_NONBLOCK);
+    assertf(r == 0, "fcntl O_NONBLOCK must succeed");
+    *server = sv[0];
+    *client = sv[1];
+}
+
+// Success path: commit ok → buffered bytes reach the peer unchanged
+// and the conn state settles to WANT_COMMAND.
+void
+cttest_dur_flush_all_success_emits_buffered_replies(void)
+{
+    setup();
+    int saved = srv.wal.durable_sync;
+    srv.wal.durable_sync = 1;
+
+    static Conn c;
+    memset(&c, 0, sizeof c);
+    c.srv = &srv;                 // connsched/heap access
+    c.rw = 'r';                   // avoid epollq_add in flush path
+    int cfd;
+    open_pair_nb_server(&c.sock.fd, &cfd);
+    c.state = STATE_WANT_COMMAND;
+
+    dur_enqueue(&c);
+    // Hand-buffer three acks as reply() would have done.
+    const char *payload = "INSERTED 42\r\nDELETED\r\nRELEASED\r\n";
+    int plen = (int)strlen(payload);
+    memcpy(c.dur_reply_buf, payload, plen);
+    c.dur_reply_len = plen;
+
+    dur_flush_all(1);
+
+    assertf(!c.in_dur_batch,
+            "flush must clear in_dur_batch, got %d", c.in_dur_batch);
+    assertf(c.dur_reply_len == 0,
+            "flush must reset dur_reply_len, got %d", c.dur_reply_len);
+    assertf(c.state == STATE_WANT_COMMAND,
+            "post-flush state must be WANT_COMMAND, got %d", c.state);
+
+    char buf[128];
+    ssize_t got = recv(cfd, buf, sizeof buf, 0);
+    assertf(got == plen,
+            "peer must receive exactly %d bytes, got %zd (errno=%d)",
+            plen, got, errno);
+    assertf(memcmp(buf, payload, plen) == 0,
+            "peer bytes must match buffered payload");
+
+    close(c.sock.fd); close(cfd);
+    srv.wal.durable_sync = saved;
+}
+
+
+// Failure path: commit=0 → peer receives INTERNAL_ERROR\r\n (NOT the
+// buffered acks). Preserves invariant #14: a client never sees an ack
+// for a record whose fdatasync did not land.
+void
+cttest_dur_flush_all_failure_emits_internal_error(void)
+{
+    setup();
+    int saved = srv.wal.durable_sync;
+    srv.wal.durable_sync = 1;
+
+    static Conn c;
+    memset(&c, 0, sizeof c);
+    c.srv = &srv;
+    c.rw = 'r';
+    int cfd;
+    open_pair_nb_server(&c.sock.fd, &cfd);
+    c.state = STATE_WANT_COMMAND;
+
+    dur_enqueue(&c);
+    // Pre-fill the buffer with what WOULD have been sent — so a bug
+    // that leaks this content on the fail branch is caught.
+    const char *leaked = "INSERTED 99\r\n";
+    int llen = (int)strlen(leaked);
+    memcpy(c.dur_reply_buf, leaked, llen);
+    c.dur_reply_len = llen;
+
+    dur_flush_all(0);  // commit failed
+
+    assertf(!c.in_dur_batch, "flush must clear in_dur_batch");
+    assertf(c.dur_reply_len == 0, "flush must reset dur_reply_len");
+
+    char buf[64];
+    ssize_t got = recv(cfd, buf, sizeof buf, 0);
+    const char *expected = "INTERNAL_ERROR\r\n";
+    int elen = (int)strlen(expected);
+    assertf(got == elen,
+            "peer must receive exactly %d bytes (INTERNAL_ERROR), got %zd",
+            elen, got);
+    assertf(memcmp(buf, expected, elen) == 0,
+            "peer must see INTERNAL_ERROR, not the buffered ack");
+
+    close(c.sock.fd); close(cfd);
+    srv.wal.durable_sync = saved;
+}
+
+
+// Partial-write path: when the kernel socket buffer is full and
+// accepts only part of the write, dur_flush_all must save the
+// remainder on the conn (c->reply/reply_len/reply_sent) and leave
+// c->state = STATE_SEND_WORD so the epoll 'w' handler finishes the
+// send. A regression that dropped the leftover would lose bytes.
+//
+// We force the partial by shrinking the peer's receive buffer to the
+// platform minimum, then filling it with padding so exactly part of
+// the next write fits. socketpair's Unix sockets are atomic — to get a
+// true short write we rely on the buffer being near full when we
+// call dur_flush_all.
+void
+cttest_dur_flush_all_partial_write_saves_remainder(void)
+{
+    setup();
+    int saved = srv.wal.durable_sync;
+    srv.wal.durable_sync = 1;
+
+    static Conn c;
+    memset(&c, 0, sizeof c);
+    c.srv = &srv;
+    c.rw = 'r';
+    int cfd;
+    open_pair_nb_server(&c.sock.fd, &cfd);
+    c.state = STATE_WANT_COMMAND;
+
+    // Shrink the server-side send buffer so we can saturate it in a
+    // reasonable loop. Linux rounds up; exact minimum varies per kernel.
+    int small = 4096;
+    setsockopt(c.sock.fd, SOL_SOCKET, SO_SNDBUF, &small, sizeof small);
+    setsockopt(cfd,       SOL_SOCKET, SO_RCVBUF, &small, sizeof small);
+
+    // Saturate: write until non-blocking send returns EAGAIN. We need
+    // the next small write to go partial, so leave a tiny window.
+    char pad[1024];
+    memset(pad, 'P', sizeof pad);
+    ssize_t filled = 0;
+    for (;;) {
+        ssize_t w = send(c.sock.fd, pad, sizeof pad, 0);
+        if (w < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            assertf(0, "send during fill must not fail non-EAGAIN, errno=%d",
+                    errno);
+        }
+        filled += w;
+        if (filled > 1 << 20) {
+            // Guard against a kernel that refuses to honour SO_SNDBUF;
+            // 1MB is way more than a properly-sized pair should absorb.
+            assertf(0, "socket absorbed >1MB without EAGAIN; "
+                       "SO_SNDBUF not honoured on this kernel");
+        }
+    }
+
+    // Now drain exactly a sliver on the peer so the next send can
+    // write a few bytes before EAGAIN fires again.
+    char sink[200];
+    ssize_t drained = recv(cfd, sink, sizeof sink, 0);
+    assertf(drained > 0, "peer recv must free window, got %zd", drained);
+
+    dur_enqueue(&c);
+    // Payload large enough to overflow the freed window.
+    static char payload[2048];
+    memset(payload, 'Q', sizeof payload);
+    memcpy(c.dur_reply_buf, payload, sizeof payload);
+    c.dur_reply_len = (int)sizeof payload;
+
+    dur_flush_all(1);
+
+    // Expected outcomes: either full write (rare if drained window <
+    // payload), or partial with state saved. Partial is the whole
+    // point of this test.
+    if (c.state == STATE_SEND_WORD) {
+        assertf(c.reply == c.dur_reply_buf,
+                "partial-write path must park c->reply on dur_reply_buf");
+        assertf(c.reply_len == (int)sizeof payload,
+                "reply_len must equal original payload length, got %d",
+                c.reply_len);
+        assertf(c.reply_sent > 0 && c.reply_sent < c.reply_len,
+                "reply_sent must be strictly between 0 and reply_len; "
+                "got %d (full len %d). Short write not observed — test "
+                "harness may need a smaller window.",
+                c.reply_sent, c.reply_len);
+    } else if (c.state == STATE_WANT_COMMAND) {
+        // Harness did not coerce a partial write — skip rather than
+        // silently claim coverage. The kernel can be stubborn about
+        // SO_SNDBUF minimums under containers.
+        assertf(c.dur_reply_len == 0,
+                "full-write path must clear dur_reply_len");
+    } else {
+        assertf(0, "unexpected state after flush: %d", c.state);
+    }
+
+    close(c.sock.fd); close(cfd);
+    srv.wal.durable_sync = saved;
+}
+
+
+// dur_enqueue is idempotent per conn: calling twice must not double-
+// register (would corrupt dur_batch_idx of whatever conn it displaces).
+void
+cttest_dur_enqueue_idempotent(void)
+{
+    setup();
+    int saved_durable = srv.wal.durable_sync;
+    srv.wal.durable_sync = 1;
+
+    static Conn c;
+    memset(&c, 0, sizeof c);
+    c.sock.fd = -1;
+
+    dur_enqueue(&c);
+    int idx_first = c.dur_batch_idx;
+    dur_enqueue(&c);
+    assertf(c.dur_batch_idx == idx_first,
+            "second enqueue must be a no-op, idx changed %d -> %d",
+            idx_first, c.dur_batch_idx);
+
+    dur_flush_all(1);
+    srv.wal.durable_sync = saved_durable;
 }

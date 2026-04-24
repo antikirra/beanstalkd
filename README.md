@@ -47,7 +47,7 @@ No upstream command, response string, error string, stats key, or CLI flag was r
 | Job memory | malloc/free per job | 11 size classes, O(1) pool reuse |
 | WAL compaction | Broken on release cycles | Fixed alive tracking |
 | WAL integrity | None | CRC32C per record (v8 format, SSE4.2) |
-| WAL durability | Async only, errors can be silently dropped | Async with `_Atomic` error signalling + EINTR retry; opt-in synchronous `-D` (`ack ⇒ durable`) |
+| WAL durability | Async only, errors can be silently dropped | Async with `_Atomic` error signalling + EINTR retry; opt-in synchronous `-D` (`ack ⇒ durable`) with **group commit** — one `fdatasync` per event-loop tick amortises across every staged record, durable pipelined throughput now matches async mode |
 | Tube hash | Stock DJB2 | wyhash v4 (avalanche + length-aware) |
 | Heap layout | Binary (2-ary) | 4-ary (shallower, cache-line-fit children) |
 | Crash/data bugs | 22+ open in upstream tracker | see §Bug fixes and `CHANGELOG.md` |
@@ -103,7 +103,7 @@ u64toa two-digit pair table. reply_inserted/reply_job backward build into reply_
 11-class job pool (64B-64KB, `__attribute__((malloc))`). Cache-line Conn/Tube struct layout. Conn slab pool (256). Incremental rehash (16 buckets/op, dual-table). wyhash (final v4) tube hash with hash-first filter and length-aware API. MALLOC_ARENA_MAX=1. Periodic malloc_trim.
 
 **WAL:**
-Async fsync thread (_Atomic error signaling). Optional synchronous mode via `-D` (`ack ⇒ durable`, blocking fdatasync per write, EINTR-aware retry). writev records with per-record CRC32C trailer (v8 format, Intel SSE4.2 `_mm_crc32_u64` ~0.33 cyc/byte, negligible overhead). fallocate prealloc. Rate-limited compaction with correct alive tracking. Lock-free error check. Readahead on recovery. _Static_assert guards on WAL record sizes. Transparent v7 binlog replay for upgrade from upstream.
+Async fsync thread (_Atomic error signaling). Optional synchronous mode via `-D` (`ack ⇒ durable`, EINTR-aware retry) with **group commit**: `walwrite` stages the record (writev + accounting) without fsync, the event loop batches every WAL-dirty command in the current epoll drain, and one `walcommit` issues a single `fdatasync` covering the whole batch before acks fan out. Buffered replies land in `Conn::dur_reply_buf` and are drained by `dur_flush_all` after commit; commit failure ftruncates the tail, rolls back global counters, disables the WAL, and emits `INTERNAL_ERROR` to every conn in the batch — `ack ⇒ durable` holds. writev records with per-record CRC32C trailer (v8 format, Intel SSE4.2 `_mm_crc32_u64` ~0.33 cyc/byte, negligible overhead). fallocate prealloc. Rate-limited compaction with correct alive tracking. Lock-free error check. Readahead on recovery. _Static_assert guards on WAL record sizes. Transparent v7 binlog replay for upgrade from upstream.
 
 **Network:**
 TCP_FASTOPEN(1024). TCP_DEFER_ACCEPT. TCP_NOTSENT_LOWAT(16KB). TCP_USER_TIMEOUT(30s). SO_INCOMING_CPU. sched_setaffinity.
@@ -115,7 +115,7 @@ TCP_FASTOPEN(1024). TCP_DEFER_ACCEPT. TCP_NOTSENT_LOWAT(16KB). TCP_USER_TIMEOUT(
 | `-b DIR` | — | WAL directory (enables persistence) |
 | `-f MS` | 50 | fsync interval (0 = every write) |
 | `-F` | | Never fsync |
-| `-D` | | Durable: block on fdatasync per WAL write; `ack ⇒ durable` (implies `-F`, needs `-b`) |
+| `-D` | | Durable: one fdatasync per event-loop tick (group commit); `ack ⇒ durable` (implies `-F`, needs `-b`) |
 | `-l ADDR` | 0.0.0.0 | Listen address (`unix:` for Unix socket) |
 | `-p PORT` | 11300 | Listen port |
 | `-z BYTES` | 65535 | Max job body size |
