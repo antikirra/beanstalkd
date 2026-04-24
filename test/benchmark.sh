@@ -183,6 +183,125 @@ print(f'{total/wall:.0f}')
     echo "  S6 500 tubes:   $s6rate ops/s"
     stop $pid $port; rm -rf "$w"
 
+    # S11: 10K tubes (Python) — stress tube_find hash chain walk.
+    # wyhash v4 spreads 10K names across 4096 fixed buckets → avg chain ≈ 2.4.
+    # Tests hypothesis 1.4 (tube hash dynamic resize).
+    w="/tmp/wal-$label-s11-$$"; rm -rf "$w"; mkdir -p "$w"
+    $bin $extra -p $port -b "$w" -f 50 >/dev/null 2>&1 &
+    pid=$!; sleep 1
+    local s11rate
+    s11rate=$(python3 -c "
+import socket, time, threading, random
+PORT=$port; random.seed(99); N_TUBES=10000; JOBS_PER_TUBE=10; results=[]
+def worker(bs, bsz):
+    s=socket.socket(); s.setsockopt(socket.IPPROTO_TCP,socket.TCP_NODELAY,1)
+    s.settimeout(240); s.connect(('127.0.0.1',PORT)); buf=b''
+    def rl():
+        nonlocal buf
+        while b'\r\n' not in buf: buf+=s.recv(8192)
+        i=buf.index(b'\r\n'); r=buf[:i]; buf=buf[i+2:]; return r
+    def rn(n):
+        nonlocal buf
+        while len(buf)<n: buf+=s.recv(8192)
+        r=buf[:n]; buf=buf[n:]; return r
+    t0=time.monotonic(); ops=0
+    for t in range(bs,bs+bsz):
+        tube=f'mtube-{t:06d}'.encode()
+        s.sendall(b'use '+tube+b'\r\n'); rl()
+        s.sendall(b'watch '+tube+b'\r\n'); rl()
+        body=b'x'*64
+        put_cmd=b'put 1024 0 60 64\r\n'+body+b'\r\n'
+        for _ in range(JOBS_PER_TUBE): s.sendall(put_cmd); rl(); ops+=1
+        for _ in range(JOBS_PER_TUBE):
+            s.sendall(b'reserve-with-timeout 0\r\n')
+            parts=rl().split(); rn(int(parts[2])+2)
+            s.sendall(b'delete '+parts[1]+b'\r\n'); rl(); ops+=1
+        s.sendall(b'ignore '+tube+b'\r\n'); rl()
+    results.append((ops, time.monotonic()-t0)); s.close()
+t0=time.monotonic(); per=N_TUBES//4
+threads=[threading.Thread(target=worker,args=(i*per,per)) for i in range(4)]
+for t in threads: t.start()
+for t in threads: t.join()
+wall=time.monotonic()-t0; total=sum(r[0] for r in results)
+print(f'{total/wall:.0f}')
+" 2>/dev/null)
+    eval "${label}_s11='$s11rate'"
+    echo "  S11 10K tubes:  $s11rate ops/s"
+    stop $pid $port; rm -rf "$w"
+
+    # S13: connection churn (Python) — open + use + put + quit, repeat.
+    # Tests make_conn / connclose / conn_pool (256-slab pool → churn above cap
+    # hits malloc). 4 workers × 2000 conns = 8K make_conn/s target.
+    # Tests hypothesis 1.10 (pool resize).
+    w="/tmp/wal-$label-s13-$$"; rm -rf "$w"; mkdir -p "$w"
+    $bin $extra -p $port -b "$w" -f 50 >/dev/null 2>&1 &
+    pid=$!; sleep 1
+    local s13rate
+    s13rate=$(python3 -c "
+import socket, time, threading
+PORT=$port; ITERS_PER_WORKER=2000; WORKERS=4; results=[]
+def worker():
+    t0=time.monotonic(); ops=0
+    for _ in range(ITERS_PER_WORKER):
+        s=socket.socket(); s.setsockopt(socket.IPPROTO_TCP,socket.TCP_NODELAY,1)
+        s.settimeout(30); s.connect(('127.0.0.1',PORT))
+        s.sendall(b'put 1024 0 60 4\r\ndata\r\n')
+        buf=b''
+        while b'\r\n' not in buf: buf+=s.recv(4096)
+        s.close(); ops+=1
+    results.append((ops, time.monotonic()-t0))
+t0=time.monotonic()
+threads=[threading.Thread(target=worker) for _ in range(WORKERS)]
+for t in threads: t.start()
+for t in threads: t.join()
+wall=time.monotonic()-t0; total=sum(r[0] for r in results)
+print(f'{total/wall:.0f}')
+" 2>/dev/null)
+    eval "${label}_s13='$s13rate'"
+    echo "  S13 conn churn: $s13rate conn/s"
+    stop $pid $port; rm -rf "$w"
+
+    # S12: truncate-heavy (Python) — fork-only (upstream has no truncate).
+    # 1 worker: put 1000 → truncate → repeat × 50. Measures both PUT rate
+    # under accumulation pressure and truncate latency with 1K-deep heaps.
+    # Tests hypothesis 1.5 (truncated tube index) and lazy-reap budget.
+    if [ "$label" = "fk" ]; then
+        w="/tmp/wal-$label-s12-$$"; rm -rf "$w"; mkdir -p "$w"
+        $bin $extra -p $port -b "$w" -f 50 >/dev/null 2>&1 &
+        pid=$!; sleep 1
+        local s12rate s12trunc
+        read s12rate s12trunc <<< $(python3 -c "
+import socket, time
+PORT=$port; PUTS_PER_CYCLE=1000; CYCLES=50
+s=socket.socket(); s.setsockopt(socket.IPPROTO_TCP,socket.TCP_NODELAY,1)
+s.settimeout(120); s.connect(('127.0.0.1',PORT)); buf=b''
+def rl():
+    global buf
+    while b'\r\n' not in buf: buf+=s.recv(8192)
+    i=buf.index(b'\r\n'); r=buf[:i]; buf=buf[i+2:]; return r
+s.sendall(b'use trunc-bench\r\n'); rl()
+put_cmd=b'put 1024 0 60 32\r\n'+b'x'*32+b'\r\n'
+put_ops=0; trunc_total_us=0
+t0=time.monotonic()
+for _ in range(CYCLES):
+    for _ in range(PUTS_PER_CYCLE):
+        s.sendall(put_cmd); rl(); put_ops+=1
+    tt=time.monotonic()
+    s.sendall(b'truncate trunc-bench\r\n'); rl()
+    trunc_total_us += (time.monotonic()-tt)*1e6
+wall=time.monotonic()-t0; s.close()
+print(f'{put_ops/wall:.0f} {trunc_total_us/CYCLES:.0f}')
+" 2>/dev/null)
+        eval "${label}_s12='$s12rate'"
+        eval "${label}_s12t='$s12trunc'"
+        echo "  S12 trunc-chrn: $s12rate put/s  (truncate avg=${s12trunc}μs @ 1K jobs)"
+        stop $pid $port; rm -rf "$w"
+    else
+        eval "${label}_s12='0'"
+        eval "${label}_s12t='0'"
+        echo "  S12 trunc-chrn: (upstream has no truncate command, skipped)"
+    fi
+
     echo "  done."
     echo ""
 }
@@ -194,8 +313,8 @@ run_suite "fk" "$FORK"     11700 ""
 
 # ── Results ──────────────────────────────────────────────────
 
-export up_s1 up_s2 up_s3 up_s4 up_s5 up_s6 up_s7 up_s8 up_s9 up_s10
-export fk_s1 fk_s2 fk_s3 fk_s4 fk_s5 fk_s6 fk_s7 fk_s8 fk_s9 fk_s10
+export up_s1 up_s2 up_s3 up_s4 up_s5 up_s6 up_s7 up_s8 up_s9 up_s10 up_s11 up_s12 up_s12t up_s13
+export fk_s1 fk_s2 fk_s3 fk_s4 fk_s5 fk_s6 fk_s7 fk_s8 fk_s9 fk_s10 fk_s11 fk_s12 fk_s12t fk_s13
 
 python3 << PYEOF
 import os
@@ -223,6 +342,10 @@ up_s7 = e('up_s7'); fk_s7 = e('fk_s7')
 up_s8 = e('up_s8'); fk_s8 = e('fk_s8')
 up_s9 = e('up_s9'); fk_s9 = e('fk_s9')
 up_s10 = e('up_s10'); fk_s10 = e('fk_s10')
+up_s11 = e('up_s11'); fk_s11 = e('fk_s11')
+up_s12 = e('up_s12'); fk_s12 = e('fk_s12')
+up_s12t = e('up_s12t'); fk_s12t = e('fk_s12t')
+up_s13 = e('up_s13'); fk_s13 = e('fk_s13')
 
 fmt = '  {:<28s} {:>10s} {:>10s}  {:>8s}'
 print()
@@ -255,6 +378,12 @@ row('  P50 latency (μs)', v(up_s8,1), v(fk_s8,1), True)
 row('  P99.9 latency (μs)', v(up_s8,3), v(fk_s8,3), True)
 row('  P99.99 latency (μs)', v(up_s8,4), v(fk_s8,4), True)
 row('  Max latency (μs)', v(up_s8,5), v(fk_s8,5), True)
+row('S11: 10K tubes (ops/s)', up_s11, fk_s11)
+row('S13: Conn churn (conn/s)', up_s13, fk_s13)
+print()
+print('  Truncate-heavy (fork-only, upstream has no truncate):')
+row('S12: put rate under trunc',       '-', fk_s12)
+row('  truncate avg (μs @ 1K jobs)',   '-', fk_s12t, True)
 print()
 print('  Durable mode (-D) — fork-only (upstream has no -D flag):')
 row('S9: -D serial (ops/s)',          '-', v(fk_s9,0))
@@ -290,6 +419,9 @@ print('      (reserve fast-path forced to scan all 500 — measures O(watched_tu
 print('  S8: 1 conn × 100K ops, pipeline=1, 4B body (long serial RTT for tail study)')
 print('  S9: -D × 1 conn × 5K ops, pipeline=1, 4B (serial fsync cost)')
 print('  S10: -D × 8 conn × 5K ops, pipeline=64, 128B (durable under pipeline load)')
+print('  S11: 10K tubes × 10 jobs each, 4 clients (tube_find hash chain at scale)')
+print('  S12: put 1000 → truncate × 50 cycles (truncate cost at 1K-deep heap)')
+print('  S13: open+put+quit × 2000 × 4 workers (make_conn/connclose churn)')
 print()
 print('╚══════════════════════════════════════════════════════════════╝')
 PYEOF
