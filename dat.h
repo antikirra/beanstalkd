@@ -390,8 +390,14 @@ static inline int job_list_is_empty(Job *head) {
 Job *job_list_remove(Job *j);
 void job_list_insert(Job *head, Job *j);
 
+// Free every pooled job back to glibc and reset the size-class free lists.
+// Called on the periodic -m trim tick before malloc_trim(0) so the trim can
+// reclaim the pool's pages.
+void job_pool_drain(void);
+
 /* for unit tests */
 size_t get_all_jobs_used(void);
+void get_job_pool_stats(size_t *bytes, int *count);
 
 
 extern struct Ms tubes;

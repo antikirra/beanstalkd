@@ -332,3 +332,99 @@ cttest_job_pool_oversized_bypass()
     assertf(j2 != NULL, "small job after oversized must work");
     job_free(j2);
 }
+
+// ─── Pool drain returns memory to glibc ─────────────────────
+// job_pool_drain() frees every pooled entry and zeroes the size-class
+// accounting so the periodic malloc_trim(0) can reclaim the pages.
+// Hostile angles: counter balance (#2), idempotence on an empty pool,
+// re-pool balance afterward, and proof that LIVE jobs in the hash table
+// are never touched by a drain.
+
+void
+cttest_job_pool_drain_balances_counters()
+{
+    TUBE_ASSIGN(dtube, make_tube("default"));
+
+    // Start cold. (Tests are fork-isolated, so the pool is already empty;
+    // the explicit drain documents intent and must be a safe no-op.)
+    job_pool_drain();
+    size_t bytes; int count;
+    get_job_pool_stats(&bytes, &count);
+    assertf(count == 0 && bytes == 0,
+            "pool must be empty after initial drain: count=%d bytes=%zu", count, bytes);
+
+    // Draining an already-empty pool stays empty (idempotent, no double-free).
+    job_pool_drain();
+    get_job_pool_stats(&bytes, &count);
+    assertf(count == 0 && bytes == 0, "double drain must stay empty");
+
+    // Fill five distinct size classes, then return them to the pool.
+    int sizes[] = {1, 100, 1000, 9000, 60000};
+    for (int i = 0; i < 5; i++) {
+        Job *j = make_job(1, 0, 1000000000, sizes[i], dtube);
+        assertf(j != NULL, "alloc size %d must succeed", sizes[i]);
+        job_free(j);
+    }
+    get_job_pool_stats(&bytes, &count);
+    assertf(count == 5, "five freed jobs must be pooled, got %d", count);
+    assertf(bytes > 0, "pool_mem must be positive after pooling, got %zu", bytes);
+
+    // The drain under test: every entry freed, accounting back to zero.
+    job_pool_drain();
+    get_job_pool_stats(&bytes, &count);
+    assertf(count == 0, "drain must zero pooled count, got %d", count);
+    assertf(bytes == 0, "drain must zero pool_mem, got %zu", bytes);
+
+    // Pool is usable again: one size-100 job lands in class 1 (130-byte slab);
+    // the re-pooled entry's accounting must balance exactly.
+    Job *j = make_job(1, 0, 1000000000, 100, dtube);
+    assertf(j != NULL, "post-drain alloc must succeed");
+    job_free(j);
+    get_job_pool_stats(&bytes, &count);
+    assertf(count == 1 && bytes == sizeof(Job) + 130,
+            "post-drain re-pool must balance: count=%d bytes=%zu", count, bytes);
+    job_pool_drain();
+}
+
+void
+cttest_job_pool_drain_spares_live_jobs()
+{
+    TUBE_ASSIGN(dtube, make_tube("default"));
+    job_pool_drain();
+
+    // Live jobs live in the hash table, NOT the free-list pool. A drain must
+    // touch only pooled (already-freed) entries, never a live allocation.
+    Job *live[8];
+    for (int i = 0; i < 8; i++) {
+        live[i] = make_job(1, 0, 1000000000, 200, dtube);
+        assertf(live[i] != NULL, "live job %d must allocate", i);
+    }
+
+    // Populate the pool with unrelated freed jobs of the same class.
+    // Allocate all four before freeing — freeing one then re-allocating the
+    // same class would just reuse it from the pool and never accumulate.
+    Job *tmp[4];
+    for (int i = 0; i < 4; i++) {
+        tmp[i] = make_job(1, 0, 1000000000, 200, dtube);
+        assertf(tmp[i] != NULL, "tmp job %d must allocate", i);
+    }
+    for (int i = 0; i < 4; i++) job_free(tmp[i]);
+    size_t bytes; int count;
+    get_job_pool_stats(&bytes, &count);
+    assertf(count == 4, "expected 4 pooled jobs, got %d", count);
+
+    job_pool_drain();
+
+    // Every live job is still findable and unchanged after the drain.
+    for (int i = 0; i < 8; i++) {
+        Job *f = job_find(live[i]->r.id);
+        assertf(f == live[i],
+                "live job %"PRIu64" must survive drain", live[i]->r.id);
+    }
+    get_job_pool_stats(&bytes, &count);
+    assertf(count == 0 && bytes == 0, "pool must be empty after drain");
+
+    for (int i = 0; i < 8; i++) job_free(live[i]);
+    assertf(get_all_jobs_used() == 0, "no live jobs must remain after free");
+    job_pool_drain();
+}

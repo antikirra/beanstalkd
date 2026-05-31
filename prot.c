@@ -3531,6 +3531,9 @@ prottick(Server *s)
     if (mem_trim_rate > 0) {
         static int64 last_trim;
         if (now - last_trim >= mem_trim_rate) {
+            // Free the job pool first: its entries are live allocations that
+            // malloc_trim cannot reclaim while they sit on the free list.
+            job_pool_drain();
             malloc_trim(0);
             last_trim = now;
         }

@@ -286,6 +286,32 @@ job_free(Job *j)
     free(j);
 }
 
+// job_pool_drain frees every pooled job back to glibc and resets the
+// size-class free lists to empty. Pooled entries are live allocations the
+// allocator holds for O(1) reuse; malloc_trim(0) cannot reclaim their pages
+// while they sit on the free list. prottick calls this right before the
+// periodic malloc_trim(0) (-m cadence) so the trim can actually return the
+// pool's pages to the OS once a burst subsides. On a busy server the pool
+// refills via malloc on the next burst; cost is bounded by the entries
+// present (<= POOL_PER_CLASS * POOL_NCLASS frees) and amortized over -m.
+// Counter balance (#2): pool_len/pool_mem are zeroed exactly as every entry
+// is freed, mirroring the accounting in allocate_job/job_free.
+void
+job_pool_drain(void)
+{
+    for (int cls = 0; cls < POOL_NCLASS; cls++) {
+        Job *j = pool_head[cls];
+        while (j) {
+            Job *next = j->ht_next;
+            free(j);
+            j = next;
+        }
+        pool_head[cls] = NULL;
+        pool_len[cls] = 0;
+    }
+    pool_mem = 0;
+}
+
 void
 job_setpos(void *j, size_t pos)
 {
@@ -396,4 +422,14 @@ size_t
 get_all_jobs_used()
 {
     return all_jobs_used;
+}
+
+/* for unit tests: total pooled entries and bytes across all size classes */
+void
+get_job_pool_stats(size_t *bytes, int *count)
+{
+    int n = 0;
+    for (int cls = 0; cls < POOL_NCLASS; cls++) n += pool_len[cls];
+    if (count) *count = n;
+    if (bytes) *bytes = pool_mem;
 }
