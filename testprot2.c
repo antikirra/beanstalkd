@@ -374,7 +374,7 @@ cttest_prot_remove_tube_cleans_pause()
     prot_init();
 
     /* Create a paused tube, then free it via tube_dref.
-     * tube_free calls prot_remove_tube which must handle paused_ct. */
+     * tube_free calls prot_remove_tube which must handle a paused tube. */
     Tube *t = make_tube("pause-free");
     tube_iref(t);
 
@@ -383,8 +383,8 @@ cttest_prot_remove_tube_cleans_pause()
     t->unpause_at = now + 5000000000LL;
 
     /* Free: refs 1→0 → tube_free → prot_remove_tube.
-     * prot_remove_tube sees t->pause > 0, decrements paused_ct.
-     * Must not crash, must not leave stale state. */
+     * prot_remove_tube sees t->pause > 0 and must clean up the
+     * pause-heap state. Must not crash, must not leave stale state. */
     tube_dref(t);
 }
 
@@ -578,32 +578,6 @@ cttest_job_hash_rehash_recovery()
             "all jobs must be freed, got %zu", get_all_jobs_used());
 
     tube_dref(t);
-}
-
-/* --- make_nonblocking: verify exported function works --- */
-
-void
-cttest_make_nonblocking_pipe()
-{
-    int fds[2];
-    int r = pipe(fds);
-    assertf(r == 0, "pipe must succeed");
-
-    r = make_nonblocking(fds[0]);
-    assertf(r == 0, "make_nonblocking must succeed on pipe read fd");
-
-    r = make_nonblocking(fds[1]);
-    assertf(r == 0, "make_nonblocking must succeed on pipe write fd");
-
-    /* Verify nonblocking: read on empty pipe should return -1 with EAGAIN */
-    char buf[1];
-    ssize_t n = read(fds[0], buf, 1);
-    assertf(n == -1, "read on empty nonblocking pipe must fail");
-    assertf(errno == EAGAIN || errno == EWOULDBLOCK,
-            "errno must be EAGAIN/EWOULDBLOCK, got %d", errno);
-
-    close(fds[0]);
-    close(fds[1]);
 }
 
 /* --- conn_ready: paused tube must not count as ready --- */
@@ -1007,23 +981,6 @@ cttest_enqueue_reserved_jobs_clears_all_reservers()
 }
 
 
-// #7 net.c: make_nonblocking must reject invalid fds cleanly. The
-// existing cttest_make_nonblocking_pipe covers the happy path; this
-// test locks the error branch (fcntl F_GETFL on a bad fd returns -1)
-// to stop a future refactor silently swallowing the failure.
-void
-cttest_make_nonblocking_bad_fd()
-{
-    int r = make_nonblocking(-1);
-    assertf(r == -1,
-            "make_nonblocking must return -1 on fd=-1, got %d", r);
-
-    r = make_nonblocking(999999);
-    assertf(r == -1,
-            "make_nonblocking must return -1 on an unopened high fd, got %d", r);
-}
-
-
 // #7 net.c: make_server_socket for a unix: path longer than
 // sizeof(sun_path)-1 must be rejected with -1 BEFORE any socket() /
 // bind() / listen() syscall. Catches a regression that silently
@@ -1044,4 +1001,434 @@ cttest_make_server_socket_unix_path_too_long()
     int fd = make_server_socket(addr, "0");
     assertf(fd == -1,
             "make_server_socket must reject over-long unix path, got fd=%d", fd);
+}
+
+
+/* ------------------------------------------------------------------ */
+/* prottick -m trim cadence (mem-trim-never-fires-when-idle)          */
+/* ------------------------------------------------------------------ */
+
+// An idle server must keep waking at the -m cadence. Pre-fix, prottick
+// never fed the trim deadline into its return value, so an idle server
+// parked in epoll for the 1h default and -m silently never fired in
+// exactly its target scenario (mass delete, then workers idle on plain
+// reserve). Kill shot: on the old code both calls return 1h.
+void
+cttest_prottick_idle_trim_deadline_bounds_period()
+{
+    now = nanoseconds();
+    prot_init();
+    Server s = {0};
+
+    mem_trim_rate = 5000000000LL; // -m 5
+
+    // First tick either fires the trim (last_trim = now) or is already
+    // counting down from process start; both leave a live deadline.
+    int64 p1 = prottick(&s);
+    assertf(p1 > 0 && p1 <= mem_trim_rate,
+            "tick 1: period must be bounded by the -m deadline, got %" PRId64,
+            p1);
+
+    // Second tick: the server is completely idle (no delayed jobs, no
+    // truncated tubes, no conns) — only the trim deadline can bound it.
+    int64 p2 = prottick(&s);
+    assertf(p2 > 0 && p2 <= mem_trim_rate,
+            "tick 2: idle period must stay at the -m cadence, got %" PRId64,
+            p2);
+}
+
+// -m 0 must NOT add gratuitous wake-ups: a fully idle server keeps the
+// 1h park. Proves the clamp lives inside the mem_trim_rate guard.
+void
+cttest_prottick_trim_disabled_keeps_idle_period()
+{
+    now = nanoseconds();
+    prot_init();
+    Server s = {0};
+
+    mem_trim_rate = 0;
+
+    int64 p = prottick(&s);
+    assertf(p == 0x34630B8A000LL,
+            "with -m off an idle tick must return the 1h period, got %" PRId64,
+            p);
+}
+
+
+/* ------------------------------------------------------------------ */
+/* conn pool drain at trim (conn-pool-not-drained-at-trim)            */
+/* ------------------------------------------------------------------ */
+
+// The -m trim tick must be able to hand the conn slab pool back to
+// glibc: pooled Conns are live allocations malloc_trim(0) cannot
+// reclaim (up to CONN_POOL_MAX * sizeof(Conn) ~ 1.2MB of resident
+// slack after any connection burst). Counter discipline (#2): the pool
+// length is zeroed exactly as entries are freed; a double drain must
+// be a no-op (a double free here dies under the ASan loadtest gate).
+void
+cttest_conn_pool_drain_balances_counter()
+{
+    now = nanoseconds();
+    prot_init();
+
+    int count = -1;
+    conn_pool_drain();              // cold drain: no-op
+    get_conn_pool_stats(&count);
+    assertf(count == 0, "cold pool must report 0, got %d", count);
+    conn_pool_drain();              // double drain: idempotent
+    get_conn_pool_stats(&count);
+    assertf(count == 0, "double drain must stay 0, got %d", count);
+
+    Tube *t = tube_find_or_make("connpool-bal");
+    tube_iref(t);
+
+    int base = -1;
+    get_conn_pool_stats(&base);
+
+    Conn *cs[3];
+    for (int i = 0; i < 3; i++) {
+        cs[i] = make_conn(dup(2), 0, t, t);
+        assertf(cs[i], "make_conn %d must succeed", i);
+    }
+    for (int i = 0; i < 3; i++)
+        connclose(cs[i]);
+
+    get_conn_pool_stats(&count);
+    assertf(count == base + 3,
+            "three closed conns must pool (base %d, got %d)", base, count);
+
+    conn_pool_drain();
+    get_conn_pool_stats(&count);
+    assertf(count == 0, "drain must empty the pool, got %d", count);
+
+    // The pool must keep working after a drain: take/put re-pools.
+    Conn *c = make_conn(dup(2), 0, t, t);
+    assertf(c, "make_conn after drain must succeed");
+    connclose(c);
+    get_conn_pool_stats(&count);
+    assertf(count == 1, "post-drain close must re-pool, got %d", count);
+
+    conn_pool_drain();
+    tube_dref(t);
+}
+
+// Drain must free ONLY pooled (closed) conns. Live conns keep working
+// end-to-end afterwards; under the ASan loadtest gate any touch of
+// freed memory here is a hard failure.
+void
+cttest_conn_pool_drain_spares_live_conns()
+{
+    now = nanoseconds();
+    prot_init();
+
+    Tube *t = tube_find_or_make("connpool-live");
+    tube_iref(t);
+
+    Conn *p1 = make_conn(dup(2), 0, t, t);
+    Conn *p2 = make_conn(dup(2), 0, t, t);
+    Conn *l1 = make_conn(dup(2), 0, t, t);
+    Conn *l2 = make_conn(dup(2), 0, t, t);
+    assertf(p1 && p2 && l1 && l2, "conns must allocate");
+    connclose(p1);
+    connclose(p2);
+
+    conn_pool_drain();
+    int count = -1;
+    get_conn_pool_stats(&count);
+    assertf(count == 0, "drain must empty the pool, got %d", count);
+
+    // Exercise the live conns after the drain.
+    assertf(l1->watch.len == 1 && l1->watch.items[0] == t,
+            "live conn watch must be intact after drain");
+    assertf(enqueue_waiting_conn(l1) == 1,
+            "live conn must still be able to wait after drain");
+    assertf(t->waiting_conns.len == 1 && t->waiting_conns.items[0] == l1,
+            "live conn must actually register as waiting");
+    remove_waiting_conn(l1);
+
+    connclose(l1);
+    connclose(l2);
+    get_conn_pool_stats(&count);
+    assertf(count == 2, "live conns must re-pool after drain, got %d", count);
+
+    conn_pool_drain();
+    tube_dref(t);
+}
+
+
+/* ------------------------------------------------------------------ */
+/* prottick zombie-head guard (delayed-reap-ignores-remove-result)    */
+/* ------------------------------------------------------------------ */
+
+// Deliberately violate invariant #1 (the #720 precondition): the delay
+// heap root claims state Reserved, so remove_delayed_job must fail.
+// Pre-fix, prottick ignored that result and reap_purged_job freed the
+// job while it was still linked as t->delay.data[0]; the loop then
+// refetched the freed pointer from soonest_delayed_job and dereferenced
+// j->tube (NULLed by job_free) — deterministic SIGSEGV in this
+// fork-isolated test (ASan UAF under the loadtest gate). Fixed code
+// breaks out, leaving the corrupt-but-alive job in place.
+void
+cttest_prottick_zombie_head_corrupted_state_no_uaf()
+{
+    now = nanoseconds();
+    prot_init();
+    Server s = {0};
+
+    Tube *t = tube_find_or_make("zombie-head");
+    tube_iref(t);
+
+    // Install a delayed job through prot_replay — the only exported
+    // path into enqueue_job and its delayed_ct / delay_tube_heap
+    // bookkeeping (the prottick loop gates on both).
+    Job list = {0};
+    list.prev = list.next = &list;
+    Job *j = make_job(1, 3600000000000LL, 1000000000LL, 0, t);
+    assertf(j, "job must allocate");
+    j->r.state = Delayed;
+    j->r.deadline_at = nanoseconds() + 3600000000000LL;
+    job_list_insert(&list, j);
+    assertf(prot_replay(&s, &list) == 1, "replay must install the job");
+    assertf(t->delay.len == 1 && t->delay.data[0] == j,
+            "precondition: j must be the delay heap root");
+
+    // Make j a zombie, then corrupt its state.
+    t->purge_before_id = j->r.id;
+    j->r.state = Reserved;
+
+    prottick(&s);
+
+    assertf(t->delay.len == 1 && t->delay.data[0] == j,
+            "guard must skip, not free, a job it failed to unlink");
+    assertf(j->r.state == Reserved,
+            "job state must be untouched by the skipped reap, got %d",
+            j->r.state);
+
+    // Cleanup: restore the invariant, then dispose properly (no leak).
+    t->purge_before_id = 0;
+    heapremove(&t->delay, j->heap_index);
+    j->r.state = Ready; /* so job_free doesn't complain */
+    job_free(j);
+    tube_dref(t);
+}
+
+
+/* ------------------------------------------------------------------ */
+/* truncated-tube registry (prottick-truncated-tube-full-scan)        */
+/* ------------------------------------------------------------------ */
+
+// The lazy reap now walks a registry of truncated tubes instead of the
+// whole tube list. This test proves the full lifecycle through the two
+// exported entry points: prot_replay rebuilds the registry from
+// purge_before_id (boot path), prottick drains the zombies, and the
+// clearance retires the cutoff and unregisters. Tube reg-c is
+// deliberately NOT pinned by the test: its only refs are its job's, so
+// the reap's final job_free drops it to zero and tube_free runs INSIDE
+// the registry iteration — the mid-scan swap-remove must neither skip
+// the swapped-in tube nor touch freed memory (UAF visible under the
+// ASan loadtest gate).
+void
+cttest_prottick_truncate_registry_reaps_and_clears()
+{
+    now = nanoseconds();
+    prot_init();
+    Server s = {0};
+
+    size_t jobs_before = get_all_jobs_used();
+
+    Tube *ta = tube_find_or_make("reg-a");
+    Tube *tb = tube_find_or_make("reg-b");
+    Tube *tc = tube_find_or_make("reg-c");
+    assertf(ta && tb && tc, "tubes must allocate");
+    tube_iref(ta);
+    tube_iref(tb);
+    /* no iref on tc — see comment above */
+
+    // Seed ready jobs via replay #1 (purge not set yet, so the replay
+    // purge-guard must NOT eat them).
+    Job list = {0};
+    list.prev = list.next = &list;
+    for (int i = 0; i < 5; i++) {
+        Tube *dst = (i < 2) ? ta : (i < 4) ? tb : tc;
+        Job *j = make_job(1, 0, 1000000000LL, 0, dst);
+        assertf(j, "job %d must allocate", i);
+        j->r.state = Ready;
+        job_list_insert(&list, j);
+    }
+    assertf(prot_replay(&s, &list) == 1, "replay #1 must succeed");
+    assertf(ta->ready.len == 2 && tb->ready.len == 2 && tc->ready.len == 1,
+            "precondition: jobs distributed 2/2/1");
+
+    // Truncate all three tubes the way a binlog marker would, then let
+    // replay #2 (empty list) rebuild the registry from purge_before_id.
+    uint64 cutoff = job_next_id() - 1;
+    ta->purge_before_id = cutoff;
+    tb->purge_before_id = cutoff;
+    tc->purge_before_id = cutoff;
+    Job list2 = {0};
+    list2.prev = list2.next = &list2;
+    assertf(prot_replay(&s, &list2) == 1,
+            "replay #2 (registry rebuild) must succeed");
+
+    prottick(&s);
+
+    // All zombies reaped, cutoffs retired, registry drained.
+    assertf(ta->ready.len == 0 && tb->ready.len == 0,
+            "zombies must be reaped (ta %zu, tb %zu)",
+            ta->ready.len, tb->ready.len);
+    assertf(ta->purge_before_id == 0,
+            "reg-a cutoff must clear, got %" PRIu64, ta->purge_before_id);
+    assertf(tb->purge_before_id == 0,
+            "reg-b cutoff must clear, got %" PRIu64, tb->purge_before_id);
+    assertf(ta->stat.total_delete_ct == 2,
+            "reaps must count as deletes, got %" PRIu64,
+            ta->stat.total_delete_ct);
+    // reg-c was freed mid-scan: gone from the name table entirely.
+    assertf(tube_find_name("reg-c", 5) == NULL,
+            "reg-c must be freed once its last zombie is reaped");
+    assertf(get_all_jobs_used() == jobs_before,
+            "every seeded job must be freed (before %zu, after %zu)",
+            jobs_before, get_all_jobs_used());
+
+    // A second tick over the (now empty) registry must be a no-op.
+    prottick(&s);
+    assertf(ta->purge_before_id == 0 && tb->purge_before_id == 0,
+            "second tick must not resurrect cutoffs");
+
+    tube_dref(ta);
+    tube_dref(tb);
+}
+
+
+/* ------------------------------------------------------------------ */
+/* waitpos hint invariant (waiting-conns-linear-scan)                 */
+/* ------------------------------------------------------------------ */
+
+// Invariant: for every WAITING conn c and every watch index i,
+// c->watch.items[i]->waiting_conns.items[c->waitpos[i]] == c.
+// Checked EXACTLY (not via membership) after every operation, so the
+// ms_remove_at stale-hint fallback cannot silently mask hint rot.
+static void
+assert_waitpos_exact(Conn **cs, int n, const char *ctx, int step)
+{
+    for (int k = 0; k < n; k++) {
+        Conn *c = cs[k];
+        if (!c || !conn_waiting(c))
+            continue;
+        for (size_t i = 0; i < c->watch.len; i++) {
+            Tube *t = c->watch.items[i];
+            assertf(c->waitpos[i] < t->waiting_conns.len,
+                    "%s step %d: conn %d hint %zu out of range for tube %s "
+                    "(len %zu)", ctx, step, k, c->waitpos[i], t->name,
+                    t->waiting_conns.len);
+            assertf(t->waiting_conns.items[c->waitpos[i]] == c,
+                    "%s step %d: conn %d hint %zu rotted for tube %s",
+                    ctx, step, k, c->waitpos[i], t->name);
+        }
+    }
+}
+
+// Random interleave of every production mutation of the waiting sets:
+// enqueue_waiting_conn, remove_waiting_conn, the ms_take + other-tubes
+// removal sequence of process_tube, the single-tube removal of
+// OP_IGNORE (which also swap-removes the watch entry while the conn
+// STAYS waiting on the rest — the on_watch_remove parallel-swap path),
+// and re-watching while not waiting. srand(42) determinism per test
+// rules.
+void
+cttest_waitpos_hint_invariant_churn()
+{
+    now = nanoseconds();
+    prot_init();
+
+    enum { NCONN = 8, STEPS = 600 };
+    Tube *tubes3[3];
+    tubes3[0] = tube_find_or_make("wp-churn-a");
+    tubes3[1] = tube_find_or_make("wp-churn-b");
+    tubes3[2] = tube_find_or_make("wp-churn-c");
+    assertf(tubes3[0] && tubes3[1] && tubes3[2], "tubes must allocate");
+    for (int i = 0; i < 3; i++)
+        tube_iref(tubes3[i]);
+
+    Conn *cs[NCONN];
+    for (int k = 0; k < NCONN; k++) {
+        cs[k] = make_conn(dup(2), 0, tubes3[0], tubes3[0]);
+        assertf(cs[k], "conn %d must allocate", k);
+        // Overlapping multi-watch: every conn watches tube a, most
+        // watch one or both of b/c.
+        if (k % 2 == 0)
+            assertf(ms_append(&cs[k]->watch, tubes3[1]), "watch b");
+        if (k % 3 != 1)
+            assertf(ms_append(&cs[k]->watch, tubes3[2]), "watch c");
+    }
+
+    srand(42);
+    for (int step = 0; step < STEPS; step++) {
+        Conn *c = cs[rand() % NCONN];
+        int op = rand() % 100;
+
+        if (conn_waiting(c)) {
+            if (op < 40) {
+                remove_waiting_conn(c);
+            } else if (op < 70 && c->watch.len > 1) {
+                // OP_IGNORE replica: drop one watched tube while the
+                // conn keeps waiting on the others.
+                size_t wi = (size_t)(rand() % (int)c->watch.len);
+                Tube *t = c->watch.items[wi];
+                t->stat.waiting_ct--;
+                ms_remove_at(&t->waiting_conns, c->waitpos[wi], c);
+                ms_remove_at(&c->watch, wi, t);
+            } else {
+                // process_tube replica: take the oldest waiter from a
+                // random tube, then unregister it from its other tubes.
+                Tube *t = tubes3[rand() % 3];
+                Conn *v = ms_take(&t->waiting_conns);
+                if (v) {
+                    t->stat.waiting_ct--;
+                    v->type &= ~CONN_TYPE_WAITING;
+                    global_stat.waiting_ct--;
+                    for (size_t i = 0; i < v->watch.len; i++) {
+                        Tube *other = v->watch.items[i];
+                        if (other == t)
+                            continue;
+                        other->stat.waiting_ct--;
+                        ms_remove_at(&other->waiting_conns, v->waitpos[i], v);
+                    }
+                }
+            }
+        } else {
+            if (op < 30) {
+                // Re-watch a tube this conn dropped (only legal while
+                // not waiting; OP_WATCH on a waiting conn re-enqueues).
+                Tube *t = tubes3[rand() % 3];
+                if (!ms_contains(&c->watch, t))
+                    assertf(ms_append(&c->watch, t), "re-watch");
+            } else {
+                assertf(enqueue_waiting_conn(c) == 1, "enqueue must succeed");
+            }
+        }
+
+        assert_waitpos_exact(cs, NCONN, "churn", step);
+    }
+
+    // Teardown: every waiter out, every set empty, counters balanced.
+    for (int k = 0; k < NCONN; k++)
+        if (conn_waiting(cs[k]))
+            remove_waiting_conn(cs[k]);
+    for (int i = 0; i < 3; i++) {
+        assertf(tubes3[i]->waiting_conns.len == 0,
+                "tube %d waiting set must drain to 0, got %zu",
+                i, tubes3[i]->waiting_conns.len);
+        assertf(tubes3[i]->stat.waiting_ct == 0,
+                "tube %d waiting_ct must balance (#2), got %" PRIu64,
+                i, tubes3[i]->stat.waiting_ct);
+    }
+    assertf(global_stat.waiting_ct == 0,
+            "global waiting_ct must balance, got %" PRIu64,
+            global_stat.waiting_ct);
+
+    for (int k = 0; k < NCONN; k++)
+        connclose(cs[k]);
+    for (int i = 0; i < 3; i++)
+        tube_dref(tubes3[i]);
 }

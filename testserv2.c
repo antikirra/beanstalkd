@@ -2515,3 +2515,252 @@ cttest_truncate_count_covers_ready_delay_buried()
     close(fd);
 }
 
+
+
+/* ============================================================
+ * DURABLE (-D) GROUP-COMMIT WIRE TESTS — hostile to the code
+ * ============================================================ */
+
+// Server in durable mode: -D semantics (durable_sync=1 implies -F /
+// wantsync=0; group commit per invariant #16). Caller sets srv.wal.dir.
+static int
+startsrv_durable(void)
+{
+    srv.wal.use = 1;
+    srv.wal.durable_sync = 1;
+    srv.wal.wantsync = 0; // -D implies -F: walcommit owns the fdatasync
+    srv.wal.syncrate = 0;
+    return startsrv();
+}
+
+// >4KB of acks buffered on ONE conn in ONE tick. The reply() defer hook
+// used to handle the dur_reply_buf overflow by dropping the buffered
+// acks and sending only the current line — up to 4KB of replies (~300
+// INSERTED lines) silently vanished and the client's reply stream
+// desynced forever. Every one of the 900 INSERTED acks must arrive, in
+// id order.
+void
+cttest_dur_pipeline_acks_over_4kb_not_dropped()
+{
+    srv.wal.dir = ctdir();
+    int port = startsrv_durable();
+    int fd = diallocal(port);
+
+    enum { NPUT = 900 };
+    static const char put_cmd[] = "put 0 0 0 1\r\nx\r\n"; // 16 bytes
+    static char burst[NPUT * (sizeof put_cmd - 1) + 1];
+    size_t blen = 0;
+    for (int i = 0; i < NPUT; i++) {
+        memcpy(burst + blen, put_cmd, sizeof put_cmd - 1);
+        blen += sizeof put_cmd - 1;
+    }
+    burst[blen] = '\0';
+    // One pipelined burst: the kernel queues it faster than the server
+    // dispatches 224-byte command-buffer rounds, so the acks accumulate
+    // in dur_reply_buf within a tick and cross the 4096 soft cap.
+    snd(fd, burst);
+
+    for (int i = 1; i <= NPUT; i++) {
+        char exp[64];
+        snprintf(exp, sizeof exp, "INSERTED %d\r\n", i);
+        ck(fd, exp);
+    }
+
+    close(fd);
+}
+
+// Reply ORDER under -D: a WAL-dirty command (delete → ack deferred for
+// the group commit) pipelined with a STATE_SEND_JOB command
+// (peek-ready → immediate writev). The job reply used to bypass the
+// deferred ack buffer entirely: the client saw FOUND+body BEFORE
+// DELETED — positional clients attribute both replies to the wrong
+// commands. Wire contract: replies arrive in command order.
+void
+cttest_dur_delete_then_peek_replies_in_command_order()
+{
+    srv.wal.dir = ctdir();
+    int port = startsrv_durable();
+    int fd = diallocal(port);
+
+    snd(fd, "put 0 0 60 1\r\na\r\n");
+    ck(fd, "INSERTED 1\r\n");
+    snd(fd, "put 0 0 60 1\r\nb\r\n");
+    ck(fd, "INSERTED 2\r\n");
+
+    // One pipelined burst, dispatched in a single tick.
+    snd(fd, "delete 1\r\npeek-ready\r\n");
+    ck(fd, "DELETED\r\n");
+    ck(fd, "FOUND 2 1\r\n");
+    ck(fd, "b\r\n"); // job body line
+
+    close(fd);
+}
+
+// Mid-PUT state vs the end-of-tick durable flush. A pipelined
+// "delete N\r\nput <hdr>\r\n" whose body lags one packet leaves the
+// conn in STATE_WANT_DATA when dur_flush_all runs. The old flush
+// unconditionally reset the conn to STATE_WANT_COMMAND, so the body
+// bytes that arrived next were parsed as a COMMAND LINE — job-body
+// content injected into the command stream (and the half-read in_job
+// leaked). The body must complete the put normally.
+void
+cttest_dur_flush_does_not_clobber_mid_put_body()
+{
+    srv.wal.dir = ctdir();
+    int port = startsrv_durable();
+    int fd = diallocal(port);
+
+    snd(fd, "put 0 0 60 1\r\na\r\n");
+    ck(fd, "INSERTED 1\r\n");
+
+    // WAL-dirty delete (deferred ack) + put header; body intentionally
+    // held back so the durable flush runs while the put is mid-body.
+    snd(fd, "delete 1\r\nput 0 0 60 10\r\n");
+    ck(fd, "DELETED\r\n");
+    usleep(100000); // tick boundary: flush fires with conn in WANT_DATA
+    snd(fd, "0123456789\r\n");
+    ck(fd, "INSERTED 2\r\n"); // old code: body parsed as a command → UNKNOWN_COMMAND
+
+    close(fd);
+}
+
+// The worker idiom under -D: "delete N\r\nreserve\r\n" in ONE pipelined
+// burst. The delete's ack is deferred for the group commit; the
+// RESERVED+body reply is deferred BEHIND it (reply() SEND_JOB hook) and
+// the fd is parked out of epoll until the end-of-tick flush re-arms
+// 'w'. Attack: if the flush forgets the re-arm, the parked fd produces
+// no events and the client waits for RESERVED forever — this test then
+// dies in rd()'s 5s timeout. Also kills any reorder (RESERVED before
+// DELETED) and any ack-bytes-into-body interleave.
+void
+cttest_dur_worker_idiom_delete_reserve_one_burst()
+{
+    srv.wal.dir = ctdir();
+    int port = startsrv_durable();
+    int fd = diallocal(port);
+
+    snd(fd, "put 0 0 60 1\r\na\r\n");
+    ck(fd, "INSERTED 1\r\n");
+    snd(fd, "put 0 0 60 1\r\nb\r\n");
+    ck(fd, "INSERTED 2\r\n");
+
+    snd(fd, "delete 1\r\nreserve\r\n");
+    ck(fd, "DELETED\r\n");
+    ck(fd, "RESERVED 2 1\r\n");
+    ck(fd, "b\r\n");
+
+    // The conn must stay fully usable after the deferred-FSM round trip
+    // (epoll re-armed 'r' by conn_want_command).
+    snd(fd, "delete 2\r\n");
+    ck(fd, "DELETED\r\n");
+
+    close(fd);
+}
+
+// Commands pipelined BEHIND a deferred job reply. The defer halts
+// h_conn's dispatch loop at the reserve (STATE_SEND_JOB), leaving
+// "delete 2\r\nreserve\r\n" unparsed in c->cmd. No further client bytes
+// ever arrive, so a level-triggered 'r' wake-up cannot save a broken
+// resume: only the SEND_JOB FSM's conn_want_command path can revive the
+// parser. A regression there deadlocks this test at the 4th reply. Two
+// full defer cycles in one burst also prove the conn re-enters the
+// batch cleanly after a deferred round.
+void
+cttest_dur_deferred_job_reply_resumes_pipeline()
+{
+    srv.wal.dir = ctdir();
+    int port = startsrv_durable();
+    int fd = diallocal(port);
+
+    snd(fd, "put 0 0 60 1\r\na\r\n");
+    ck(fd, "INSERTED 1\r\n");
+    snd(fd, "put 0 0 60 1\r\nb\r\n");
+    ck(fd, "INSERTED 2\r\n");
+    snd(fd, "put 0 0 60 1\r\nc\r\n");
+    ck(fd, "INSERTED 3\r\n");
+
+    // One burst: delete 1 (ack deferred) + reserve (job 2, reply
+    // deferred, pipeline halted) + delete 2 (reserved by this conn —
+    // legal; must be parsed only after the deferred FSM drains) +
+    // reserve (job 3, second defer cycle).
+    snd(fd, "delete 1\r\nreserve\r\ndelete 2\r\nreserve\r\n");
+    ck(fd, "DELETED\r\n");
+    ck(fd, "RESERVED 2 1\r\n");
+    ck(fd, "b\r\n");
+    ck(fd, "DELETED\r\n");
+    ck(fd, "RESERVED 3 1\r\n");
+    ck(fd, "c\r\n");
+
+    close(fd);
+}
+
+
+/* ============================================================
+ * EPOLLQ DOUBLE-INSERT — same-tick wait_for_job + process_tube
+ * ============================================================ */
+
+// One dispatch can epollq_add the same conn twice: reserve's slow path
+// registers 'h' (wait_for_job), then process_tube serves that same conn
+// and re-arms 'r' (reply fast path → conn_want_command). The blind
+// list-prepend turned the second add into a self-cycle that DROPPED
+// every conn queued earlier in the tick — here the worker W, whose
+// 'h'→'r' re-arm was queued by its RESERVED wake-up. W's rw said 'r'
+// (so no later guard re-armed it) while the kernel registration stayed
+// hangup-only: the server went permanently deaf to W.
+//
+// The zombie-at-ready-root truncate state is what forces A's reserve
+// into the slow path while a live job sits beneath — all within one
+// pipelined h_conn dispatch (no epollq_apply between commands).
+void
+cttest_epollq_double_insert_does_not_orphan_worker()
+{
+    int port = startsrv();
+    int w = diallocal(port);
+    int a = diallocal(port);
+
+    // W: watch only t2, then block in reserve ('h' registration).
+    snd(w, "watch t2\r\n");
+    ck(w, "WATCHING 2\r\n");
+    snd(w, "ignore default\r\n");
+    ck(w, "WATCHING 1\r\n");
+    snd(w, "reserve\r\n");
+    usleep(100000); // let the server park W (STATE_WAIT, epoll 'h')
+
+    // A: ONE pipelined burst (~120B → single read, single h_conn tick):
+    // job1 (t1) becomes the zombie ready-heap root via truncate, job2
+    // (t1) survives beneath it, job3 (t2) wakes W mid-dispatch, then
+    // A's own reserve takes the slow path over the zombie root.
+    snd(a, "use t1\r\n"
+           "put 0 0 60 1\r\na\r\n"
+           "truncate t1\r\n"
+           "put 0 0 60 1\r\nb\r\n"
+           "watch t1\r\n"
+           "ignore default\r\n"
+           "use t2\r\n"
+           "put 0 0 60 1\r\nc\r\n"
+           "reserve\r\n");
+
+    ck(a, "USING t1\r\n");
+    ck(a, "INSERTED 1\r\n");
+    ck(a, "TRUNCATED 1\r\n");
+    ck(a, "INSERTED 2\r\n");
+    ck(a, "WATCHING 2\r\n");
+    ck(a, "WATCHING 1\r\n");
+    ck(a, "USING t2\r\n");
+    ck(a, "INSERTED 3\r\n");
+    cksub(a, "RESERVED 2 1\r\n"); // A got the live t1 job via slow path
+    ck(a, "b\r\n");
+
+    // W was woken with job 3 inside A's dispatch.
+    cksub(w, "RESERVED 3 1\r\n");
+    ck(w, "c\r\n");
+
+    // THE KILL: before the fix W is orphaned from the epollq — its
+    // socket stays registered hangup-only and this delete never gets a
+    // reply (rd() times out after 5s and aborts the test).
+    snd(w, "delete 3\r\n");
+    ck(w, "DELETED\r\n");
+
+    close(w);
+    close(a);
+}

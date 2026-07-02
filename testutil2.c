@@ -1,10 +1,13 @@
 #include "ct/ct.h"
 #include "dat.h"
 #include <errno.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 void
 cttest_optz_zero_uses_default()
@@ -62,9 +65,10 @@ cttest_opts_one()
         "s=1 must be accepted, got %d", srv.wal.filesize);
 }
 
-// -D enables durable mode: fdatasync blocks inside walwrite so replies
-// never precede persistence. Must also silence wantsync — the async
-// sync thread would otherwise duplicate the fsync work.
+// -D enables durable mode: group commit (invariant #16), one fdatasync
+// per event-loop tick, and replies never precede persistence. Must also
+// silence wantsync — the async sync thread would otherwise duplicate
+// the fsync work.
 void
 cttest_optD_enables_durable_and_disables_wantsync()
 {
@@ -559,4 +563,50 @@ cttest_log_text_mode_unchanged()
         "text mode must contain the message: got [%s]", buf);
     assertf(buf[0] != '{',
         "text mode must not look like JSON: got [%s]", buf);
+}
+
+// usage() must describe actual -s behavior. Upstream's help promises
+// "rounded up to a multiple of 4096 bytes", but this fork's rawfalloc
+// (file.c) allocates exactly len bytes: fallocate(fd, 0, 0, len) on the
+// primary path, exact-size chunks on the write-loop fallback. A help
+// text that promises rounding the code does not perform is a lie to the
+// operator. This test kills any resurrection of the claim and verifies
+// the printed range renders the real optparse contract (1..INT_MAX) —
+// which also catches a format string whose fprintf argument list has
+// drifted out of sync.
+void
+cttest_usage_s_text_matches_exact_allocation()
+{
+    char path[256];
+    snprintf(path, sizeof path, "%s/usage.txt", ctdir());
+
+    // usage() calls exit(); run it in a child so the test survives.
+    pid_t pid = fork();
+    assertf(pid >= 0, "fork: %s", strerror(errno));
+    if (pid == 0) {
+        progname = "beanstalkd";
+        log_json = 0;
+        capture_stderr_to(path);
+        char *args[] = { "-h", NULL };
+        optparse(&srv, args); // -h -> usage(0) -> exit(0), flushes stdio
+        _exit(86);            // unreachable: optparse must not return
+    }
+    int status = 0;
+    assertf(waitpid(pid, &status, 0) == pid, "waitpid: %s", strerror(errno));
+    assertf(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+        "-h must exit(0), raw wait status=%d", status);
+
+    char buf[8192];
+    read_file(path, buf, sizeof buf);
+
+    assertf(strstr(buf, "-s BYTES") != NULL,
+        "usage must still document -s: got [%s]", buf);
+    assertf(strstr(buf, "rounded") == NULL,
+        "usage must not promise 4096-rounding; rawfalloc is byte-exact: [%s]",
+        buf);
+    char range[64];
+    snprintf(range, sizeof range, "1..%d bytes", INT_MAX);
+    assertf(strstr(buf, range) != NULL,
+        "usage must state the real -s range \"%s\" (args in sync): [%s]",
+        range, buf);
 }

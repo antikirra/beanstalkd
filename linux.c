@@ -12,8 +12,10 @@
 
 // Batch size for epoll_wait. Amortizes syscall overhead: with 64 events
 // per call, a server handling 100K events/sec makes ~1562 syscalls instead
-// of 100K. Timer processing (prottick) still runs between each event,
-// so deadline accuracy is unaffected.
+// of 100K. Timer processing (prottick) runs once per drained batch (see
+// srvserve in serv.c), so timer granularity is one full event drain;
+// level-triggered epoll re-arms anything left unread, so nothing is lost
+// across batches.
 #define EPOLL_BATCH 64
 
 static int epfd;
@@ -85,12 +87,23 @@ socknext(Socket **s, int64 timeout)
             int64 ms64 = timeout / 1000000;
             ms = ms64 > INT_MAX ? INT_MAX : (int)ms64;
         }
-        ep_nready = epoll_wait(epfd, ep_buf, EPOLL_BATCH, ms);
+        // The check-then-block shutdown race (srvserve tests
+        // shutdown_requested, then parks here for up to 1h) is closed
+        // by the srv_wake eventfd in serv.c: signal handlers write to
+        // it, turning a signal in the window into fd readiness that
+        // wakes this wait immediately. We deliberately do NOT use the
+        // epoll_pwait sigmask for that — qemu/Rosetta user-mode
+        // emulation (the CI gate) returns EINTR from the mask swap but
+        // never delivers the pending signal to the handler, hanging
+        // the loop forever. The mask stays NULL (== epoll_wait); the
+        // pwait spelling is kept as the stable symbol testinject.c
+        // wraps to inject signals deterministically into this window.
+        ep_nready = epoll_pwait(epfd, ep_buf, EPOLL_BATCH, ms, NULL);
         ep_pos = 0;
         if (ep_nready == -1) {
             ep_nready = 0;
             if (errno != EINTR) {
-                twarn("epoll_wait");
+                twarn("epoll_pwait");
                 exit(1);
             }
             return 0;

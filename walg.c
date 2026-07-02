@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "dat.h"
 #include <stdint.h>
+#include <inttypes.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <fcntl.h>
@@ -179,11 +180,36 @@ walgc(Wal *w)
     File *f;
     int did_unlink = 0;
 
-    while (w->head && !w->head->refs) {
+    // Never reap the file w->cur points to. In healthy operation this
+    // is a no-op: the current file carries the writer's ref (filewopen)
+    // until usenext() has advanced w->cur past it. It matters on the
+    // WAL-disable failure paths, where filewclose(w->cur) drops that
+    // ref while w->cur still points at the file: freeing it here would
+    // leave w->cur dangling — fmt_stats reads w->cur->seq gated only on
+    // NULL, and walwrite's failure block relies on filewclose being
+    // idempotent, which holds only while the struct is allocated. As a
+    // side effect the failed binlog stays on disk for recovery.
+    while (w->head && !w->head->refs && w->head != w->cur) {
         f = w->head;
         w->head = f->next;
         if (w->tail == f) {
             w->tail = f->next; // also, f->next == NULL
+        }
+
+        // Truncate-marker bytes in this file were counted as live so
+        // ratio() would not let walgc unlink a marker-only binlog too
+        // early (#701). The file is gone now — reclaim them from
+        // w->alive, or every compact_post re-emission inflates alive
+        // forever and compaction gets monotonically lazier. Clamp
+        // defensively, mirroring filermjob.
+        if (f->marker_bytes) {
+            if (f->marker_bytes <= w->alive) {
+                w->alive -= f->marker_bytes;
+            } else {
+                twarnx("walgc: marker_bytes %d > alive %"PRId64,
+                       f->marker_bytes, w->alive);
+                w->alive = 0;
+            }
         }
 
         w->nfile--;
@@ -208,6 +234,24 @@ usenext(Wal *w)
     f = w->cur;
     if (!f->next) {
         twarnx("there is no next wal file");
+        return 0;
+    }
+
+    // Group commit (invariant #16) defers fdatasync to walcommit(),
+    // which only covers w->cur. Rotating away with staged-but-unsynced
+    // records in f would orphan them: filewclose drops the fd, no later
+    // fsync can reach the old file, and a crash loses data the client
+    // was acked for (invariant #14). Commit the old file before
+    // switching. filewrcommit is free outside durable mode and when
+    // nothing is staged (returns 1 without an fdatasync in both cases).
+    if (!filewrcommit(f)) {
+        // Staged bytes were ftruncated away by the commit rollback.
+        // Disable the WAL and poison this tick's group commit so
+        // dur_flush_all sends INTERNAL_ERROR, not ghost acks.
+        twarnx("wal: disabling WAL after rotation commit failure");
+        filewclose(f);
+        w->use = 0;
+        w->commit_failed = 1;
         return 0;
     }
 
@@ -363,6 +407,21 @@ walsync(Wal *w)
 }
 
 
+// wal_disabled_result — shared verdict for the WAL-disabled guard in
+// walwrite / wal_write_truncate / reserve. When the WAL is disabled the
+// legacy contract is: succeed silently (return 1) because nothing
+// persists anyway. Under durable mode (-D) that would let the caller
+// ghost-ack the client for a record that never became durable (see
+// #C1), so refuse with 0 instead — walresvput/walresvupdate propagate
+// the 0 upward and the dispatcher replies with a real error
+// (invariant #14). walcommit/walmaint/walresvreturn handle !w->use
+// with deliberately different semantics — do not funnel them here.
+static inline int
+wal_disabled_result(const Wal *w)
+{
+    return unlikely(w->durable_sync) ? 0 : 1;
+}
+
 // walwrite stages a WAL record: the writev and accounting happen now,
 // the fdatasync is deferred to walcommit() which the serv main loop
 // fires once per epoll drain (group commit — see invariant #16). One
@@ -378,10 +437,8 @@ walwrite(Wal *w, Job *j)
 {
     int r = 0;
 
-    if (!w->use) {
-        if (unlikely(w->durable_sync)) return 0;
-        return 1;
-    }
+    // Invariant-#14 refusal vs legacy silent success — see wal_disabled_result.
+    if (!w->use) return wal_disabled_result(w);
     if (likely(w->cur->resv > 0) || usenext(w)) {
         if (likely(j->file)) {
             r = filewrjobshort(w->cur, j);
@@ -390,9 +447,24 @@ walwrite(Wal *w, Job *j)
         }
     }
     if (unlikely(!r)) {
-        twarnx("wal: disabling WAL after write failure");
-        filewclose(w->cur);
-        w->use = 0;
+        // usenext()'s rotation-commit failure path has already closed
+        // w->cur and disabled the WAL. That filewclose may have dropped
+        // the last ref — a head binlog whose staged records were all
+        // deletes holds only the writer ref — and "filewclose is
+        // idempotent" holds only while the struct is still allocated,
+        // so w->cur must not be touched again here. walwrite is entered
+        // with w->use set and usenext zeroes it on exactly that path:
+        // gate on w->use.
+        if (w->use) {
+            // filewclose orphans any records staged into w->cur earlier
+            // in this tick (closed fd, never fsynced). Poison the tick
+            // so walcommit reports failure and dur_flush_all does not
+            // ghost-ack them (invariants #14/#16).
+            twarnx("wal: disabling WAL after write failure");
+            filewclose(w->cur);
+            w->use = 0;
+            w->commit_failed = 1;
+        }
         return 0;
     }
 
@@ -412,6 +484,18 @@ walwrite(Wal *w, Job *j)
 int
 walcommit(Wal *w)
 {
+    if (unlikely(w->commit_failed)) {
+        // A mid-tick failure (rotation commit, writev, truncate marker)
+        // already disabled w->use after this tick's staged records were
+        // lost. The disabled-WAL fast path below would report success
+        // and dur_flush_all would ghost-ack clients for records that
+        // never became durable — fail this one tick instead so the
+        // batch gets INTERNAL_ERROR (invariants #14/#16). One-shot:
+        // later ticks see w->use==0 and every walwrite refuses, so no
+        // new acks can be staged against the dead WAL.
+        w->commit_failed = 0;
+        return 0;
+    }
     if (!w->use) return 1;  // WAL disabled — nothing to commit
     if (!filewrcommit(w->cur)) {
         twarnx("wal: disabling WAL after commit failure");
@@ -427,10 +511,8 @@ walcommit(Wal *w)
 int
 wal_write_truncate(Wal *w, Tube *t, uint64 cutoff_id)
 {
-    if (!w->use) {
-        if (unlikely(w->durable_sync)) return 0;
-        return 1;
-    }
+    // Invariant-#14 refusal vs legacy silent success — see wal_disabled_result.
+    if (!w->use) return wal_disabled_result(w);
 
     int needed = sizeof(int) + (int)t->name_len + sizeof(Jobrec) + 2 + sizeof(uint32);
     if (!reserve(w, needed)) return 0;
@@ -450,6 +532,9 @@ wal_write_truncate(Wal *w, Tube *t, uint64 cutoff_id)
         twarnx("wal: disabling WAL after truncate-marker write failure");
         filewclose(w->cur);
         w->use = 0;
+        // Same poison as walwrite: records staged earlier this tick are
+        // now in a closed, unsynced file — walcommit must fail the tick.
+        w->commit_failed = 1;
         return 0;
     }
 
@@ -587,7 +672,11 @@ balance(Wal *w, int n)
         }
 
         moveresv(w->tail, w->cur, m);
-        usenext(w);
+        // usenext has a real runtime failure mode (rotation commit fail
+        // under -D disables the WAL). Ignoring it would spin this loop
+        // on a dead w->cur; reserve() rolls the reservation back on 0.
+        if (!usenext(w))
+            return 0;
     }
 
     // Invariants 2 and 3
@@ -601,16 +690,10 @@ reserve(Wal *w, int n)
 {
     int r;
 
-    // When WAL is disabled the legacy contract is: reserve succeeds
-    // silently (return nonzero) because nothing persists anyway. Under
-    // durable mode that would let a subsequent walwrite ghost-ack the
-    // client (see #C1), so refuse here too: walresvput/walresvupdate
-    // propagate 0 upward, and the dispatcher replies with a real error
-    // instead of an unconditional success.
-    if (!w->use) {
-        if (unlikely(w->durable_sync)) return 0;
-        return 1;
-    }
+    // Invariant-#14 refusal vs legacy silent success — see
+    // wal_disabled_result. Note: the disabled path keeps the legacy
+    // return value 1, not n.
+    if (!w->use) return wal_disabled_result(w);
 
     if (likely(w->cur->free >= n)) {
         w->cur->free -= n;

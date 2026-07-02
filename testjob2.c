@@ -428,3 +428,121 @@ cttest_job_pool_drain_spares_live_jobs()
     assertf(get_all_jobs_used() == 0, "no live jobs must remain after free");
     job_pool_drain();
 }
+
+// ─── Copy jobs and the size-class pool ──────────────────────
+// Historically job_free sent every Copy job to free(3) while do_stats /
+// do_list_tubes POPPED warm slabs from the pool for their Copy jobs —
+// monitoring traffic permanently drained the pool that PUT traffic
+// filled. job_copy now allocates via allocate_job (class-rounded slab)
+// and job_free pools copies. These tests fail on the old code and go
+// ASan-red on any half-applied fix (pooling copies while job_copy still
+// raw-mallocs is a heap overflow).
+
+void
+cttest_job_copy_free_returns_to_pool()
+{
+    TUBE_ASSIGN(dtube, make_tube("default"));
+    job_pool_drain();
+
+    Job *j = make_job(1, 0, 1000000000, 100, dtube);
+    assertf(j != NULL, "make_job");
+    memset(j->body, 'a', 100);
+
+    Job *c = job_copy(j);
+    assertf(c != NULL, "job_copy");
+    assertf(memcmp(c->body, j->body, 100) == 0, "body must be copied");
+    job_free(c);
+
+    // Old code: the copy goes to free(3), pool stays empty — this is
+    // the assert that kills the always-free behavior.
+    size_t bytes; int count;
+    get_job_pool_stats(&bytes, &count);
+    assertf(count == 1, "freed copy must be pooled, got %d", count);
+    assertf(bytes == sizeof(Job) + 130,
+            "pooled copy must account a class-1 slab: bytes=%zu", bytes);
+
+    // The pooled copy must be reusable by a same-class allocation.
+    Job *r = make_job(1, 0, 1000000000, 102, dtube);
+    assertf(r != NULL, "post-copy alloc");
+    get_job_pool_stats(&bytes, &count);
+    assertf(count == 0 && bytes == 0,
+            "class-1 alloc must pop the pooled copy: count=%d bytes=%zu",
+            count, bytes);
+
+    job_free(r);
+    job_free(j);
+    job_pool_drain();
+}
+
+void
+cttest_job_copy_pooled_slab_is_class_rounded()
+{
+    TUBE_ASSIGN(dtube, make_tube("default"));
+    job_pool_drain();
+
+    // Copy of a 100-byte body. With a raw-malloc job_copy the real slab
+    // would be sizeof(Job)+100; pooled as class 1 it would CLAIM a
+    // 130-byte slab.
+    Job *j = make_job(1, 0, 1000000000, 100, dtube);
+    assertf(j != NULL, "make_job");
+    memset(j->body, 'b', 100);
+    Job *c = job_copy(j);
+    assertf(c != NULL, "job_copy");
+    job_free(c);
+
+    size_t bytes; int count;
+    get_job_pool_stats(&bytes, &count);
+    assertf(count == 1, "copy must be pooled, got %d", count);
+
+    // Pop it at the class-1 ceiling (body_size 130 = user 128 + \r\n
+    // pad) and write every claimed byte. Under ASan this goes red
+    // against any fix that pools copies without class-rounding them.
+    Job *r = make_job(1, 0, 1000000000, 130, dtube);
+    assertf(r != NULL, "boundary alloc");
+    get_job_pool_stats(&bytes, &count);
+    assertf(count == 0,
+            "boundary alloc must reuse the pooled copy, got %d pooled", count);
+    memset(r->body, 'x', 130);
+
+    job_free(r);
+    job_free(j);
+    job_pool_drain();
+}
+
+void
+cttest_stats_copy_shrunken_body_pools_safely()
+{
+    TUBE_ASSIGN(dtube, make_tube("default"));
+    job_pool_drain();
+
+    // Mimic do_stats: allocate STATS_BUF_SIZE (4096), mark Copy, then
+    // SHRINK r.body_size to the formatted length before job_free. The
+    // pooling branch must classify by the shrunken size, and the
+    // (larger) real slab must cover the claimed class.
+    Job *s = allocate_job(4096);
+    assertf(s != NULL, "allocate_job(4096)");
+    s->r.state = Copy;
+    memset(s->body, 's', 900);
+    s->r.body_size = 900;
+    job_free(s);
+
+    size_t bytes; int count;
+    get_job_pool_stats(&bytes, &count);
+    assertf(count == 1, "shrunken copy must be pooled, got %d", count);
+    assertf(bytes == sizeof(Job) + 1026,
+            "accounting must follow the shrunken class (1026 slab): bytes=%zu",
+            bytes);
+
+    // Pop from the shrunken class and write the full claimed slab —
+    // proves the real 4098-byte slab backs the claimed 1026 bytes.
+    Job *r = make_job(1, 0, 1000000000, 1026, dtube);
+    assertf(r != NULL, "class-4 alloc");
+    get_job_pool_stats(&bytes, &count);
+    assertf(count == 0 && bytes == 0,
+            "class-4 alloc must pop the pooled entry: count=%d bytes=%zu",
+            count, bytes);
+    memset(r->body, 'y', 1026);
+
+    job_free(r);
+    job_pool_drain();
+}

@@ -62,15 +62,12 @@ printf 'live\t%s\n' "\$(rss)"
 } | nc -q1 127.0.0.1 11300 > /dev/null
 printf 'pooled\t%s\n' "\$(rss)"
 
-# Phase 3: low activity past the -m trim interval. prottick only runs when the
-# event loop is woken (idle period defaults to 1h), so a quiescent sleep never
-# trims; a light stats trickle keeps the loop ticking until the -m interval
-# elapses and drain + malloc_trim fire. Mirrors a server going quiet but not
-# dead (health checks / polling clients).
-for k in \$(seq 1 "\$IDLE"); do
-  printf 'stats\r\nquit\r\n' | nc -q1 127.0.0.1 11300 > /dev/null
-  sleep 0.5
-done
+# Phase 3: full quiescence past the -m trim interval. prottick feeds the
+# trim deadline into its epoll timeout, so an idle server self-wakes at the
+# -m cadence and drain + malloc_trim fire with zero client traffic. A plain
+# sleep is the honest probe — the old stats trickle here was a workaround
+# for the idle-never-trims bug and would mask its regression.
+sleep "\$IDLE"
 printf 'idle\t%s\n' "\$(rss)"
 EOF
 

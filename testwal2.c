@@ -587,3 +587,101 @@ cttest_wal_v8_header_byte()
 
     assertf(ver == 8, "binlog version header: expected 8, got %d", ver);
 }
+
+
+// Hand-craft a v7 binlog.1: [int32 ver=7] [full record for job 1 in
+// "default": namelen=7, name, Jobrec{body_size=5}, body "abc\r\n"]
+// [short record for job 1: namelen=0, Jobrec{state=Buried,
+// body_size=short_body_size}] [zero padding -> clean EOF]. v7 carries
+// no CRC trailer, so the short record's body_size field is whatever
+// the disk says — the reader must cross-check it itself.
+static void
+wal_write_v7_short_record_fixture(int32 short_body_size)
+{
+    char *path = wal_binlog_path(1);
+    int bfd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    assertf(bfd >= 0, "create v7 fixture");
+
+    int ver7 = 7;
+    assertf(write(bfd, &ver7, sizeof ver7) == (ssize_t)sizeof ver7,
+            "write v7 header");
+
+    // Full record: establishes job 1 with a 5-byte body allocation.
+    int nl = 7;
+    Jobrec jr = {0};
+    jr.id = 1;
+    jr.pri = 0;
+    jr.delay = 0;
+    jr.ttr = 120000000000LL; // 120s in ns
+    jr.body_size = 5;        // "abc" + "\r\n"
+    jr.created_at = 1;
+    jr.state = Ready;
+    assertf(write(bfd, &nl, sizeof nl) == (ssize_t)sizeof nl, "full namelen");
+    assertf(write(bfd, "default", 7) == 7, "tube name");
+    assertf(write(bfd, &jr, sizeof jr) == (ssize_t)sizeof jr, "full jobrec");
+    assertf(write(bfd, "abc\r\n", 5) == 5, "full body");
+
+    // Short record: state update for job 1. The writer always snapshots
+    // the live j->r, so a legit short record repeats body_size=5; the
+    // hostile variant plants a different value.
+    int nl0 = 0;
+    Jobrec jrs = jr;
+    jrs.state = Buried;
+    jrs.body_size = short_body_size;
+    assertf(write(bfd, &nl0, sizeof nl0) == (ssize_t)sizeof nl0,
+            "short namelen");
+    assertf(write(bfd, &jrs, sizeof jrs) == (ssize_t)sizeof jrs,
+            "short jobrec");
+
+    // Zero padding parses as namelen=0 + all-zero Jobrec -> jr.id==0
+    // -> clean EOF for readrec7.
+    char zeros[512] = {0};
+    assertf(write(bfd, zeros, sizeof zeros) == (ssize_t)sizeof zeros, "pad");
+    close(bfd);
+    free(path);
+}
+
+
+// v7 short records (namelen==0) used to skip ALL body_size validation:
+// `j->r = jr` copied a corrupt size straight into the live job while
+// the real allocation stayed 5 bytes. Consequences of replaying it:
+// (a) peek/reserve would send r.body_size bytes from the 5-byte heap
+// buffer to the client (OOB read), and (b) job_free would file the
+// 5-byte slab into pool_class(60000) — a later 64KB PUT reusing that
+// slab overflows it. The reader must reject the record; the corrupt
+// state update takes the job down with it (same contract as a v8 CRC
+// mismatch on a full record).
+void
+cttest_wal_v7_short_record_body_size_corruption_rejected()
+{
+    wal_setup();
+    wal_write_v7_short_record_fixture(60000); // full record said 5
+
+    int port = wal_startsrv();
+    int fd = wal_dial(port);
+    wal_send(fd, "stats-job 1\r\n");
+    wal_ckline(fd, "NOT_FOUND\r\n");
+    wal_killsrv();
+}
+
+
+// Companion compatibility guard: a LEGIT v7 short record — body_size
+// equal to the full record's, exactly as every writer (v7 and v8)
+// produces — must still replay, preserving both the buried state and
+// the body bytes. If the mismatch check ever rejects equal sizes,
+// this fails: the fix may only kill corrupt records, never real ones.
+void
+cttest_wal_v7_short_record_legit_still_replays()
+{
+    wal_setup();
+    wal_write_v7_short_record_fixture(5); // matches the full record
+
+    int port = wal_startsrv();
+    int fd = wal_dial(port);
+    // The short record buried job 1; body must be intact ("abc" = 3
+    // bytes net of the \r\n trailer).
+    wal_send(fd, "peek-buried\r\n");
+    wal_ckline(fd, "FOUND 1 3\r\n");
+    wal_ckline(fd, "abc\r\n");
+    wal_killsrv();
+}

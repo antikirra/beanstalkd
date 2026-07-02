@@ -311,6 +311,21 @@ readrec(File *f, Job *l, int *err)
             job_list_reset(j);
             j->r.created_at = jr.created_at;
         }
+
+        // A short record is a state update for an existing job; its
+        // body_size must equal the size set by the job's full record
+        // (the writer snapshots the immutable j->r). Reject a mismatch
+        // BEFORE `j->r = jr`: otherwise the bogus size is copied into
+        // j->r and the Error path's job_free would file j->body into
+        // the wrong size-class pool slab (heap overflow on reuse).
+        // Unreachable here under a valid CRC trailer; kept as free
+        // defense in depth mirroring the v7 reader, where it is
+        // load-bearing.
+        if (!namelen && jr.body_size != j->r.body_size) {
+            warnpos(f, -sz, "job %"PRIu64" short-record body_size changed (was %d, now %d)",
+                    jr.id, j->r.body_size, jr.body_size);
+            goto Error;
+        }
         {
         int32 old_body_size = j->r.body_size;
         j->r = jr;
@@ -391,7 +406,8 @@ Error:
 
 // Readrec7 reads a v7 WAL record. v7 has no CRC trailer; this function is
 // an unchanged snapshot of the previous readrec implementation and exists
-// to recover pre-v8 binlogs during migration. See dat.h:186 for procedure.
+// to recover pre-v8 binlogs during migration. See the Walver workflow
+// comment above struct Jobrec in dat.h for the procedure.
 static int
 readrec7(File *f, Job *l, int *err)
 {
@@ -482,6 +498,24 @@ readrec7(File *f, Job *l, int *err)
             }
             job_list_reset(j);
             j->r.created_at = jr.created_at;
+        }
+
+        // A short record is a state update for an existing job; its
+        // body_size must equal the size set by the job's full record
+        // (the writer snapshots the immutable j->r), so a mismatch is
+        // corruption. v7 has no CRC trailer: without this check a
+        // bit-flipped body_size would be copied into j->r below and
+        // later poison the size-class pool — job_free pools the small
+        // j->body slab under the bogus (large) class, and a future
+        // allocate_job hands that slab to a real large PUT whose body
+        // write overflows it. Reject BEFORE `j->r = jr` so the Error
+        // path frees j by its true size. Full records already get the
+        // symmetric "size changed" check below; short records were the
+        // unvalidated gap.
+        if (!namelen && jr.body_size != j->r.body_size) {
+            warnpos(f, -sz, "job %"PRIu64" short-record body_size changed (was %d, now %d)",
+                    jr.id, j->r.body_size, jr.body_size);
+            goto Error;
         }
         {
         int32 old_body_size = j->r.body_size;
@@ -818,6 +852,24 @@ filewrite_commit_durable(File *f, int total)
     return 0;
 }
 
+// file_stage_account applies the staging-side accounting shared by
+// filewritev and filewrtruncate: `total` bytes leave the reservation
+// (w->resv, f->resv) and become uncommitted-but-alive. filewrcommit's
+// commit-fail rollback reverses exactly these counters, so the two
+// staging paths must stay in lockstep — hence one helper. Per-job
+// (j->walresv, j->walused) and per-marker (f->marker_bytes,
+// f->uncommitted_marker_bytes) adjustments stay at the call sites:
+// a truncate marker has no Job, a job record is not a marker.
+static inline void
+file_stage_account(File *f, int total)
+{
+    f->uncommitted_bytes += total;
+    f->uncommitted_alive += total;
+    f->w->resv -= total;
+    f->resv -= total;
+    f->w->alive += total;
+}
+
 // filewritev stages a WAL record: writev_all + accounting, NO fdatasync.
 // Accounting is applied immediately on success so each stage looks the
 // same to subsequent stages in the same batch; filewrcommit() later
@@ -840,12 +892,9 @@ filewritev(File *f, Job *j, struct iovec *iov, int iovcnt)
 
     if (!writev_all(f->fd, iov, iovcnt, total)) return 0;
 
-    f->uncommitted_bytes += total;
-    f->w->resv -= total;
-    f->resv -= total;
+    file_stage_account(f, total);
     j->walresv -= total;
     j->walused += total;
-    f->w->alive += total;
     return 1;
 }
 
@@ -860,10 +909,17 @@ filewritev(File *f, Job *j, struct iovec *iov, int iovcnt)
 //   looks the same to subsequent stages. If the batch commit fails and
 //   the tail is ftruncate'd away, those adjustments must be reversed
 //   or w->resv / w->alive drift from what the disk actually holds.
-//   Per-job counters (j->walresv, j->walused) would require a
-//   pending-job list on File; left as a known gap since walcommit
+//   w->resv reverts by the full uncommitted_bytes (every stage took
+//   its reservation and nothing returned it), but w->alive reverts by
+//   uncommitted_alive only: filewrjobshort immediately undoes its own
+//   alive contribution (#622 dead space), so reverting the full batch
+//   would subtract short-record bytes a second time and drive alive
+//   negative. Per-job counters (j->walresv, j->walused) would require
+//   a pending-job list on File; left as a known gap since walcommit
 //   disables the WAL on fail, after which no further walresv* /
-//   walwrite call references those per-job fields.
+//   walwrite call references those per-job fields. The same gap covers
+//   the full-record bytes that an Invalid short record's filermjob
+//   already subtracted from alive — they are not restored either.
 //
 // In durable_sync=0 mode this is a no-op (matches legacy behaviour of
 // filewritev: fdatasync only fires under -D).
@@ -880,13 +936,36 @@ filewrcommit(File *f)
         // disk AND accounting.
         f->w->resv  += total;
         f->resv     += total;
-        f->w->alive -= total;
+        f->w->alive -= f->uncommitted_alive;
+        // Truncate-marker bytes staged in this batch are gone from the
+        // tail too; forget them or walgc would over-subtract from
+        // w->alive when this file is eventually unlinked.
+        f->marker_bytes -= f->uncommitted_marker_bytes;
     }
-    // On success or rollback, the counter is drained: success leaves bytes
-    // durable, rollback has removed them from the tail. Either way the
-    // next batch starts fresh.
+    // On success or rollback, the counters are drained: success leaves
+    // bytes durable, rollback has removed them from the tail. Either way
+    // the next batch starts fresh.
     f->uncommitted_bytes = 0;
+    f->uncommitted_alive = 0;
+    f->uncommitted_marker_bytes = 0;
     return r;
+}
+
+
+// crc32c_trailer_le serializes the v8 WAL record trailer: final XOR,
+// then 4 bytes little-endian. This is the single encoder for the
+// on-disk trailer format; the decode mirror is in readrec (stored vs
+// computed). testwal2.c re-implements the trailer independently on
+// purpose — it is the oracle proving the on-disk bytes — do not
+// "deduplicate" it into this helper.
+static inline void
+crc32c_trailer_le(uint32 crc, unsigned char out[4])
+{
+    crc ^= WAL_CRC32C_XOR;
+    out[0] = (unsigned char)(crc      );
+    out[1] = (unsigned char)(crc >>  8);
+    out[2] = (unsigned char)(crc >> 16);
+    out[3] = (unsigned char)(crc >> 24);
 }
 
 
@@ -899,13 +978,8 @@ filewrjobshort(File *f, Job *j)
     uint32 crc = WAL_CRC32C_INIT;
     crc = wal_crc32c(crc, &nl,   sizeof nl);
     crc = wal_crc32c(crc, &j->r, sizeof j->r);
-    crc ^= WAL_CRC32C_XOR;
-    unsigned char crc_bytes[4] = {
-        (unsigned char)(crc      ),
-        (unsigned char)(crc >>  8),
-        (unsigned char)(crc >> 16),
-        (unsigned char)(crc >> 24),
-    };
+    unsigned char crc_bytes[4];
+    crc32c_trailer_le(crc, crc_bytes);
 
     struct iovec iov[3] = {
         { .iov_base = &nl,       .iov_len = sizeof nl },
@@ -919,10 +993,14 @@ filewrjobshort(File *f, Job *j)
     // Short records are state updates for an existing job whose
     // authoritative data lives in a full record (in j->file).
     // Undo the alive/walused accounting from filewritev to prevent
-    // phantom bytes that suppress compaction ratio (#622).
+    // phantom bytes that suppress compaction ratio (#622). Also undo
+    // uncommitted_alive: these bytes are no longer counted in w->alive,
+    // so the commit-fail rollback must not subtract them a second time
+    // (it reverts only uncommitted_alive, never the whole batch).
     int total = sizeof(int) + sizeof(Jobrec) + sizeof crc_bytes;
     j->walused -= total;
     f->w->alive -= total;
+    f->uncommitted_alive -= total;
 
     if (j->r.state == Invalid) {
         filermjob(j->file, j);
@@ -943,13 +1021,8 @@ filewrjobfull(File *f, Job *j)
     crc = wal_crc32c(crc, j->tube->name, nl);
     crc = wal_crc32c(crc, &j->r,         sizeof j->r);
     crc = wal_crc32c(crc, j->body,       j->r.body_size);
-    crc ^= WAL_CRC32C_XOR;
-    unsigned char crc_bytes[4] = {
-        (unsigned char)(crc      ),
-        (unsigned char)(crc >>  8),
-        (unsigned char)(crc >> 16),
-        (unsigned char)(crc >> 24),
-    };
+    unsigned char crc_bytes[4];
+    crc32c_trailer_le(crc, crc_bytes);
 
     struct iovec iov[5] = {
         { .iov_base = &nl,           .iov_len = sizeof nl },
@@ -987,13 +1060,8 @@ filewrtruncate(File *f, Tube *t, uint64 cutoff_id)
     crc = wal_crc32c(crc, t->name, nl);
     crc = wal_crc32c(crc, &jr,     sizeof jr);
     crc = wal_crc32c(crc, body,    sizeof body);
-    crc ^= WAL_CRC32C_XOR;
-    unsigned char crc_bytes[4] = {
-        (unsigned char)(crc      ),
-        (unsigned char)(crc >>  8),
-        (unsigned char)(crc >> 16),
-        (unsigned char)(crc >> 24),
-    };
+    unsigned char crc_bytes[4];
+    crc32c_trailer_le(crc, crc_bytes);
 
     struct iovec iov[5] = {
         { .iov_base = &nl,       .iov_len = sizeof nl },
@@ -1006,10 +1074,14 @@ filewrtruncate(File *f, Tube *t, uint64 cutoff_id)
     int total = sizeof(int) + nl + sizeof(Jobrec) + sizeof body + sizeof(uint32);
     if (!writev_all(f->fd, iov, 5, total)) return 0;
 
-    f->uncommitted_bytes += total;
-    f->w->resv -= total;
-    f->resv -= total;
-    f->w->alive += total;
+    file_stage_account(f, total);
+    // Remember the marker bytes per file: they are not in f->jlist, so
+    // filermjob never reclaims them from w->alive. walgc subtracts
+    // f->marker_bytes when the file is unlinked — without that, every
+    // compact_post re-emission would inflate w->alive forever and make
+    // ratio()-driven compaction monotonically lazier.
+    f->marker_bytes += total;
+    f->uncommitted_marker_bytes += total;
     return 1;
 }
 

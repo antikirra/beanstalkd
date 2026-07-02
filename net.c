@@ -3,7 +3,6 @@
 #include <netdb.h>
 #include <stdio.h>
 #include <unistd.h>
-#include <fcntl.h>
 #include <string.h>
 #include <errno.h>
 #include <sys/socket.h>
@@ -16,24 +15,6 @@
 #ifdef HAVE_LIBSYSTEMD
 #include <systemd/sd-daemon.h>
 #endif
-
-int
-make_nonblocking(int fd)
-{
-    int flags, r;
-
-    flags = fcntl(fd, F_GETFL, 0);
-    if (flags < 0) {
-        twarn("getting flags");
-        return -1;
-    }
-    r = fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-    if (r == -1) {
-        twarn("setting O_NONBLOCK");
-        return -1;
-    }
-    return 0;
-}
 
 static int
 make_inet_socket(char *host, char *port)
@@ -201,7 +182,7 @@ make_unix_socket(char *path)
     memset(&addr, 0, sizeof(struct sockaddr_un));
     addr.sun_family = AF_UNIX;
     if (strlen(path) > maxlen) {
-        warnx("socket path %s is too long (%ld characters), where maximum allowed is %ld",
+        warnx("socket path %s is too long (%zu characters), where maximum allowed is %zu",
               path, strlen(path), maxlen);
         return -1;
     }

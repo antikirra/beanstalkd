@@ -20,6 +20,53 @@ int verbose = 0;
 static Conn *conn_pool = NULL;
 static int conn_pool_len = 0;
 
+// conn_pool_put returns c to the slab pool, or frees it when the pool
+// is full. Sole owner of the pool-push invariant (its pair is the pool
+// take at the top of make_conn).
+static void
+conn_pool_put(Conn *c)
+{
+    if (conn_pool_len < CONN_POOL_MAX) {
+        c->next = conn_pool;
+        conn_pool = c;
+        conn_pool_len++;
+    } else {
+        free(c);
+    }
+}
+
+// conn_pool_drain frees every pooled Conn back to glibc and resets the
+// free list. Pooled entries are live allocations the allocator holds for
+// O(1) reuse; malloc_trim(0) cannot reclaim their pages while they sit
+// on the free list (after a connection burst that is ~1.2MB of
+// permanently-resident slack: CONN_POOL_MAX * sizeof(Conn)). prottick
+// calls this right before the periodic malloc_trim(0) (-m cadence),
+// mirroring job_pool_drain. Every entry here went through connclose, so
+// it is fully detached (no epollq link, no dur batch, no watch refs);
+// plain free() is the same sanctioned path conn_pool_put takes on
+// overflow. Counter balance (#2): conn_pool_len is zeroed exactly as
+// every entry is freed.
+void
+conn_pool_drain(void)
+{
+    Conn *c = conn_pool;
+    while (c) {
+        Conn *next = c->next;
+        free(c);
+        c = next;
+    }
+    conn_pool = NULL;
+    conn_pool_len = 0;
+}
+
+/* for unit tests: number of Conns currently sitting in the slab pool */
+void
+get_conn_pool_stats(int *count)
+{
+    if (count)
+        *count = conn_pool_len;
+}
+
 // Callbacks for c->watch Ms: manage tube refcount and watching_ct.
 static void
 on_watch_insert(Ms *a, void *item, size_t i)
@@ -34,12 +81,67 @@ on_watch_insert(Ms *a, void *item, size_t i)
 static void
 on_watch_remove(Ms *a, void *item, size_t i)
 {
-    UNUSED_PARAMETER(a);
-    UNUSED_PARAMETER(i);
     Tube *t = item;
     t->watching_ct--;
     tube_dref(t);
+    // ms_delete swap-moved the last watch entry into slot i; mirror the
+    // swap in the parallel waitpos hint array so a WAITING conn's hints
+    // keep tracking their tubes (OP_IGNORE shrinks watch while the conn
+    // stays waiting on the remaining tubes). Bounds-gated: a conn that
+    // never waited may have a smaller (or absent) hint array, and its
+    // hints are meaningless anyway.
+    Conn *c = (Conn *)((char *)a - offsetof(Conn, watch));
+    if (i < a->len && a->len < c->waitpos_cap)
+        c->waitpos[i] = c->waitpos[a->len];
 }
+
+// conn_waitpos_reserve — see dat.h. Doubling growth mirrors Ms.
+int
+conn_waitpos_reserve(Conn *c, size_t n)
+{
+    if (n <= c->waitpos_cap)
+        return 1;
+    size_t ncap = c->waitpos_cap ? c->waitpos_cap << 1 : 8;
+    if (ncap < n)
+        ncap = n;
+    size_t *p = realloc(c->waitpos, ncap * sizeof(*p));
+    if (!p)
+        return 0;
+    c->waitpos = p;
+    c->waitpos_cap = ncap;
+    return 1;
+}
+
+// on_waiting_conn_remove keeps waitpos hints fresh on the other side:
+// removal from a tube's waiting_conns is swap-remove, so the conn that
+// got MOVED into slot i must update its cached position for this tube.
+// O(moved->watch.len), typically 1-2 entries. A miss (corrupt watch
+// set) just leaves a stale hint — ms_remove_at degrades to the old
+// linear scan, never to corruption.
+void
+on_waiting_conn_remove(Ms *a, void *item, size_t i)
+{
+    UNUSED_PARAMETER(item);
+    if (i >= a->len)
+        return; // removed the tail; nothing was moved
+    Tube *t = (Tube *)((char *)a - offsetof(Tube, waiting_conns));
+    Conn *moved = a->items[i];
+    for (size_t k = 0; k < moved->watch.len; k++) {
+        if (moved->watch.items[k] == t) {
+            if (k < moved->waitpos_cap)
+                moved->waitpos[k] = i;
+            return;
+        }
+    }
+}
+
+// The pool-reuse memset below zeroes only [0, offsetof(Conn, cmd)).
+// Keep every large buffer (cmd, reply_buf, dur_reply_buf) at the end of
+// struct Conn so the hot accept path never wastes cycles zeroing them;
+// their contents are gated by cmd_len/reply_len/dur_reply_len instead.
+_Static_assert(offsetof(Conn, cmd) < 1024,
+               "memset hot path must exclude large buffers; "
+               "do not insert big arrays before cmd[] in struct Conn");
 
 Conn *
 make_conn(int fd, char start_state, Tube *use, Tube *watch)
@@ -67,14 +169,8 @@ make_conn(int fd, char start_state, Tube *use, Tube *watch)
     if (!ms_append(&c->watch, watch)) { // callback: iref + watching_ct++
         twarn("OOM");
         // Don't close fd — caller is responsible for cleanup.
-        if (conn_pool_len < CONN_POOL_MAX) {
-            c->sock.fd = -1;
-            c->next = conn_pool;
-            conn_pool = c;
-            conn_pool_len++;
-        } else {
-            free(c);
-        }
+        c->sock.fd = -1;
+        conn_pool_put(c);
         return NULL;
     }
 
@@ -114,25 +210,25 @@ connsetworker(Conn *c)
 }
 
 uint
-count_cur_conns()
+count_cur_conns(void)
 {
     return cur_conn_ct;
 }
 
 uint
-count_tot_conns()
+count_tot_conns(void)
 {
     return tot_conn_ct;
 }
 
 uint
-count_cur_producers()
+count_cur_producers(void)
 {
     return cur_producer_ct;
 }
 
 uint
-count_cur_workers()
+count_cur_workers(void)
 {
     return cur_worker_ct;
 }
@@ -210,7 +306,8 @@ connsched(Conn *c)
 // conn_set_soonestjob updates c->soonest_job with j
 // if j should be handled sooner than c->soonest_job.
 static inline void
-conn_set_soonestjob(Conn *c, Job *j) {
+conn_set_soonestjob(Conn *c, Job *j)
+{
     if (likely(!c->soonest_job) || j->r.deadline_at < c->soonest_job->r.deadline_at) {
         c->soonest_job = j;
     }
@@ -233,7 +330,8 @@ connsoonestjob(Conn *c)
 }
 
 __attribute__((hot)) void
-conn_reserve_job(Conn *c, Job *j) {
+conn_reserve_job(Conn *c, Job *j)
+{
     j->tube->stat.reserved_ct++;
     j->r.reserve_ct++;
 
@@ -335,12 +433,12 @@ connclose(Conn *c)
         sockwant(&c->srv->sock, 'r');
     }
 
+    // The waitpos hint array dies with the watch set: the pool-reuse
+    // memset in make_conn would zero the pointer and leak the block.
+    free(c->waitpos);
+    c->waitpos = NULL;
+    c->waitpos_cap = 0;
+
     // Return to pool for reuse, or free if pool is full.
-    if (conn_pool_len < CONN_POOL_MAX) {
-        c->next = conn_pool;
-        conn_pool = c;
-        conn_pool_len++;
-    } else {
-        free(c);
-    }
+    conn_pool_put(c);
 }

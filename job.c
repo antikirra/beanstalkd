@@ -269,9 +269,19 @@ job_free(Job *j)
     TUBE_ASSIGN(j->tube, NULL);
     if (likely(!is_copy)) job_hash_free(j);
 
-    // Pool regular jobs for reuse; copies, oversized, and excess go to free().
+    // Pool class-sized jobs for reuse — copies included; oversized and
+    // excess go to free(). Pooling copies is safe because every Job is
+    // born in allocate_job (job_copy included), which class-rounds the
+    // real slab even on a fresh malloc, and r.body_size only ever
+    // SHRINKS after allocation (sole sites in prot.c do_stats /
+    // do_list_tubes trim a Copy to the formatted length). Hence
+    // pool_class(body_size) here <= the alloc-time class and the actual
+    // slab always covers the claimed class. Accepted side effect: a
+    // shrunken entry makes pool_mem under-count its real bytes (bounded
+    // by STATS_BUF_SIZE per entry; safe direction — the slab is never
+    // smaller than claimed).
     int cls = pool_class(j->r.body_size);
-    if (likely(!is_copy) && likely(cls >= 0)) {
+    if (likely(cls >= 0)) {
         size_t entry_bytes = sizeof(Job) + (size_t)((64 << cls) + POOL_PAD);
         if (pool_len[cls] < POOL_PER_CLASS
             && pool_mem + entry_bytes <= POOL_MEM_MAX) {
@@ -344,13 +354,21 @@ job_copy(Job *j)
     if (!j)
         return NULL;
 
-    Job *n = malloc(sizeof(Job) + j->r.body_size);
+    // Allocate through the size-class pool so the copy's slab is
+    // class-rounded like every other job, letting job_free pool copies
+    // on release (stats/list-tubes/peek copies otherwise drain warm
+    // slabs from the pool back to glibc). A raw malloc here would make
+    // pooling copies in job_free a heap overflow: the claimed class
+    // slab could exceed the actual allocation. Copies stay out of the
+    // job hash — no store_job.
+    Job *n = allocate_job(j->r.body_size);
     if (!n) {
         twarnx("OOM");
         return (Job *) 0;
     }
 
-    // Copy Jobrec (the value fields) and body only.
+    // Copy Jobrec (the value fields) and body only; this restores the
+    // source's id/created_at/body_size over allocate_job's fresh memset.
     // Skip Job's pointer fields (tube, file, ht_next, etc.) which are
     // reset below — avoids copying ~80 bytes that get overwritten.
     n->r = j->r;
@@ -390,8 +408,9 @@ job_state(Job *j)
     return "invalid";
 }
 
-// job_list_reset detaches head from the list,
-// marking the list starting in head pointing to itself.
+// job_list_remove unlinks j from its doubly-linked list and resets it
+// to a singleton. Returns j, or NULL if j is NULL or not linked into a
+// list.
 Job *
 job_list_remove(Job *j)
 {
@@ -419,7 +438,7 @@ job_list_insert(Job *head, Job *j)
 
 /* for unit tests */
 size_t
-get_all_jobs_used()
+get_all_jobs_used(void)
 {
     return all_jobs_used;
 }

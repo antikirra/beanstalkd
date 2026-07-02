@@ -48,4 +48,12 @@ void fault_clear_all(void);
 int  fault_hits(int which);
 int  fault_calls(int which);
 
+// One-shot hook invoked immediately before the real epoll_pwait, then
+// auto-disarmed. Unlike the fault table above it never fails the call;
+// it exists to land work (e.g. kill(getpid(), SIGTERM)) deterministically
+// inside the historical check-then-block window between srvserve's
+// shutdown_requested test and the kernel parking the thread in epoll.
+// Cleared by fault_clear_all().
+extern void (*epoll_pwait_pre_hook)(void);
+
 #endif

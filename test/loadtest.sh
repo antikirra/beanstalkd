@@ -3,7 +3,7 @@ set -euo pipefail
 
 echo "========================================"
 echo "  Beanstalkd Load Test Suite"
-echo "  ASan + Valgrind + WAL Recovery"
+echo "  ASan + Valgrind + WAL Recovery + Priv Drop"
 echo "========================================"
 
 ASAN_BIN=/usr/local/bin/beanstalkd-asan
@@ -197,6 +197,58 @@ else
     fi
     kill $PID3B 2>/dev/null; wait $PID3B 2>/dev/null || true
 fi
+
+# ============================================================
+echo ""
+echo "=== PHASE 4: privilege drop sheds supplementary groups ==="
+# ============================================================
+# Hostile probe for su() in main.c (CWE-271): setuid/setgid alone do
+# NOT clear the caller's supplementary groups. Start the server as
+# root with deliberately poisoned supplementary groups; after
+# `-u nobody` none of them may survive in /proc/<pid>/status.
+# Pre-fix (no initgroups before setgid) this deterministically FAILs
+# with "Groups: 1 2 3" retained.
+setpriv --reuid 0 --regid 0 --groups 1,2,3 \
+    $DEBUG_BIN -u nobody -p 11430 &
+PID4=$!; sleep 2
+
+if ! kill -0 $PID4 2>/dev/null; then
+    echo "  Priv drop: FAIL (server did not start under -u nobody)"
+    phase_result FAIL
+else
+    UID_LINE=$(grep '^Uid:' /proc/$PID4/status)
+    GROUPS_LINE=$(grep '^Groups:' /proc/$PID4/status)
+    echo "  $UID_LINE"
+    echo "  $GROUPS_LINE"
+    NOBODY_UID=$(id -u nobody)
+    if ! echo "$UID_LINE" | grep -qw "$NOBODY_UID"; then
+        echo "  Priv drop: FAIL (uid not dropped to nobody)"
+        phase_result FAIL
+    elif echo "$GROUPS_LINE" | sed 's/^Groups://' | grep -qwE '1|2|3'; then
+        echo "  Priv drop: FAIL (root's supplementary groups retained)"
+        phase_result FAIL
+    else
+        echo "  Priv drop: PASS"
+        phase_result PASS
+    fi
+    kill $PID4 2>/dev/null || true; wait $PID4 2>/dev/null || true
+fi
+
+# Regression guard: an already-unprivileged `-u <self>` invocation must
+# keep working. The group reset in su() is gated on euid==0 — an
+# unconditional setgroups/initgroups would EPERM here and exit(34).
+setpriv --reuid nobody --regid nogroup --init-groups \
+    $DEBUG_BIN -u nobody -p 11431 &
+PID5=$!; sleep 2
+
+if kill -0 $PID5 2>/dev/null; then
+    echo "  Non-root -u <self>: PASS"
+    phase_result PASS
+else
+    echo "  Non-root -u <self>: FAIL (unprivileged -u nobody no longer starts)"
+    phase_result FAIL
+fi
+kill $PID5 2>/dev/null || true; wait $PID5 2>/dev/null || true
 
 # ============================================================
 echo ""

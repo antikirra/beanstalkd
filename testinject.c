@@ -4,13 +4,17 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <sys/uio.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/epoll.h>
 #include <pthread.h>
 
 struct fault faults[FAULT_COUNT];
+
+void (*epoll_pwait_pre_hook)(void) = 0;
 
 static int
 default_err(int which)
@@ -59,6 +63,7 @@ fault_clear_all(void)
         faults[i].hits = 0;
         faults[i].calls = 0;
     }
+    epoll_pwait_pre_hook = 0;
 }
 
 int
@@ -224,4 +229,23 @@ __wrap_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
         return err ? err : EAGAIN;
     }
     return __real_pthread_create(thread, attr, start, arg);
+}
+
+extern int __real_epoll_pwait(int, struct epoll_event *, int, int,
+                              const sigset_t *);
+
+// Not a fault: the call always proceeds. The one-shot hook runs in the
+// exact spot where the historical SIGTERM shutdown race lived — after
+// srvserve's shutdown_requested check, immediately before the kernel
+// parks the thread — making the race window deterministic for tests.
+int
+__wrap_epoll_pwait(int epfd, struct epoll_event *events, int maxevents,
+                   int timeout, const sigset_t *sigmask)
+{
+    void (*hook)(void) = epoll_pwait_pre_hook;
+    if (hook) {
+        epoll_pwait_pre_hook = 0; // one-shot: disarm before running
+        hook();
+    }
+    return __real_epoll_pwait(epfd, events, maxevents, timeout, sigmask);
 }

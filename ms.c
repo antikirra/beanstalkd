@@ -77,7 +77,9 @@ ms_remove(Ms *a, void *item)
 }
 
 // ms_remove_at removes item from position i in O(1) if the hint is correct.
-// Falls back to O(n) linear scan if the hint is stale.
+// Falls back to O(n) linear scan if the hint is stale — a wrong hint
+// degrades to ms_remove's cost, never to corruption. Prod users:
+// waiting_conns removal via Conn.waitpos and the truncated-tube registry.
 int
 ms_remove_at(Ms *a, size_t i, void *item)
 {

@@ -47,13 +47,19 @@ and format of the `beanstalkd` protocol.
   (This option has no effect without `-b`.)
 
 * `-D`:
-  Durable mode: call fdatasync(2) synchronously inside every binlog
-  write so that a successful reply to the client guarantees the data
-  is already on disk. This disables the asynchronous fsync thread
-  (implies `-F`) and significantly reduces throughput; use when
-  zero-loss durability matters more than peak ops/sec.
+  Durable mode: a successful reply to the client guarantees the data
+  is already on disk (ack implies durable). Binlog writes are staged
+  and committed as a group: one fdatasync(2) per event-loop tick
+  covers every record staged during that tick, so pipelined clients
+  see throughput comparable to the asynchronous default. Strictly
+  serial clients (one command per round trip) still pay one fdatasync
+  per operation. This disables the asynchronous fsync thread
+  (implies `-F`).
 
-  (This option has no effect without `-b`.)
+  Without `-b` the server starts but warns at startup, and every
+  persistent command returns a real error instead of acknowledging an
+  unsaved write. The canonical durable configuration is `-D` `-b`
+  <path>.
 
 * `-h`:
   Show a brief help message and exit.
@@ -93,9 +99,38 @@ and format of the `beanstalkd` protocol.
   The maximum size in bytes of a job.
 
 * `-m` <sec>:
-  Return unused memory to the OS at most once every <sec> seconds.
-  This helps reduce resident memory after mass job deletion on glibc
-  systems. A value of 0 disables this behavior. The default is 60.
+  Return unused memory to the OS every <sec> seconds, even while the
+  server is otherwise idle. This helps reduce resident memory after
+  mass job deletion on glibc systems. A value of 0 disables this
+  behavior. The default is 60.
+
+* `-t` <cpu>:
+  Pin the main thread to CPU core <cpu>. The default is no pinning.
+  The value must be a valid online CPU index; out-of-range values are
+  rejected at startup.
+
+* `-c` <n>:
+  Reject new connections once the current connection count reaches
+  <n>. A value of 0 (the default) means unlimited, preserving upstream
+  behavior. The kernel file-descriptor limit remains the hard cap.
+
+* `-I` <sec>:
+  Close connections that have been idle for <sec> seconds. A value of
+  0 (the default) disables this behavior. A worker blocked on a
+  `reserve` command is not considered idle, so this option is safe to
+  enable with worker pools.
+
+* `-H`:
+  Reply to HTTP `GET` and `HEAD` requests on the beanstalk port with a
+  plain-text health response: `200 ok` normally, `503 draining` while
+  the server is in drain mode. Intended for Kubernetes httpGet probes.
+  Off by default; beanstalk clients never send these verbs, so
+  enabling it does not affect them.
+
+* `--log-json`:
+  Emit warnings as single-line JSON objects on stderr instead of plain
+  text. Affects stderr diagnostics only; verbose `-V` output on stdout
+  stays plain.
 
 ## ENVIRONMENT
 

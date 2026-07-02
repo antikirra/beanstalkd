@@ -2,8 +2,9 @@ FROM debian:bookworm-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# util-linux: setpriv for the PHASE 4 privilege-drop probe
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc libc6-dev make valgrind python3 \
+    gcc libc6-dev make valgrind python3 util-linux \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src

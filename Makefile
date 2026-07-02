@@ -121,7 +121,8 @@ WRAP_FLAGS=\
 	-Wl,--wrap,unlink\
 	-Wl,--wrap,fdatasync\
 	-Wl,--wrap,stat\
-	-Wl,--wrap,pthread_create
+	-Wl,--wrap,pthread_create\
+	-Wl,--wrap,epoll_pwait
 
 ct/_ctcheck: ct/_ctcheck.o ct/ct.o $(OFILES) $(TOFILES)
 	$(LINK.o) $(WRAP_FLAGS) -o $@ $^ $(LDLIBS)

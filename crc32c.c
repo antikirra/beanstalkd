@@ -1,4 +1,3 @@
-#define _GNU_SOURCE
 #include "dat.h"
 #include <stdint.h>
 #include <nmmintrin.h>

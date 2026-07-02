@@ -137,7 +137,7 @@ tube_ht_remove(Tube *t)
 
 // tube_find_name_h finds a tube by name with a precomputed hash.
 // Hash-first filter skips memcmp on non-matching chain entries.
-Tube *
+static Tube *
 tube_find_name_h(const char *name, size_t len, uint h)
 {
     Tube *t = tube_ht[h % TUBE_HASH_SIZE];
@@ -184,9 +184,24 @@ make_tube(const char *name)
     Job j = {.tube = NULL};
     t->buried = j;
     t->buried.prev = t->buried.next = &t->buried;
-    ms_init(&t->waiting_conns, NULL, NULL);
+    // onremove keeps Conn.waitpos hints fresh across swap-removes so
+    // waiting-set removal stays O(1) (see on_waiting_conn_remove).
+    ms_init(&t->waiting_conns, NULL, on_waiting_conn_remove);
 
     return t;
+}
+
+// tube_destroy frees every allocation owned by t, then t itself.
+// Shared teardown for tube_free and the make_and_insert_tube failure
+// path — a new owned allocation in make_tube needs a matching free
+// here only.
+static void
+tube_destroy(Tube *t)
+{
+    free(t->ready.data);
+    free(t->delay.data);
+    ms_clear(&t->waiting_conns);
+    free(t);
 }
 
 void
@@ -195,10 +210,7 @@ tube_free(Tube *t)
     prot_remove_tube(t);
     tube_ht_remove(t);
     ms_remove(&tubes, t);
-    free(t->ready.data);
-    free(t->delay.data);
-    ms_clear(&t->waiting_conns);
-    free(t);
+    tube_destroy(t);
 }
 
 // tube_dref is now static inline in dat.h
@@ -219,10 +231,7 @@ make_and_insert_tube(const char *name)
      * increment the ref count. */
     r = ms_append(&tubes, t);
     if (!r) {
-        ms_clear(&t->waiting_conns);
-        free(t->ready.data);
-        free(t->delay.data);
-        free(t);
+        tube_destroy(t);
         return NULL;
     }
 

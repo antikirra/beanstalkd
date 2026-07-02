@@ -190,15 +190,15 @@ usage(int code)
             " -f MS    fsync at most once every MS milliseconds (default is %dms);\n"
             "          use -f0 for \"always fsync\"\n"
             " -F       never fsync\n"
-            " -D       durable mode: block on fdatasync inside each WAL\n"
-            "          write so replies never precede persistence (implies -F)\n"
+            " -D       durable mode: group commit — one fdatasync per event-loop tick;\n"
+            "          replies never precede persistence (implies -F)\n"
             " -l ADDR  listen on address (default is 0.0.0.0)\n"
             " -p PORT  listen on port (default is " Portdef ")\n"
             " -u USER  become user and group\n"
             " -z BYTES set the maximum job size in bytes (default is %d);\n"
             "          max allowed is %d bytes\n"
             " -s BYTES set the size of each write-ahead log file (default is %d);\n"
-            "          will be rounded up to a multiple of 4096 bytes\n"
+            "          valid range is 1..%d bytes\n"
             " -m SEC   return unused memory to OS every SEC seconds (default is 60);\n"
             "          use -m0 to disable\n"
             " -t CPU   pin main thread to CPU core (default is no pinning)\n"
@@ -216,7 +216,8 @@ usage(int code)
             DEFAULT_FSYNC_MS,
             JOB_DATA_SIZE_LIMIT_DEFAULT,
             JOB_DATA_SIZE_LIMIT_MAX,
-            Filesizedef);
+            Filesizedef,
+            INT_MAX);
     exit(code);
 }
 
@@ -307,7 +308,7 @@ optparse(Server *s, char **argv)
                     }
                     s->wal.syncrate = ms * 1000000;
                     // -f should not resurrect the async sync thread after
-                    // -D asked for blocking fdatasync. -D wins regardless
+                    // -D asked for durable group commit. -D wins regardless
                     // of position on the command line.
                     if (!s->wal.durable_sync)
                         s->wal.wantsync = 1;
@@ -316,7 +317,8 @@ optparse(Server *s, char **argv)
                     s->wal.wantsync = 0;
                     break;
                 case 'D':
-                    // Durable: blocking fdatasync inside walwrite().
+                    // Durable: group commit (invariant #16) — walwrite
+                    // stages, walcommit fsyncs once per tick.
                     // Disable the async sync thread — it would double up.
                     s->wal.durable_sync = 1;
                     s->wal.wantsync = 0;
