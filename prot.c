@@ -356,6 +356,9 @@ pause_tube_update(Tube *t)
 void
 prot_remove_tube(Tube *t)
 {
+    // The ready_ct/delayed_ct branches are defensive: tube_free only
+    // runs when the last iref drops, and a tube holding ready/delayed
+    // jobs is kept alive by those jobs' irefs, so len is 0 in practice.
     if (t->ready.len > 0)
         ready_ct -= t->ready.len;
     if (t->delay.len > 0)
@@ -1127,7 +1130,9 @@ enqueue_waiting_conn(Conn *c)
 
 /* Forward decl — bury_job is defined later; process_tube needs it for
  * the OOM bury fallback on orphaned ready jobs (see process_tube below). */
-static int bury_job(Server *s, Job *j, char update_store);
+// Non-static: testinject2 links bury_job directly for hostile
+// error-path tests (same pattern as kick_buried_job / kick_delayed_job).
+int bury_job(Server *s, Job *j, char update_store);
 
 // process_tube matches ready jobs with waiting connections in a single tube.
 __attribute__((hot)) static void
@@ -1275,12 +1280,13 @@ enqueue_job(Server *s, Job *j, int64 delay, char update_store)
     return 1;
 }
 
-__attribute__((cold)) static int
+__attribute__((cold)) int
 bury_job(Server *s, Job *j, char update_store)
 {
     Wal *w = &s->wal;
+    int z = 0;
     if (update_store) {
-        int z = walresvupdate(w);
+        z = walresvupdate(w);
         if (!z)
             return 0;
         j->walresv += z;
@@ -1295,6 +1301,14 @@ bury_job(Server *s, Job *j, char update_store)
 
     if (update_store) {
         if (!walwrite(w, j)) {
+            // WAL write failed — the WAL is now disabled. The in-memory
+            // transition above is KEPT (matches OP_DELETE's failure
+            // path, which buries on purpose to prevent ghost jobs on
+            // restart, #536), but the reserved bytes go back and the
+            // caller must surface a real error instead of ghost-acking
+            // (invariant #14 under -D).
+            walresvreturn(w, z);
+            j->walresv -= z;
             return 0;
         }
         if (!walmaint(w)) {
@@ -1797,6 +1811,9 @@ enqueue_incoming_job(Conn *c)
     }
 
     /* out of memory trying to grow the queue, so it gets buried */
+    // Log like process_tube's OOM bury-path does: a silent bury hides
+    // memory-pressure events from operators.
+    twarnx("enqueue_job failed (OOM), burying job id=%"PRIu64, jid);
     // Return residual walresv before bury: walresvput reserved a full-record
     // slot, enqueue_job returned 0 (heapinsert or walwrite failed), and
     // bury_job(update_store=0) will not consume it. Without this return,
@@ -2672,6 +2689,10 @@ dispatch_cmd(Conn *c)
         /* out of memory trying to grow the queue, so it gets buried */
         walresvreturn(release_wal, z);
         j->walresv -= z;
+        // bury_job(update_store=0): no WAL record is written for this
+        // fallback, so the new bury_job walwrite-fail path cannot fire
+        // here and the inherited upstream MSG_BURIED reply is kept
+        // deliberately — the release itself was never persisted either.
         bury_job(c->srv, j, 0);
         reply_msg(c, MSG_BURIED);
         return;
@@ -2696,9 +2717,12 @@ dispatch_cmd(Conn *c)
         r = bury_job(c->srv, j, 1);
         if (!r) {
             if (j->r.state == Buried) {
-                // Job was buried in memory but WAL write failed.
-                // WAL is now disabled; in-memory state is correct.
-                reply_msg(c, MSG_BURIED);
+                // WAL write failed — WAL is now disabled; the job stays
+                // buried in memory (same contract as OP_DELETE's failure
+                // path, #536), and bury_job already returned the
+                // reservation. Do NOT ack: the bury is not durable, so
+                // the client must see a real error (invariant #14).
+                reply_serr(c, MSG_INTERNAL_ERROR);
             } else {
                 // WAL reservation failed; undo remove_reserved_job.
                 restore_reserved_job(c, j);
@@ -2776,11 +2800,9 @@ dispatch_cmd(Conn *c)
         op_ct[type]++;
 
         if (touch_job(c, job_find(id))) {
-            // Defer ack until walcommit at end of tick.
-            if (!dur_enqueue(c)) {
-                reply_serr(c, MSG_INTERNAL_ERROR);
-                return;
-            }
+            // touch writes nothing to the WAL — not a WAL-dirty
+            // callsite (dat.h dur_enqueue contract), so the ack must
+            // not wait for group commit; reply immediately.
             reply_msg(c, MSG_TOUCHED);
         } else {
             reply_msg(c, MSG_NOTFOUND);
@@ -3308,7 +3330,10 @@ conn_process_io(Conn *c)
     }
 }
 
-#define want_command(c) ((c)->sock.fd && ((c)->state == STATE_WANT_COMMAND))
+// sock.fd is -1 on a closing/closed conn (and fd 0 is never a client
+// socket here), so a plain truthiness test would let a dead conn
+// through. Require a valid descriptor explicitly.
+#define want_command(c) ((c)->sock.fd > 0 && ((c)->state == STATE_WANT_COMMAND))
 #define cmd_data_ready(c) (want_command(c) && (c)->cmd_read)
 
 __attribute__((hot)) static void

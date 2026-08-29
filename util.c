@@ -148,6 +148,12 @@ fmtalloc(char *fmt, ...)
     n = vsnprintf(&dummy, 0, fmt, ap) + 1; // include space for trailing NUL
     va_end(ap);
 
+    // A negative vsnprintf (encoding error) wraps through the +1 into
+    // n <= 0, and malloc would get a huge/zeroed request. Fail instead;
+    // callers (fileinit) already handle NULL.
+    if (n <= 0)
+        return NULL;
+
     buf = malloc(n);
     if (buf) {
         va_start(ap, fmt);
@@ -305,6 +311,12 @@ optparse(Server *s, char **argv)
                 }
                 case 'f':
                     ms = (int64)parse_size_t(EARGF(flagusage("-f")));
+                    // parse_size_t returns size_t: values above INT64_MAX
+                    // wrap negative in the cast (same hazard as -m).
+                    if (ms < 0) {
+                        warnx("-f value out of range");
+                        usage(5);
+                    }
                     if (ms > 1000000000) {
                         warnx("-f value too large, capping at 1000000000ms");
                         ms = 1000000000;
@@ -346,7 +358,14 @@ optparse(Server *s, char **argv)
                     break;
                 }
                 case 't': {
-                    int cpu = (int)parse_size_t(EARGF(flagusage("-t")));
+                    size_t cput = parse_size_t(EARGF(flagusage("-t")));
+                    // Reject before narrowing: a value above INT_MAX would
+                    // truncate (possibly negative) in the int cast.
+                    if (cput > INT_MAX) {
+                        warnx("-t %zu: CPU out of range", cput);
+                        usage(5);
+                    }
+                    int cpu = (int)cput;
                     int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
                     if (cpu < 0 || cpu >= ncpu) {
                         warnx("-t %d: CPU out of range (0..%d)", cpu, ncpu - 1);
@@ -372,6 +391,12 @@ optparse(Server *s, char **argv)
                     // is itself a large value. Any legitimate operator
                     // wanting longer should just set 0 (off).
                     int64 sec = (int64)parse_size_t(EARGF(flagusage("-I")));
+                    // Same wrap hazard as -m: size_t above INT64_MAX casts
+                    // to a negative sec.
+                    if (sec < 0) {
+                        warnx("-I value out of range");
+                        usage(5);
+                    }
                     if (sec > 1000000000LL) {
                         warnx("-I %lld: too large, capping at 1e9 sec",
                             (long long)sec);

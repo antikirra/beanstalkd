@@ -151,9 +151,10 @@ heapremove(Heap *h, size_t k)
         }
     }
     // Note: setpos() is only called for elements that remain in the
-    // heap. The removed element keeps its stale cached index — the
-    // caller owns x now and must invalidate its heap_index if it can
-    // be reused (job.c callers do this before reinserting).
+    // heap. The removed element keeps its stale cached index; no caller
+    // invalidates it before reuse — that is safe because reinsertion
+    // goes through heapinsert(), whose setpos() overwrites the stale
+    // value before anything can read it.
     return x;
 }
 

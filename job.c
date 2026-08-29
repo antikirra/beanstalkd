@@ -88,7 +88,9 @@ rehash_start(int is_upscaling)
     if (rehash_old) return; /* already in progress */
 
     int d = is_upscaling ? 1 : -1;
-    if (cur_prime + d >= NUM_PRIMES) return;
+    // primes_len is computed from the array itself (primes.c), so it
+    // tracks the table even if the NUM_PRIMES define drifts.
+    if (cur_prime + d >= (int)primes_len) return;
     if (cur_prime + d < 0) return;
 
     size_t new_cap = primes[cur_prime + d];

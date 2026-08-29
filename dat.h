@@ -314,6 +314,7 @@ struct Tube {
 
 // Prints warning message on stderr in the format:
 // <progname>: FILE:LINE in FUNC: <fmt>: <errno_msg>
+// (a JSON object instead when --log-json is active; see log_json)
 #define twarn(...) __twarn(__VA_ARGS__, "")
 
 // Hack to quiet the compiler. When VA_ARGS in twarn() has one element,
@@ -324,6 +325,7 @@ struct Tube {
 
 // Prints warning message on stderr in the format:
 // <progname>: FILE:LINE in FUNC: <fmt>
+// (a JSON object instead when --log-json is active; see log_json)
 #define twarnx(...) __twarnx(__VA_ARGS__, "")
 
 // See __twarn macro.
@@ -517,7 +519,9 @@ struct Conn {
 
     // --- cache line 2 (64-127): scheduling, job I/O ---
     Conn   *next;       // only used in epollq functions
-    uint64 gen;         // generation counter, incremented on pool reuse
+    uint64 gen;         // generation counter, incremented on pool reuse;
+                        // test-only / reserved: written by conn.c pool
+                        // reuse, read only by tests
     int64  tickat;      // time at which to do more work; determines pos in heap
     size_t tickpos;     // position in srv->conns, stale when in_conns=0
     Conn   *live_next;  // intrusive list of ALL live conns (conn.c); lets
@@ -717,10 +721,13 @@ struct File {
     int  free;
     int  resv;
     // uncommitted_bytes: sum of bytes staged by filewritev since the last
-    // successful filewrcommit. Used for group-commit rollback: if the
-    // deferred fdatasync fails, we ftruncate this many bytes off the tail
-    // and undo accounting (see filewrcommit). Always 0 outside durable
-    // mode; async mode leaves filewrcommit a no-op and this stays at 0.
+    // filewrcommit. file_stage_account increments it in EVERY mode (the
+    // staging path is mode-independent), and walcommit → filewrcommit runs
+    // once per main-loop tick regardless of mode, draining it back to 0 —
+    // only the fdatasync inside filewrite_commit_durable is gated on
+    // durable_sync. Used for group-commit rollback: if the deferred
+    // fdatasync fails, we ftruncate this many bytes off the tail and undo
+    // accounting (see filewrcommit).
     int  uncommitted_bytes;
     // uncommitted_alive: the portion of uncommitted_bytes still counted
     // in w->alive. filewrjobshort immediately undoes its own alive

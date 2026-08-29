@@ -159,14 +159,13 @@ tube_find_name(const char *name, size_t len)
 }
 
 
-Tube *
-make_tube(const char *name)
+static Tube *
+make_tube_n(const char *name, size_t nlen)
 {
     Tube *t = new(Tube);
     if (!t)
         return NULL;
 
-    size_t nlen = strlen(name);
     if (nlen >= MAX_TUBE_NAME_LEN) {
         twarnx("truncating tube name");
         nlen = MAX_TUBE_NAME_LEN - 1;
@@ -189,6 +188,12 @@ make_tube(const char *name)
     ms_init(&t->waiting_conns, NULL, on_waiting_conn_remove);
 
     return t;
+}
+
+Tube *
+make_tube(const char *name)
+{
+    return make_tube_n(name, strlen(name));
 }
 
 // tube_destroy frees every allocation owned by t, then t itself.
@@ -218,12 +223,12 @@ tube_free(Tube *t)
 // tube_iref is now static inline in dat.h
 
 static Tube *
-make_and_insert_tube(const char *name)
+make_and_insert_tube(const char *name, size_t len)
 {
     int r;
     Tube *t = NULL;
 
-    t = make_tube(name);
+    t = make_tube_n(name, len);
     if (!t)
         return NULL;
 
@@ -258,7 +263,10 @@ tube_find_or_make_n(const char *name, size_t len)
     Tube *t = tube_find_name(name, len);
     if (t)
         return t;
-    return make_and_insert_tube(name);
+    // Pass len through: name is not necessarily NUL-terminated (prot.c
+    // hands over slices of the command buffer), so strlen(name) here
+    // would read past the caller's slice.
+    return make_and_insert_tube(name, len);
 }
 
 Tube *

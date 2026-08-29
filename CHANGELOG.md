@@ -3,7 +3,9 @@
 ## 2026-08-29 — Audit fixes, connsched OOM recovery, crc32c runtime dispatch, -Wextra
 
 Final hardening batch on top of the `truncate` removal (see the entry
-below — the wire contract is now identical to upstream).
+below — the wire command set is now identical to upstream; the
+strict-parsing edges documented in README §Wire-observable differences
+remain).
 
 ### Audit fixes
 
@@ -48,8 +50,11 @@ below — the wire contract is now identical to upstream).
 ## 2026-08-29 — Remove the `truncate` command
 
 The fork-specific `truncate <tube>` command (added 2026-04-16, hardened
-2026-04-23) is removed entirely; the wire contract returns to upstream:
-`truncate` dispatches to `UNKNOWN_COMMAND` again.
+2026-04-23) is removed entirely; the wire command set returns to
+upstream: `truncate` dispatches to `UNKNOWN_COMMAND` again. (The
+strict-parsing edges — trailing-space commands and strict literal
+prefixes — remain, as documented in README §Wire-observable
+differences.)
 
 ### Removed
 
@@ -86,6 +91,41 @@ now locks in `truncate` → `UNKNOWN_COMMAND`. The
 `cttest_epollq_double_insert_does_not_orphan_worker` scenario was
 rewritten to force the reserve slow path without truncate (empty-tube
 reserve + same-burst puts).
+
+## 2026-07-02 — Job pool, wyhash tubes, incremental rehash, -c connection cap
+
+Large performance and robustness batch (`505d91a`):
+
+- 11-class job pool (64B–64KB slabs, O(1) reuse) replacing per-job
+  malloc/free; cache-line-aligned `Conn`/`Tube` struct layout; Conn slab
+  pool (256).
+- wyhash v4 tube hashing (avalanche + length-aware) replacing DJB2;
+  hash-first filter on lookup.
+- Incremental job-hash rehash (16 buckets/op, dual-table) replacing
+  stop-the-world rehash.
+- `-c N` connection cap (0 = unlimited, upstream behavior preserved).
+- Group-commit hardening: failure semantics and rollback paths covered
+  by new fault-injection tests (~1750 lines of new tests).
+
+## 2026-06-01 — Job-pool drain before malloc_trim
+
+`-m` (periodic `malloc_trim`) could not reclaim pages held by pooled
+jobs sitting on the free list. The pool is now drained on the `-m` tick
+before trimming, so RSS actually drops on idle (`ac50b73`).
+Counter balance preserved; covered by
+`cttest_job_pool_drain_{balances_counters,spares_live_jobs}`.
+
+Also: Lima A/B bench harness and the Mode-D pool-reclaim probe scripts
+(`7b3d93b`, `0bf4be9`).
+
+## 2026-04-25 — Pool size-class fix for power-of-2 bodies
+
+`pool_class` rounded every stored `body_size` up to the next power of 2,
+but callers store `body+2` (the `\r\n` trailer), so a 1024-byte user
+body landed in the 2048-byte slab — ~1.80× upstream RSS on round-size
+workloads. `POOL_PAD=2` shifts slab sizes to {66..65538}, so power-of-2
+user bodies land exactly on class boundaries with zero waste
+(`d28f5a7`). Measured: 2234 → 1207 B/job (upstream: 1312).
 
 ## 2026-04-24 — Durable group commit (-D)
 

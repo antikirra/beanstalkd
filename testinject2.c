@@ -20,6 +20,7 @@
 // Exposed from prot.c for hostile error-path testing.
 extern int kick_buried_job(Server *s, Job *j);
 extern int kick_delayed_job(Server *s, Job *j);
+extern int bury_job(Server *s, Job *j, char update_store);
 extern struct stats global_stat;
 extern void prot_init();
 
@@ -3462,4 +3463,212 @@ cttest_inject_waitpos_enqueue_oom_rollback_keeps_hints(void)
     tube_dref(t1);
     tube_dref(t2);
     tube_dref(t3);
+}
+
+
+// ─── bury_job walwrite-fail: reservation returned, failure reported ──
+//
+// Regression: bury_job(update_store=1) used to return 0 on walwrite
+// failure while keeping the j->walresv reservation it had just taken —
+// leaking w->resv accounting — and OP_BURY then replied MSG_BURIED even
+// though the bury never became durable (ghost-ack, invariant #14 under
+// -D). The fixed contract mirrors OP_DELETE: the in-memory transition
+// to Buried is kept (the WAL is disabled anyway, #536), the reserved
+// bytes are returned (j->walresv back to its pre-call value), and the
+// caller replies INTERNAL_ERROR.
+void
+cttest_inject_bury_job_walwrite_fail_returns_walresv(void)
+{
+    setup();
+
+    Server s = {0};
+
+    char tmppath[] = "/tmp/testinject_buryfail.XXXXXX";
+    int fd = mkstemp(tmppath);
+    assertf(fd >= 0, "mkstemp must succeed");
+
+    int ver = Walver;
+    ssize_t nver = write(fd, &ver, sizeof(ver));
+    assertf(nver == (ssize_t)sizeof(ver), "version header write");
+
+    s.wal.use = 1;
+    s.wal.filesize = 4096;
+    s.wal.nfile = 1;
+
+    File f = {0};
+    f.w = &s.wal;
+    f.fd = fd;
+    f.iswopen = 1;
+    f.free = 4096;
+    f.resv = 0;
+    f.refs = 2;                  // prevent walgc on filedecref
+    f.jlist.fprev = &f.jlist;
+    f.jlist.fnext = &f.jlist;
+
+    s.wal.cur = &f;
+    s.wal.tail = &f;
+    s.wal.head = &f;
+
+    Tube *t = make_tube("buryfail");
+    assertf(t, "tube must allocate");
+
+    Job *j = allocate_job(10);
+    assertf(j, "job must allocate");
+    TUBE_ASSIGN(j->tube, t);
+    j->r.id = 1;
+    j->r.body_size = 10;
+    j->r.state = Reserved;
+    memset(j->body, 'B', 10);
+
+    int64  pre_j_walresv     = j->walresv;
+    uint64 pre_buried_global = global_stat.buried_ct;
+    uint64 pre_buried_tube   = t->stat.buried_ct;
+
+    fault_set(FAULT_WRITEV, 0, EIO);
+    int r = bury_job(&s, j, 1);
+
+    assertf(r == 0,
+            "bury_job must report failure when walwrite fails, got %d", r);
+    assertf(fault_hits(FAULT_WRITEV) == 1,
+            "exactly one writev injection expected, got %d",
+            fault_hits(FAULT_WRITEV));
+
+    // walwrite's own failure path disables the WAL, so walresvreturn is
+    // a no-op on w->resv (moot — WAL is dead); the per-job reservation
+    // must still be unwound.
+    assertf(j->walresv == pre_j_walresv,
+            "j->walresv leak: was %" PRId64 " got %" PRId64,
+            pre_j_walresv, j->walresv);
+    assertf(s.wal.use == 0,
+            "wal must be disabled after write failure, got use=%d",
+            s.wal.use);
+
+    // The in-memory bury is kept, matching OP_DELETE's failure path.
+    assertf(j->r.state == Buried,
+            "job must stay Buried in memory, got state=%d", j->r.state);
+    assertf(global_stat.buried_ct == pre_buried_global + 1,
+            "global buried_ct must advance exactly once: was %" PRIu64
+            " got %" PRIu64, pre_buried_global, global_stat.buried_ct);
+    assertf(t->stat.buried_ct == pre_buried_tube + 1,
+            "tube buried_ct must advance exactly once: was %" PRIu64
+            " got %" PRIu64, pre_buried_tube, t->stat.buried_ct);
+
+    // Cleanup.
+    job_list_remove(j);
+    global_stat.buried_ct--;
+    t->stat.buried_ct--;
+    TUBE_ASSIGN(j->tube, NULL);
+    job_free(j);
+    close(fd);
+    unlink(tmppath);
+}
+
+
+// ─── durable_fsync: EINTR must be retried ──
+//
+// walg.c's durable_fsync feeds all three fsync callsites (sync thread,
+// walsync inline, dirsync). file.c's commit paths retry on EINTR;
+// durable_fsync used to return the -1 straight up, so a stray signal
+// during the inline walsync read as a sync failure. This test drives
+// the inline walsync path through walmaint with one EINTR injected:
+// the retry must absorb it and the second (real) fdatasync succeeds.
+void
+cttest_inject_durable_fsync_retries_eintr(void)
+{
+    setup();
+
+    char tmppath[] = "/tmp/testinject_eintr.XXXXXX";
+    int fd = mkstemp(tmppath);
+    assertf(fd >= 0, "mkstemp must succeed");
+    assertf(fd > 2, "wrapped fdatasync skips fds 0-2, got %d", fd);
+
+    Wal w = {0};
+    w.use = 1;
+    w.wantsync = 1;
+    w.syncrate = 0;      // now >= lastsync+syncrate always holds
+    w.lastsync = 0;
+    w.lastcompact = now; // keep walcompact out of this test
+
+    File f = {0};
+    f.w = &w;
+    f.fd = fd;
+    f.iswopen = 1;
+    f.jlist.fprev = &f.jlist;
+    f.jlist.fnext = &f.jlist;
+    w.cur = &f;
+    w.tail = &f;
+    w.head = &f;
+
+    fault_clear_all();          // zero call counters
+    fault_set(FAULT_FDATASYNC, 0, EINTR);
+    int r = walmaint(&w);
+
+    assertf(r == 1,
+            "walmaint must succeed: EINTR is transient, got %d", r);
+    assertf(fault_hits(FAULT_FDATASYNC) == 1,
+            "exactly one EINTR injection expected, got %d",
+            fault_hits(FAULT_FDATASYNC));
+    assertf(fault_calls(FAULT_FDATASYNC) == 2,
+            "durable_fsync must retry after EINTR: expected 2 calls, got %d",
+            fault_calls(FAULT_FDATASYNC));
+
+    close(fd);
+    unlink(tmppath);
+}
+
+
+// ─── walscandir: garbage suffixes must not steer w->next ──
+//
+// Three parser holes used to slip through: "binlog." (empty suffix)
+// parsed as seq 0, "binlog.0" was accepted as a valid seq, and
+// "binlog.2147483647" made max+1 overflow w->next into INT_MIN. All
+// three stray files are present here; walinit must ignore them and
+// pick up at 4 (the real binlog.3 being the highest valid seq).
+void
+cttest_inject_walscandir_ignores_garbage_suffixes(void)
+{
+    setup();
+
+    char dir[] = "/tmp/testinject_scan.XXXXXX";
+    assertf(mkdtemp(dir), "mkdtemp must succeed, got errno=%d", errno);
+
+    const char *names[] = {
+        "binlog.", "binlog.0", "binlog.3", "binlog.2147483647",
+    };
+    for (size_t i = 0; i < sizeof(names)/sizeof(names[0]); i++) {
+        char p[512];
+        snprintf(p, sizeof p, "%s/%s", dir, names[i]);
+        int fdc = open(p, O_WRONLY|O_CREAT|O_CLOEXEC, 0600);
+        assertf(fdc >= 0, "create %s must succeed, got errno=%d", p, errno);
+        close(fdc);
+    }
+
+    Wal w = {0};
+    w.dir = dir;
+    w.filesize = 4096;
+
+    Job list;
+    list.prev = list.next = &list;
+
+    walinit(&w, &list);
+
+    // walscandir must settle on max=3 (garbage ignored); walinit's
+    // makenextfile then creates binlog.4 and advances next past it.
+    assertf(w.next == 5,
+            "w.next must be 5 (garbage suffixes ignored, binlog.3 is the "
+            "highest valid seq, makenextfile advanced past binlog.4), "
+            "got %d", w.next);
+    assertf(w.cur && w.cur->seq == 4,
+            "walinit must create binlog.4, got seq=%d",
+            w.cur ? w.cur->seq : -1);
+
+    filewclose(w.cur);
+    char p[512];
+    snprintf(p, sizeof p, "%s/binlog.4", dir);
+    unlink(p);
+    for (size_t i = 0; i < sizeof(names)/sizeof(names[0]); i++) {
+        snprintf(p, sizeof p, "%s/%s", dir, names[i]);
+        unlink(p);
+    }
+    rmdir(dir);
 }

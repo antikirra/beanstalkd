@@ -404,7 +404,8 @@ readrec(File *f, Job *l, int *err)
             // Legacy truncate marker (the truncate command was removed).
             // CRC is already verified; the cutoff it carried is ignored,
             // so previously truncated jobs replay as live — the accepted
-            // downgrade semantic. Warn once per marker, do not fail replay.
+            // downgrade semantic. Warn for each marker found, but do not
+            // fail replay.
             warnpos(f, -sz, "ignoring legacy truncate marker (tube=%s cutoff=%"PRIu64")",
                     tubename, jr.id);
             return 1;
@@ -946,8 +947,10 @@ filewritev(File *f, Job *j, struct iovec *iov, int iovcnt)
 //   the full-record bytes that an Invalid short record's filermjob
 //   already subtracted from alive — they are not restored either.
 //
-// In durable_sync=0 mode this is a no-op (matches legacy behaviour of
-// filewritev: fdatasync only fires under -D).
+// In durable_sync=0 mode the fdatasync is skipped inside
+// filewrite_commit_durable (matches legacy behaviour of filewritev:
+// fdatasync only fires under -D); this function still drains the
+// uncommitted_* counters so the next batch starts fresh.
 int
 filewrcommit(File *f)
 {

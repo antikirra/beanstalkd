@@ -18,7 +18,7 @@ Requires **Linux 6.1+**, glibc, gcc 12+. Compatible with GCC 15.
 
 Drop-in replacement for upstream beanstalkd v1.13 for every non-administrative workload. All client libraries (Go, Python, Ruby, PHP, Java, etc.) connect and drive jobs without changes; every upstream command, response, error string, and stats key is preserved. The differences are limited to a few strict-parsing edges and the opt-in durability mode — see "Wire-observable differences" below before migrating.
 
-WAL writer emits v8 (4-byte CRC32C trailer per record for silent-corruption detection); upstream v7 binlogs are read transparently on startup, so upgrade requires no migration. Downgrade to a pre-v8 binary is not supported. Legacy v5 (beanstalkd 1.4.6) reader removed — drain pre-v7 binlogs on the old binary before upgrading.
+WAL writer emits v8 (4-byte CRC32C trailer per record for silent-corruption detection); upstream v7 binlogs are read transparently on startup, so upgrade requires no migration. Downgrade to a pre-v8 binary is not supported. Legacy v5 (beanstalkd 1.4.6) reader removed — drain pre-v7 binlogs on the old binary before upgrading. Binlogs written by the short-lived fork builds that had the `truncate` command (2026-04-16…2026-08-29) may contain truncate-marker records: replay consumes them with a logged warning and skips the cutoff, so jobs deleted by `truncate` resurrect as live — drain such tubes on the old binary first if that matters.
 
 ### Wire-observable differences from upstream
 
@@ -51,13 +51,13 @@ CLI (not wire-observable): upstream's deprecated no-op stubs `-c`/`-n` (warn-and
 | Tube hash | Stock DJB2 | wyhash v4 (avalanche + length-aware) |
 | Heap layout | Binary (2-ary) | 4-ary (shallower, cache-line-fit children) |
 | Crash/data bugs | 22+ open in upstream tracker | see §Bug fixes and `CHANGELOG.md` |
-| Tests | ~100 unit | 378 unit + hostile WAL + ASan + Valgrind |
+| Tests | ~100 unit | 360 unit + hostile WAL + ASan + Valgrind |
 | Status | Maintenance mode (last code 2020) | Active development |
 
 ## Build and test
 
 ```sh
-make check                                # 378 unit tests (UBSan in CI)
+make check                                # 360 unit tests (UBSan in CI)
 docker build -f Dockerfile.build .        # CI: UBSan + cppcheck (C11)
 docker build -f Dockerfile.benchmark .    # A/B benchmark vs upstream
 docker build -f test/Dockerfile.loadtest -t loadtest . && docker run --rm loadtest
@@ -127,6 +127,8 @@ TCP_FASTOPEN(1024). TCP_DEFER_ACCEPT. TCP_NOTSENT_LOWAT(16KB). TCP_USER_TIMEOUT(
 | `-I SEC` | 0 (off) | Close conns idle for SEC seconds. A worker blocked on `reserve` is NOT idle (waiting clients are excluded), so it is safe to enable with worker pools |
 | `-H` | off | Reply to HTTP `GET`/`HEAD` on the beanstalk port (`200 ok`, `503 draining`); intended for Kubernetes `httpGet` probes. Off by default — beanstalk clients never send these verbs, so enabling is harmless |
 | `-V` | | Verbose logging (`-VV` for command trace) |
+| `-v` | | Print version and exit |
+| `-h` | | Print usage and exit |
 | `--log-json` | | Emit warnings as JSON objects on stderr (`{"ts":...,"level":"warn\|error","msg":"...","errno":"..."}`) |
 
 ## Docker benchmark results

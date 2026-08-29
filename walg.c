@@ -20,7 +20,13 @@ static int reserve(Wal *w, int n);
 static int
 durable_fsync(int fd)
 {
-    return fdatasync(fd);
+    int r;
+    // Retry on EINTR, matching the commit paths in file.c — all three
+    // callsites (sync_thread_fn, walsync inline, dirsync) get the same
+    // semantics.
+    while ((r = fdatasync(fd)) == -1 && errno == EINTR)
+        ;
+    return r;
 }
 
 // --- Async fsync thread ---
@@ -117,7 +123,7 @@ walscandir(Wal *w)
     struct dirent *e;
     int min = INT_MAX;
     int max = 0;
-    int n;
+    long n;
     char *p;
 
     d = opendir(w->dir);
@@ -125,9 +131,13 @@ walscandir(Wal *w)
 
     while ((e = readdir(d))) {
         if (strncmp(e->d_name, base, len) == 0) {
+            char *start = e->d_name+len;
             errno = 0;
-            n = strtol(e->d_name+len, &p, 10);
-            if (p && *p == '\0' && !errno) {
+            n = strtol(start, &p, 10);
+            // Require a non-empty numeric suffix ("binlog." alone has
+            // p == start) and a seq in 1..INT_MAX-1: 0 is not a valid
+            // first seq, and max+1 would overflow at INT_MAX.
+            if (p != start && *p == '\0' && !errno && n >= 1 && n < INT_MAX) {
                 if (n > max) max = n;
                 if (n < min) min = n;
             }

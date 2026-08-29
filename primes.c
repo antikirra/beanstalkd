@@ -1,12 +1,15 @@
 #include <stdlib.h>
 
-// prime // downscale treshold / upscale treshold
+// prime // downscale threshold / upscale threshold
+// Actual rules live in job.c: rehash up when used > cap<<1
+// (store_job), down when used < cap>>3 (job_hash_free), never below
+// primes[0]. Thresholds below are cap>>3 / cap<<1 for that entry.
 
 size_t primes[] = {
-    12289, // NA / 3072
-    24593, // 1537 / 6148
-    49193, // 3074 / 12298
-    98387, // 6149 / 24596
+    12289, // NA (never below primes[0]) / 24578
+    24593, // 3074 / 49186
+    49193, // 6149 / 98386
+    98387, // 12298 / 196774
     196799, // etc
     393611,
     787243,

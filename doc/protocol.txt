@@ -51,6 +51,11 @@ the server will reply with one of the following error messages:
  - "UNKNOWN_COMMAND\r\n" The client sent a command that the server does not
    know.
 
+(Note, specific to this fork: a well-known command line with a trailing
+space, e.g. "stats \r\n", is rejected as UNKNOWN_COMMAND rather than
+BAD_FORMAT, and command dispatch matches literal prefixes strictly. See
+"Wire-observable differences" in README.md.)
+
 These error responses will not be listed in this document for individual
 commands in the following sections, but they are implicitly included in the
 description of all commands. Clients should be prepared to receive an error
@@ -146,7 +151,8 @@ below).
    increase the ttr to 1. Maximum ttr is 2**32-1.
 
  - <bytes> is an integer indicating the size of the job body, not including the
-   trailing "\r\n". This value must be less than max-job-size (default: 2**16).
+   trailing "\r\n". This value must be less than max-job-size (default:
+   2**16 - 1, i.e. 65535).
 
  - <data> is the job body -- a sequence of bytes of length <bytes> from the
    previous line.

@@ -163,6 +163,9 @@ srvserve(Server *s)
             sock->f(sock->x, rw);
         }
         conn_defer_free_end();
+        // Defensive, currently unreachable: socknext exits(1) itself on
+        // a non-EINTR epoll error and never returns -1. Kept as a guard
+        // in case a future socknext variant propagates errors instead.
         if (rw == -1) {
             twarnx("socknext");
             exit(1);
