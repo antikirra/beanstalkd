@@ -180,8 +180,8 @@ void ms_clear(Ms *a);
 int ms_append(Ms *a, void *item);
 int ms_remove(Ms *a, void *item);
 // ms_remove_at: O(1) removal with a position hint; falls back to the
-// O(n) ms_remove scan when the hint is stale. Prod users: waiting_conns
-// hint-based removal (Conn.waitpos) and the truncated-tube registry.
+// O(n) ms_remove scan when the hint is stale. Prod user: waiting_conns
+// hint-based removal (Conn.waitpos).
 int ms_remove_at(Ms *a, size_t i, void *item);
 int ms_contains(Ms *a, void *item);
 void *ms_take(Ms *a);
@@ -301,12 +301,8 @@ struct Tube {
     int64 unpause_at;                   // timestamp when to unpause, in nsec
     Ms waiting_conns;                   // conns waiting for a job at this moment
 
-    // --- cache line 4 (192-255): stats + truncate state ---
+    // --- cache line 4 (192-255): stats ---
     struct stats stat;
-    uint64 purge_before_id;             // jobs with id <= this are dead (0 = no purge)
-    byte   purge_drained;               // memo: a full (non-budget-cut) lazy-reap pass
-                                        // found ready/delay/buried zombie-free; prottick
-                                        // skips the heap walks until truncate re-arms it
 
     // --- cold fields: lookup, list management ---
     Tube *ht_next;                      // hash table chain for global tube lookup
@@ -372,8 +368,6 @@ void job_free(Job *j);
 /* Lookup a job by job ID */
 Job *job_find(uint64 job_id);
 
-uint64 job_next_id(void);
-
 /* the void* parameters are really job pointers */
 void job_setpos(void *j, size_t pos);
 int job_pri_less(void *ja, void *jb);
@@ -436,6 +430,12 @@ void conn_pool_drain(void);
 
 /* for unit tests */
 void get_conn_pool_stats(int *count);
+
+// Defer Conn slab-pool returns while an epoll event batch drains, so a
+// conn closed mid-batch stays frozen (not reused) until every stale
+// event that could still reference it has been dispatched/skipped.
+void conn_defer_free_begin(void);
+void conn_defer_free_end(void);
 
 uint count_cur_conns(void);
 uint count_tot_conns(void);
@@ -520,6 +520,9 @@ struct Conn {
     uint64 gen;         // generation counter, incremented on pool reuse
     int64  tickat;      // time at which to do more work; determines pos in heap
     size_t tickpos;     // position in srv->conns, stale when in_conns=0
+    Conn   *live_next;  // intrusive list of ALL live conns (conn.c); lets
+    Conn   *live_prev;  // conn_sched_recover rebuild srv->conns after a
+                        // heapinsert OOM dropped a conn's timers
     Job    *soonest_job;// memoization of the soonest job
     Job    *out_job;    // a job to be sent to the client
     int64  last_activity_at; // ns timestamp of last command processed; powers -I
@@ -576,6 +579,7 @@ struct Conn {
 int  conn_less(void *ca, void *cb);
 void conn_setpos(void *c, size_t i);
 void connsched(Conn *c);
+int  conn_sched_recover(void);
 void connclose(Conn *c);
 void connsetproducer(Conn *c);
 void connsetworker(Conn *c);
@@ -624,6 +628,13 @@ void dur_remove(Conn *c);
 void dur_flush_all(int ok);
 int  dur_batch_pending(void);
 
+// Test-only hooks into prot.c's epollq (testprot2.c): build/drain the
+// pending sockwant list on fake conns (sock.fd == -1) to check the
+// in_epollq double-insert guard without a network race.
+void  epollq_test_add(Conn *c, char rw);
+void  epollq_test_apply(void);
+Conn *epollq_test_head(void);
+
 
 
 
@@ -653,9 +664,9 @@ struct Wal {
                          // #16). Replies are held by dur_flush_all
                          // until the commit, so "ack ⇒ durable" still
                          // holds.
-    // commit_failed: a mid-tick WAL failure (rotation commit, writev,
-    // truncate marker) disabled w->use after records staged earlier in
-    // the tick were already lost (closed unsynced or ftruncated away).
+    // commit_failed: a mid-tick WAL failure (rotation commit or writev)
+    // disabled w->use after records staged earlier in the tick were
+    // already lost (closed unsynced or ftruncated away).
     // walcommit() must report failure for that tick even though
     // w->use==0 — otherwise dur_flush_all(1) would ghost-ack clients
     // for records that never became durable (invariants #14/#16). Set
@@ -672,17 +683,14 @@ struct Wal {
     int             sync_stop;
     _Atomic int     sync_err;
     int             sync_on;
-
-    int (*compact_post)(Wal *);
 };
 int  waldirlock(Wal*);
 void walinit(Wal*, Job *list);
-// walwrite / wal_write_truncate stage a record: writev + accounting,
-// fdatasync deferred. walcommit() issues one fdatasync covering every
-// staged record in w->cur; the serv main loop calls it once per epoll
-// drain (group commit — invariant #16).
+// walwrite stages a record: writev + accounting, fdatasync deferred.
+// walcommit() issues one fdatasync covering every staged record in
+// w->cur; the serv main loop calls it once per epoll drain (group
+// commit — invariant #16).
 int  walwrite(Wal*, Job*);
-int  wal_write_truncate(Wal*, Tube*, uint64);
 int  walcommit(Wal*);
 int  walmaint(Wal*);
 int  walresvput(Wal*, Job*);
@@ -721,16 +729,6 @@ struct File {
     // reverting uncommitted_bytes would subtract short-record bytes
     // twice and drive alive negative.
     int  uncommitted_alive;
-    // marker_bytes: truncate-marker bytes written to this file and
-    // counted in w->alive (#701: markers stay "live" while the file
-    // exists so ratio() cannot let walgc unlink a marker-only binlog
-    // before compact_post re-emits it). Markers are not in jlist, so
-    // walgc subtracts marker_bytes from w->alive when it unlinks the
-    // file — otherwise re-emission inflates alive forever.
-    // uncommitted_marker_bytes is the staged-but-not-yet-durable part,
-    // reverted from marker_bytes if the group commit fails.
-    int  marker_bytes;
-    int  uncommitted_marker_bytes;
     char *path;
     Wal  *w;
     ReadBuf *rbuf; // optional buffered reader, set during recovery
@@ -746,14 +744,13 @@ void filermjob(File*, Job*);
 int  fileread(File*, Job *list);
 void filewopen(File*);
 void filewclose(File*);
-// filewrjob{short,full} / filewrtruncate stage a WAL record (writev +
-// accounting; fdatasync deferred). filewrcommit issues one fdatasync
-// covering every staged record in f and either clears uncommitted_bytes
-// on success or ftruncates the tail + rolls back global counters on
-// failure. See invariant #16.
+// filewrjob{short,full} stage a WAL record (writev + accounting;
+// fdatasync deferred). filewrcommit issues one fdatasync covering every
+// staged record in f and either clears uncommitted_bytes on success or
+// ftruncates the tail + rolls back global counters on failure. See
+// invariant #16.
 int  filewrjobshort(File*, Job*);
 int  filewrjobfull(File*, Job*);
-int  filewrtruncate(File*, Tube*, uint64);
 int  filewrcommit(File*);
 
 

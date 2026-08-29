@@ -405,7 +405,76 @@ cttest_inject_filewclose_ftruncate_fail(void)
 }
 
 
-// --- WAL write: writev failure preserves counter invariants ---
+// --- WAL file close: fdatasync before close (rotation durability) ---
+
+// filewclose is the last holder of a binlog's write fd (usenext closes
+// the old file through it on rotation), so it must fdatasync before
+// close even when durable_sync is off — otherwise the window between
+// the last periodic fsync and rotation is lost on power-fail.
+void
+cttest_inject_filewclose_fdatasyncs_before_close(void)
+{
+    setup();
+    char tmppath[] = "/tmp/testinject_wclose.XXXXXX";
+    int fd = mkstemp(tmppath);
+    assertf(fd >= 0, "mkstemp must succeed");
+    assertf(fd > 2, "wrapped fdatasync skips fds 0-2, got %d", fd);
+
+    Wal w = {.filesize = 4096};
+    File f = {0};
+    f.w = &w;
+    f.fd = fd;
+    f.iswopen = 1;
+    f.refs = 2;     // prevent walgc when filedecref drops to 1
+    f.jlist.fprev = &f.jlist;
+    f.jlist.fnext = &f.jlist;
+
+    fault_clear_all();  // zero the call counters
+    filewclose(&f);
+
+    assertf(!f.iswopen, "file must be closed");
+    assertf(f.fd == -1, "fd must be -1 after close, got %d", f.fd);
+    assertf(fault_calls(FAULT_FDATASYNC) == 1,
+            "filewclose must fdatasync exactly once before close, got %d",
+            fault_calls(FAULT_FDATASYNC));
+
+    unlink(tmppath);
+}
+
+
+// An fdatasync failure on the close path must not wedge the file open:
+// the error is logged and the close proceeds (best-effort flush).
+void
+cttest_inject_filewclose_fdatasync_fail_still_closes(void)
+{
+    setup();
+    char tmppath[] = "/tmp/testinject_wclosef.XXXXXX";
+    int fd = mkstemp(tmppath);
+    assertf(fd >= 0, "mkstemp must succeed");
+    assertf(fd > 2, "wrapped fdatasync skips fds 0-2, got %d", fd);
+
+    Wal w = {.filesize = 4096};
+    File f = {0};
+    f.w = &w;
+    f.fd = fd;
+    f.iswopen = 1;
+    f.refs = 2;
+    f.jlist.fprev = &f.jlist;
+    f.jlist.fnext = &f.jlist;
+
+    fault_set(FAULT_FDATASYNC, 0, EIO);
+    filewclose(&f);
+
+    assertf(fault_hits(FAULT_FDATASYNC) == 1,
+            "fdatasync fault must fire exactly once, got %d",
+            fault_hits(FAULT_FDATASYNC));
+    assertf(!f.iswopen,
+            "file must be closed even when fdatasync fails");
+    assertf(f.fd == -1,
+            "fd must be -1 after close, got %d", f.fd);
+
+    unlink(tmppath);
+}
 
 void
 cttest_inject_filewritev_writev_fail(void)
@@ -554,8 +623,8 @@ cttest_inject_kick_buried_heapinsert_oom_walresv(void)
     int    pre_file_free     = f.free;
     int64  pre_j_walresv     = j->walresv;
     uint32 pre_kick_ct       = j->r.kick_ct;
-    int64  pre_buried_global = global_stat.buried_ct;
-    int64  pre_buried_tube   = t->stat.buried_ct;
+    uint64 pre_buried_global = global_stat.buried_ct;
+    uint64 pre_buried_tube   = t->stat.buried_ct;
 
     // Ready heap is fresh (cap==0). The FIRST heapinsert in enqueue_job()
     // WILL call realloc — and that's the only call we arm. Fault disarms
@@ -594,10 +663,10 @@ cttest_inject_kick_buried_heapinsert_oom_walresv(void)
     assertf(j->r.state == Buried,
             "job must return to Buried, got state=%d", j->r.state);
     assertf(global_stat.buried_ct == pre_buried_global,
-            "global buried_ct drift: was %" PRId64 " got %" PRId64,
+            "global buried_ct drift: was %" PRIu64 " got %" PRIu64,
             pre_buried_global, global_stat.buried_ct);
     assertf(t->stat.buried_ct == pre_buried_tube,
-            "tube buried_ct drift: was %" PRId64 " got %" PRId64,
+            "tube buried_ct drift: was %" PRIu64 " got %" PRIu64,
             pre_buried_tube, t->stat.buried_ct);
 
     // Ready heap must not retain any reference to the job.
@@ -937,40 +1006,14 @@ cttest_inject_walwrite_refuses_when_durable_and_wal_disabled(void)
 }
 
 
-// #C1 regression (truncate path): wal_write_truncate must mirror walwrite's
-// durable-refusal behavior. A silently successful marker write under -D
-// with a disabled WAL would be worse than for put/delete: it looks like
-// truncate ran but the cutoff is not on disk and never will be.
-void
-cttest_inject_wal_write_truncate_refuses_when_durable_and_wal_disabled(void)
-{
-    setup();
-
-    Wal w = { .use = 0, .durable_sync = 1 };
-    Tube *t = make_tube("ctrunc");
-    assertf(t, "tube must allocate");
-
-    int r = wal_write_truncate(&w, t, 42);
-    assertf(r == 0,
-            "wal_write_truncate under -D with w->use=0 must refuse, got %d", r);
-
-    Wal w2 = { .use = 0, .durable_sync = 0 };
-    int r2 = wal_write_truncate(&w2, t, 42);
-    assertf(r2 == 1,
-            "wal_write_truncate non-durable with w->use=0 must pass through, got %d", r2);
-
-    tube_dref(t);
-}
-
-
 // #C1 regression (reserve gate): walresvput / walresvupdate propagate
 // through `reserve()`, which was also tightened. Under -D + !use both
 // must return 0 so enqueue_incoming_job / bury_job / release see the
 // failure and reply with a real error. Under non-durable + !use they
 // must keep the legacy "succeeds with 1" pass-through.
 //
-// This test closes the gap left by the walwrite/wal_write_truncate
-// tests above: a hypothetical refactor that undoes the `reserve()`
+// This test closes the gap left by the walwrite test above: a
+// hypothetical refactor that undoes the `reserve()`
 // guard would let `walresvput` hand out bytes that walwrite then
 // refuses to write — the client would get INSERTED reply with no
 // matching WAL record, defeating the whole C1 contract.
@@ -3351,259 +3394,6 @@ cttest_inject_group_commit_fail_delete_record_keeps_alive_nonnegative(void)
             "alive must stay at 0 after rollback, got %" PRId64, w.alive);
 
     job_free(j);
-    close(fd);
-    unlink(tmppath);
-}
-
-
-// --- truncate-marker bytes vs w->alive lifecycle (#701 closure) ---
-//
-// filewrtruncate counts marker bytes as live so ratio() cannot let
-// walgc unlink a marker-only binlog before compact_post re-emits the
-// marker into w->cur. But markers are not in f->jlist: filermjob never
-// reclaims their bytes, and until now neither did walgc — every
-// re-emission leaked ~90B into w->alive FOREVER, biasing ratio() down
-// and making compaction monotonically lazier over the process's life.
-// Prove the bytes come back the moment their file is unlinked.
-void
-cttest_wal_truncate_marker_alive_reclaimed_on_gc(void)
-{
-    setup();
-
-    char tmppath[] = "/tmp/testinject_markergc.XXXXXX";
-    int fd = mkstemp(tmppath);
-    assertf(fd >= 0, "mkstemp must succeed");
-    int ver = Walver;
-    ssize_t nver = write(fd, &ver, sizeof(ver));
-    assertf(nver == (ssize_t)sizeof(ver), "version header write");
-
-    Wal w;
-    memset(&w, 0, sizeof w);
-    w.filesize = 4096;
-    w.use = 1;
-    w.durable_sync = 1;
-    w.dir = "/tmp"; // dirsync target after walgc's unlink
-
-    // Heap-allocated File: walgc frees both the struct and its path.
-    File *f = new(File);
-    assertf(f, "file must allocate");
-    f->path = malloc(strlen(tmppath) + 1);
-    assertf(f->path, "path must allocate");
-    strcpy(f->path, tmppath);
-    f->w = &w;
-    f->fd = fd;
-    f->iswopen = 1;
-    f->free = 32768;
-    f->refs = 1; // the writer's ref; filewclose drops it -> walgc fires
-    f->jlist.fprev = &f->jlist;
-    f->jlist.fnext = &f->jlist;
-    w.cur = w.head = w.tail = f;
-    w.nfile = 1;
-
-    Tube *t = make_tube("markergc");
-    assertf(t, "tube must allocate");
-
-    int64 pre_alive = w.alive;
-
-    int r = wal_write_truncate(&w, t, 123);
-    assertf(r == 1, "marker stage must succeed, got %d", r);
-    int c = walcommit(&w);
-    assertf(c == 1, "marker commit must succeed, got %d", c);
-    assertf(w.alive > pre_alive,
-            "durable marker bytes count as live while the file exists "
-            "(#701), got %" PRId64, w.alive);
-
-    // End of the file's life: drop the writer ref. filewclose ->
-    // filedecref -> refs==0 -> walgc unlinks the file. The marker's
-    // protection job is over; its bytes must leave w->alive with it.
-    // In production a binlog can only die after the writer has rotated
-    // past it, and walgc refuses to reap the file w->cur points to (UAF
-    // guard) — model the rotation by moving cur off the dying file.
-    w.cur = NULL;
-    f->free = 0; // skip filewclose's ftruncate of the fallocate tail
-    filewclose(f);
-
-    assertf(w.head == NULL && w.nfile == 0,
-            "walgc must have unlinked the only file, head=%p nfile=%d",
-            (void *)w.head, w.nfile);
-    assertf(w.alive == pre_alive,
-            "marker bytes must be reclaimed when their file is unlinked: "
-            "want %" PRId64 " got %" PRId64
-            " — w->alive leaks per marker re-emission",
-            pre_alive, w.alive);
-    // f and f->path freed by walgc; fd closed by filewclose; the tmp
-    // file itself unlinked by walgc.
-}
-
-
-// Commit failure with a staged marker: the marker bytes were ftruncated
-// off the tail, so BOTH w->alive (via uncommitted_alive) and the file's
-// marker_bytes ledger must forget them. A stale marker_bytes would make
-// a later walgc subtract bytes that alive never kept — tripping the
-// "marker_bytes > alive" clamp and understating alive.
-void
-cttest_inject_truncate_marker_commit_fail_rolls_back_marker_bytes(void)
-{
-    setup();
-
-    char tmppath[] = "/tmp/testinject_markerfail.XXXXXX";
-    int fd = mkstemp(tmppath);
-    assertf(fd >= 0, "mkstemp must succeed");
-    int ver = Walver;
-    ssize_t nver = write(fd, &ver, sizeof(ver));
-    assertf(nver == (ssize_t)sizeof(ver), "version header write");
-
-    Wal w;
-    File f;
-    setup_durable_wal(fd, &w, &f);
-
-    Tube *t = make_tube("markerfail");
-    assertf(t, "tube must allocate");
-
-    int r = wal_write_truncate(&w, t, 55);
-    assertf(r == 1, "marker stage must succeed, got %d", r);
-    assertf(w.alive > 0,
-            "staged marker counts as alive, got %" PRId64, w.alive);
-    assertf(f.marker_bytes > 0,
-            "staged marker bytes recorded on the file, got %d",
-            f.marker_bytes);
-
-    fault_set(FAULT_FDATASYNC, 0, EIO);
-    int c = walcommit(&w);
-    assertf(c == 0, "commit must fail under injected fdatasync EIO");
-    assertf(w.alive == 0,
-            "staged marker bytes must be reverted from alive, got %" PRId64,
-            w.alive);
-    assertf(f.marker_bytes == 0,
-            "rolled-back marker must leave no marker_bytes, got %d",
-            f.marker_bytes);
-    assertf(f.uncommitted_marker_bytes == 0,
-            "uncommitted_marker_bytes drained after rollback, got %d",
-            f.uncommitted_marker_bytes);
-
-    close(fd);
-    unlink(tmppath);
-}
-
-
-// ─── reap_purged_job: fileless zombie must not write a phantom marker ──
-//
-// A buried/delayed job with j->file == NULL (reachable in production via
-// the heapinsert-OOM PUT path: bury_job leaves a fresh, never-logged job
-// on the buried chain) that later becomes a zombie must be reaped WITHOUT
-// touching the WAL: walwrite on j->file==NULL dispatches filewrjobfull —
-// a full Invalid record with namelen>0, byte-identical to a truncate
-// marker. Pre-fix damage, both asserted here: (a) a full-size record was
-// written against a short-size walresvupdate reservation, driving w->resv
-// negative (invariant #6); (b) phantom bytes landed in the binlog — with
-// a body >64B that record aborts replay at fileread's Invalid-body cap
-// (#717), losing every later record.
-//
-// The zombie is driven through prottick's delayed-head reap: prot_replay
-// installs the job (the only exported path into enqueue_job's delayed_ct
-// and delay_tube_heap bookkeeping), then the tube's cutoff makes it the
-// zombie at the heap root.
-void
-cttest_inject_reap_fileless_zombie_writes_no_phantom_record(void)
-{
-    setup();
-    now = nanoseconds();
-    prot_init();
-
-    Server s = {0};
-
-    char tmppath[] = "/tmp/testinject_reapfileless.XXXXXX";
-    int fd = mkstemp(tmppath);
-    assertf(fd >= 0, "mkstemp must succeed");
-
-    int ver = Walver;
-    ssize_t nver = write(fd, &ver, sizeof(ver));
-    assertf(nver == (ssize_t)sizeof(ver), "version header write must succeed");
-
-    s.wal.use = 1;
-    s.wal.filesize = 4096;
-    s.wal.nfile = 1;
-    // Pin the compaction rate limiter so prot_replay's walmaint does not
-    // run walcompact against this hand-built single-file WAL.
-    s.wal.lastcompact = nanoseconds();
-
-    File f = {0};
-    f.w = &s.wal;
-    f.fd = fd;
-    f.iswopen = 1;
-    f.free = 4096;
-    f.resv = 0;
-    f.refs = 2;
-    f.jlist.fprev = &f.jlist;
-    f.jlist.fnext = &f.jlist;
-
-    s.wal.cur = &f;
-    s.wal.tail = &f;
-    s.wal.head = &f;
-
-    Tube *t = make_tube("reapfileless");
-    assertf(t, "tube must allocate");
-    tube_iref(t);
-
-    // Body > 64 bytes: the size class where a phantom Invalid-full
-    // record would abort replay (#717).
-    Job *j = make_job(1, 3600000000000LL, 10000000000LL, 100, t);
-    assertf(j, "job must allocate");
-    memset(j->body, 'Z', 100);
-    j->r.state = Delayed;
-    j->r.deadline_at = nanoseconds() + 3600000000000LL;
-    uint64 jid = j->r.id;
-
-    Job list = {0};
-    list.prev = list.next = &list;
-    job_list_insert(&list, j);
-    assertf(prot_replay(&s, &list) == 1, "replay must install the job");
-    assertf(t->delay.len == 1 && t->delay.data[0] == j,
-            "precondition: j is the delay heap root");
-    assertf(j->file == NULL, "precondition: job has no binlog record");
-    assertf(s.wal.resv > 0,
-            "precondition: replay reserved update space (got %" PRId64 ")",
-            s.wal.resv);
-
-    int pre_free = f.free;
-    off_t pre_end = lseek(fd, 0, SEEK_END);
-    assertf(pre_end == (off_t)sizeof(ver),
-            "precondition: binlog holds only the version header");
-
-    // Zombie at the delay-heap root; prottick reaps it inline.
-    t->purge_before_id = jid;
-    prottick(&s);
-
-    assertf(t->delay.len == 0, "zombie must be reaped, got len=%zu",
-            t->delay.len);
-    assertf(t->stat.total_delete_ct == 1,
-            "reap must count as a delete, got %" PRIu64,
-            t->stat.total_delete_ct);
-
-    // (a) Reservation balance (invariant #6): everything returned,
-    // nothing consumed. Pre-fix: a second reservation was taken and a
-    // FULL record's bytes were debited against it — w->resv ends
-    // negative and f.free short by the record size.
-    assertf(s.wal.resv == 0,
-            "w->resv must balance to 0 after the reap, got %" PRId64,
-            s.wal.resv);
-    assertf(f.resv == 0, "file resv must balance to 0, got %d", f.resv);
-    assertf(f.free == 4096,
-            "the replay reservation must come back in full "
-            "(pre-reap free %d, got %d)", pre_free, f.free);
-
-    // (b) No phantom bytes: the binlog still holds only the version
-    // header. Pre-fix: a full Invalid record (header + tube name +
-    // 100-byte body + trailer) landed here, indistinguishable from a
-    // truncate marker and fatal to replay of any later record.
-    off_t post_end = lseek(fd, 0, SEEK_END);
-    assertf(post_end == pre_end,
-            "no record may be written for a fileless zombie "
-            "(file grew from %lld to %lld)",
-            (long long)pre_end, (long long)post_end);
-
-    t->purge_before_id = 0;
-    tube_dref(t);
     close(fd);
     unlink(tmppath);
 }

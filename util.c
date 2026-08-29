@@ -176,6 +176,9 @@ warn_systemd_ignored_option(char *opt, char *arg)
     if (sd_listen_fds(0) > 0) {
         warnx("inherited listen fd; ignoring option: %s %s", opt, arg);
     }
+#else
+    UNUSED_PARAMETER(opt);
+    UNUSED_PARAMETER(arg);
 #endif
 }
 

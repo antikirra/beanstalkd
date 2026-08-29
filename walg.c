@@ -196,22 +196,6 @@ walgc(Wal *w)
             w->tail = f->next; // also, f->next == NULL
         }
 
-        // Truncate-marker bytes in this file were counted as live so
-        // ratio() would not let walgc unlink a marker-only binlog too
-        // early (#701). The file is gone now — reclaim them from
-        // w->alive, or every compact_post re-emission inflates alive
-        // forever and compaction gets monotonically lazier. Clamp
-        // defensively, mirroring filermjob.
-        if (f->marker_bytes) {
-            if (f->marker_bytes <= w->alive) {
-                w->alive -= f->marker_bytes;
-            } else {
-                twarnx("walgc: marker_bytes %d > alive %"PRId64,
-                       f->marker_bytes, w->alive);
-                w->alive = 0;
-            }
-        }
-
         w->nfile--;
         unlink(f->path);
         free(f->path);
@@ -332,19 +316,8 @@ moveone(Wal *w)
 static int
 walcompact(Wal *w)
 {
-    // Early-out: if there is nothing to migrate, skip compact_post as well.
-    // compact_post is only needed to protect markers from walgc unlinking
-    // old files during migration (moveone -> filedecref -> walgc). Without
-    // migration, walgc has no trigger here, so re-emitting every marker
-    // every walmaint tick is just write amplification (#703).
     int r = ratio(w);
     if (r < 2) return 1;
-
-    // Rewrite truncate markers to the current file BEFORE migration.
-    if (w->compact_post) {
-        if (!w->compact_post(w))
-            return 0;
-    }
 
     for (; r >= 2; r--) {
         for (int batch = 0; batch < 8; batch++) {
@@ -378,12 +351,14 @@ walsync(Wal *w)
     }
 
     if (w->wantsync && now >= w->lastsync+w->syncrate) {
-        w->lastsync = now;
         if (w->sync_on) {
             // Check if sync thread is free before dup() to avoid
             // wasted dup+close when thread is already busy.
             pthread_mutex_lock(&w->sync_mu);
             if (w->sync_fd >= 0) {
+                // Thread is busy — skip this round WITHOUT touching
+                // w->lastsync: stamping it here would silently swallow
+                // a whole syncrate interval with no fsync issued.
                 pthread_mutex_unlock(&w->sync_mu);
             } else {
                 int fd = dup(w->cur->fd);
@@ -393,10 +368,12 @@ walsync(Wal *w)
                     return 0;
                 }
                 w->sync_fd = fd;
+                w->lastsync = now;
                 pthread_cond_signal(&w->sync_cond);
                 pthread_mutex_unlock(&w->sync_mu);
             }
         } else {
+            w->lastsync = now;
             if (durable_fsync(w->cur->fd) == -1) {
                 twarn("fsync");
                 return 0;
@@ -408,7 +385,7 @@ walsync(Wal *w)
 
 
 // wal_disabled_result — shared verdict for the WAL-disabled guard in
-// walwrite / wal_write_truncate / reserve. When the WAL is disabled the
+// walwrite / reserve. When the WAL is disabled the
 // legacy contract is: succeed silently (return 1) because nothing
 // persists anyway. Under durable mode (-D) that would let the caller
 // ghost-ack the client for a record that never became durable (see
@@ -473,7 +450,7 @@ walwrite(Wal *w, Job *j)
 }
 
 // walcommit — fdatasync w->cur, flushing every record staged by
-// walwrite / wal_write_truncate since the last commit. On failure,
+// walwrite since the last commit. On failure,
 // filewrcommit ftruncates the tail back and rolls back global
 // counters; we then disable the WAL so the "ack ⇒ durable" contract
 // (invariant #14) is not regressed.
@@ -485,7 +462,7 @@ int
 walcommit(Wal *w)
 {
     if (unlikely(w->commit_failed)) {
-        // A mid-tick failure (rotation commit, writev, truncate marker)
+        // A mid-tick failure (rotation commit or writev)
         // already disabled w->use after this tick's staged records were
         // lost. The disabled-WAL fast path below would report success
         // and dur_flush_all would ghost-ack clients for records that
@@ -505,43 +482,6 @@ walcommit(Wal *w)
     }
     return 1;
 }
-
-// wal_write_truncate stages a truncate-marker record. Same staging
-// semantics as walwrite above — fdatasync is deferred to walcommit().
-int
-wal_write_truncate(Wal *w, Tube *t, uint64 cutoff_id)
-{
-    // Invariant-#14 refusal vs legacy silent success — see wal_disabled_result.
-    if (!w->use) return wal_disabled_result(w);
-
-    int needed = sizeof(int) + (int)t->name_len + sizeof(Jobrec) + 2 + sizeof(uint32);
-    if (!reserve(w, needed)) return 0;
-    if (w->cur->resv <= 0 && !usenext(w)) {
-        // `reserve` already incremented w->resv/w->cur->resv/w->tail->resv.
-        // Return them before disabling — otherwise accounting leaks.
-        walresvreturn(w, needed);
-        return 0;
-    }
-
-    int r = filewrtruncate(w->cur, t, cutoff_id);
-    if (!r) {
-        // filewrtruncate left reservations untouched on failure. Return
-        // them before WAL goes dark so w->resv matches reality for any
-        // remaining jobs still trying to reserve (#702).
-        walresvreturn(w, needed);
-        twarnx("wal: disabling WAL after truncate-marker write failure");
-        filewclose(w->cur);
-        w->use = 0;
-        // Same poison as walwrite: records staged earlier this tick are
-        // now in a closed, unsynced file — walcommit must fail the tick.
-        w->commit_failed = 1;
-        return 0;
-    }
-
-    w->nrec++;
-    return r;
-}
-
 
 // walmaint performs wal compaction and sync.
 // Returns 1 on success, 0 if WAL was disabled due to error.

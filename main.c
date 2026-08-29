@@ -153,7 +153,7 @@ main(int argc, char **argv)
     optparse(&srv, argv+1);
 
     // -D without a WAL makes every persistent command fail. Since #C1
-    // (2026-04-23), walwrite/wal_write_truncate/reserve explicitly
+    // (2026-04-23), walwrite/reserve explicitly
     // refuse under `durable_sync && !w->use` and propagate 0 upward,
     // so the dispatcher replies with BURIED/INTERNAL_ERROR/OUT_OF_MEMORY
     // rather than silently ack'ing a ghost write. That is strictly

@@ -1,5 +1,92 @@
 # Changelog
 
+## 2026-08-29 — Audit fixes, connsched OOM recovery, crc32c runtime dispatch, -Wextra
+
+Final hardening batch on top of the `truncate` removal (see the entry
+below — the wire contract is now identical to upstream).
+
+### Audit fixes
+
+- WAL replay: v7/v8 `readrec` heap overflow via a forged `body_size`;
+  `walresv` reservation leak on the kick-buried failure path (full
+  rollback of wal/file/job counters).
+- Stale-event UAF: conn pool free is deferred across the epoll batch
+  drain (`conn_defer_free_begin/end`), so an event still queued for a
+  conn being closed cannot dispatch into recycled memory.
+- WAL rotation: `fdatasync` before `close` on the old file; `lastsync`
+  accounting fix.
+- Overflow guards in the 4-ary heap growth and `ms` size math;
+  `allocate_job` failure gate on the put path.
+- `connsched` OOM recovery: a failed `heapinsert(&srv->conns)` used to
+  drop the conn's TTR / reserve-deadline / idle timers forever. Conns
+  are now linked on an intrusive live list (`Conn::live_next/live_prev`);
+  `connsched` flags the heap degraded and `conn_sched_recover` (called
+  from `prottick`) re-derives each missing conn's tickat and retries the
+  insert, waking within a second while OOM persists.
+
+### Build
+
+- `ct/gen` zero-test guard: an empty generated test list is a hard
+  error, not a falsely green `make check`.
+- Test objects build with `-fno-lto` so `nm` stays inspectable.
+- CFLAGS stamp file: objects rebuild when the effective flags change.
+- `-Wextra` added next to `-Wall` (still no `-Wpedantic`).
+
+### Portability
+
+- crc32c: SSE4.2 on x86-64 (compile-time, `-msse4.2` for this file
+  only), ARM CRC32 on aarch64 with runtime `getauxval(AT_HWCAP)`
+  dispatch, portable table-driven software fallback elsewhere. Verified
+  against the known vector (`"123456789"` → 0xE3069283).
+
+### Performance (Docker A/B vs upstream, `-O2 -DNDEBUG`)
+
+- S3 +122% after the runtime CRC dispatch.
+- Overall: +61% on S1/S4, +443% on S7, tail latency −34%.
+- mimalloc was evaluated and rejected by measurement.
+
+## 2026-08-29 — Remove the `truncate` command
+
+The fork-specific `truncate <tube>` command (added 2026-04-16, hardened
+2026-04-23) is removed entirely; the wire contract returns to upstream:
+`truncate` dispatches to `UNKNOWN_COMMAND` again.
+
+### Removed
+
+- `truncate <tube>\r\n` → `TRUNCATED <count>\r\n` command: dispatch
+  (`which_cmd` 't' branch now resolves `touch` directly), `OP_TRUNCATE`
+  handler, `reply_truncated`, `cmd-truncate` stats key.
+- Cutoff machinery that existed only for truncate: `Tube::purge_before_id`
+  / `purge_drained`, the `truncated_tubes` registry, `job_is_purged`,
+  `reap_purged_job`, the prottick lazy reap, the `enqueue_job` /
+  `process_tube` purge intercepts, and every zombie guard in
+  peek/reserve/delete/release/bury/kick/touch/stats-job. `touch` is back
+  to upstream behavior (TOUCHED for any live reservation).
+- WAL marker write path: `wal_write_truncate`, `filewrtruncate`,
+  `Wal::compact_post` (and its `prot.c` callback), `File::marker_bytes` /
+  `uncommitted_marker_bytes` accounting, marker re-emission in
+  `prot_replay`. `job_next_id()` accessor (only the truncate handler
+  used it).
+
+### WAL replay compatibility
+
+Old v7/v8 binlogs may still contain truncate-marker records (Invalid job
+record with `namelen > 0`, id = cutoff). Both `readrec` and `readrec7`
+now **skip them gracefully**: the record is consumed (body read, CRC
+verified), a warning is logged, and replay continues. The cutoff is NOT
+honored — jobs below it resurrect as live. This is the accepted
+downgrade semantic: the marker's effects were already applied to the
+live state before shutdown; silently dropping data at replay would be
+worse than resurrecting jobs the operator thought deleted. Callers that
+need the old semantics must drain such tubes before upgrading.
+
+`testprot2.c` / `testserv2.c` / `testinject2.c`: all truncate tests
+removed (45 integration + unit tests); `cttest_prot_dispatch_strict_prefix`
+now locks in `truncate` → `UNKNOWN_COMMAND`. The
+`cttest_epollq_double_insert_does_not_orphan_worker` scenario was
+rewritten to force the reserve slow path without truncate (empty-tube
+reserve + same-burst puts).
+
 ## 2026-04-24 — Durable group commit (-D)
 
 Group commit for `-D` mode. No wire-protocol change. Invariant #14

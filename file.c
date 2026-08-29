@@ -20,6 +20,28 @@ static int  readfull(File*, void*, int, int*, char*);
 static void warnpos(File*, int, char*, ...)
 __attribute__((format(printf, 3, 4)));
 
+// An all-zero Jobrec (jr.id == 0) normally means we reached the
+// fallocate-zeroed tail of the binlog and replay stops cleanly. But a
+// zeroed record MID-file (torn write, partial fsync, misaligned replay)
+// looks identical, and replay would then silently drop every record
+// that follows it. Peek at the unread buffered remainder: if it holds
+// any nonzero byte this was not a tail, so say so. This is a bounded,
+// best-effort diagnostic — data still in the kernel beyond the current
+// buffer is not scanned, and the stop-at-zero semantics are unchanged.
+static void
+warn_if_not_tail(File *f)
+{
+    ReadBuf *rb = f->rbuf;
+    if (!rb) return;
+    for (int i = rb->pos; i < rb->filled; i++) {
+        if (rb->buf[i]) {
+            warnpos(f, 0, "zero record with nonzero data beyond it; "
+                    "not a fallocate tail — ignoring the rest of the file");
+            return;
+        }
+    }
+}
+
 FAlloc falloc = rawfalloc;
 
 enum
@@ -211,7 +233,10 @@ readrec(File *f, Job *l, int *err)
 
     // Are we reading trailing zeroes? (fallocate zero-fills unused tail;
     // a genuine record always has jr.id > 0.)
-    if (!jr.id) return 0;
+    if (!jr.id) {
+        warn_if_not_tail(f);
+        return 0;
+    }
 
     // Reject jobs with body_size < 2 from corrupted WAL.
     // Valid jobs always include \r\n trailer (body_size >= 2).
@@ -225,8 +250,8 @@ readrec(File *f, Job *l, int *err)
     // pathological binlog could carry jr.body_size = INT_MAX, which
     // malloc would then attempt to honor. v7 reader bounds to 64 for
     // markers; we accept the full job_data_size_limit here for real
-    // jobs and cap the Invalid-marker specifically at 64 to mirror v7
-    // (the marker body is always 2 bytes in our writer) (#717).
+    // jobs and cap the legacy Invalid-marker specifically at 64 to
+    // mirror v7 (the marker body was always 2 bytes) (#717).
     if (namelen) {
         int64 max_body = (jr.state == Invalid) ? 64 : (int64)job_data_size_limit;
         if (jr.body_size < 0 || (int64)jr.body_size > max_body) {
@@ -328,6 +353,22 @@ readrec(File *f, Job *l, int *err)
         }
         {
         int32 old_body_size = j->r.body_size;
+
+        // A full record for an existing job must carry the body_size the
+        // job's current allocation was created with. Checking this AFTER
+        // `j->r = jr` is too late: the Error path's job_free files
+        // j->body into the size-class pool keyed by j->r.body_size, so a
+        // corrupt (larger) size would pool a small slab under a large
+        // class and the next allocate_job of that class would overflow
+        // it. Reject BEFORE the assignment, like the short-record check
+        // above. (Here it is defense in depth — a corrupt record never
+        // passes the CRC trailer — but in the v7 reader the identical
+        // check is load-bearing.)
+        if (namelen && jr.body_size != old_body_size) {
+            warnpos(f, -sz, "job %"PRIu64" full-record body_size changed (was %d, now %d)",
+                    jr.id, old_body_size, jr.body_size);
+            goto Error;
+        }
         j->r = jr;
 
         // For short records, move job to tail of replay list to
@@ -339,11 +380,6 @@ readrec(File *f, Job *l, int *err)
         job_list_insert(l, j);
 
         if (namelen) {
-            if (jr.body_size != old_body_size) {
-                warnpos(f, -sz, "job %"PRIu64" size changed", j->r.id);
-                warnpos(f, -sz, "was %d, now %d", old_body_size, jr.body_size);
-                goto Error;
-            }
             memcpy(j->body, body_buf, j->r.body_size);
 
             // since this is a full record, we can move
@@ -365,20 +401,12 @@ readrec(File *f, Job *l, int *err)
     case Invalid:
         free(body_buf);
         if (namelen > 0) {
-            t = tube_find_or_make(tubename);
-            if (!t) {
-                // OOM while resurrecting truncate marker. Silently
-                // dropping would let cutoff-covered jobs replay as
-                // live — a direct violation of invariant #9. Fail the
-                // replay so the operator notices (#718).
-                warnpos(f, -sz,
-                        "OOM tube_find_or_make for truncate marker "
-                        "(tube=%s cutoff=%"PRIu64")", tubename, jr.id);
-                *err = 1;
-                return 0;
-            }
-            if (jr.id > t->purge_before_id)
-                t->purge_before_id = jr.id;
+            // Legacy truncate marker (the truncate command was removed).
+            // CRC is already verified; the cutoff it carried is ignored,
+            // so previously truncated jobs replay as live — the accepted
+            // downgrade semantic. Warn once per marker, do not fail replay.
+            warnpos(f, -sz, "ignoring legacy truncate marker (tube=%s cutoff=%"PRIu64")",
+                    tubename, jr.id);
             return 1;
         }
         if (j) {
@@ -449,7 +477,10 @@ readrec7(File *f, Job *l, int *err)
     sz += r;
 
     // are we reading trailing zeroes?
-    if (!jr.id) return 0;
+    if (!jr.id) {
+        warn_if_not_tail(f);
+        return 0;
+    }
 
     // Reject jobs with body_size < 2 from corrupted WAL.
     // Valid jobs always include \r\n trailer (body_size >= 2).
@@ -519,6 +550,20 @@ readrec7(File *f, Job *l, int *err)
         }
         {
         int32 old_body_size = j->r.body_size;
+
+        // Full records need the same guard as the short-record check
+        // above, and for the same reason it must fire BEFORE `j->r = jr`:
+        // a corrupt full record re-stating an existing job with a larger
+        // body_size would otherwise be copied into j->r, and the Error
+        // path's job_free would pool the small j->body slab under the
+        // bogus large size class — the next allocate_job of that class
+        // overflows it. v7 has no CRC trailer, so this check is the only
+        // thing standing between a bit-flip and the pool poisoning.
+        if (namelen && jr.body_size != old_body_size) {
+            warnpos(f, -sz, "job %"PRIu64" full-record body_size changed (was %d, now %d)",
+                    jr.id, old_body_size, jr.body_size);
+            goto Error;
+        }
         j->r = jr;
 
         // For short records, move job to tail of replay list to
@@ -531,11 +576,6 @@ readrec7(File *f, Job *l, int *err)
 
         // full record; read the job body
         if (namelen) {
-            if (jr.body_size != old_body_size) {
-                warnpos(f, -r, "job %"PRIu64" size changed", j->r.id);
-                warnpos(f, -r, "was %d, now %d", j->r.body_size, jr.body_size);
-                goto Error;
-            }
             r = readfull(f, j->body, j->r.body_size, err, "job body");
             if (!r) {
                 goto Error;
@@ -558,17 +598,13 @@ readrec7(File *f, Job *l, int *err)
         return 1;
         } /* end old_body_size scope */
     case Invalid:
-        // Truncate marker (Invalid + namelen > 0) was introduced after
-        // v8 rolled out, but a v7 reader that encounters a marker-shaped
-        // record (e.g. a downgrade or cross-version migration) must
-        // honor it — otherwise cutoff is silently dropped and jobs with
-        // id ≤ cutoff resurrect on replay (#707).
+        // Legacy truncate marker (Invalid + namelen > 0). The truncate
+        // command was removed; consume the marker body so the file
+        // position stays aligned for the next readrec7 call (#714), then
+        // ignore the cutoff — previously truncated jobs replay as live
+        // (accepted downgrade semantic). The writer used a 2-byte "\r\n"
+        // body; bound defensively.
         if (namelen > 0) {
-            // Consume the marker body so the file position stays aligned
-            // for the next readrec7 call. Without this, v7 reader falls
-            // behind by body_size bytes and the next record parses from
-            // the middle of the marker (#714). filewrtruncate writes a
-            // 2-byte "\r\n" body; bound defensively.
             if (jr.body_size < 0 || jr.body_size > 64) {
                 warnpos(f, -sz, "v7 marker body_size %d out of expected range",
                         jr.body_size);
@@ -579,17 +615,8 @@ readrec7(File *f, Job *l, int *err)
                 int rb = readfull(f, mbody, jr.body_size, err, "marker body");
                 if (!rb) goto Error;
             }
-            t = tube_find_or_make(tubename);
-            if (!t) {
-                // OOM while resurrecting v7 truncate marker — fail
-                // replay rather than silently drop the cutoff (#718).
-                warnpos(f, -sz,
-                        "OOM tube_find_or_make for v7 truncate marker "
-                        "(tube=%s cutoff=%"PRIu64")", tubename, jr.id);
-                goto Error;
-            }
-            if (jr.id > t->purge_before_id)
-                t->purge_before_id = jr.id;
+            warnpos(f, -sz, "ignoring legacy truncate marker (tube=%s cutoff=%"PRIu64")",
+                    tubename, jr.id);
             return 1;
         }
         if (j) {
@@ -852,14 +879,12 @@ filewrite_commit_durable(File *f, int total)
     return 0;
 }
 
-// file_stage_account applies the staging-side accounting shared by
-// filewritev and filewrtruncate: `total` bytes leave the reservation
-// (w->resv, f->resv) and become uncommitted-but-alive. filewrcommit's
-// commit-fail rollback reverses exactly these counters, so the two
-// staging paths must stay in lockstep — hence one helper. Per-job
-// (j->walresv, j->walused) and per-marker (f->marker_bytes,
-// f->uncommitted_marker_bytes) adjustments stay at the call sites:
-// a truncate marker has no Job, a job record is not a marker.
+// file_stage_account applies the staging-side accounting of filewritev:
+// `total` bytes leave the reservation (w->resv, f->resv) and become
+// uncommitted-but-alive. filewrcommit's commit-fail rollback reverses
+// exactly these counters, so staging and rollback must stay in lockstep
+// — hence one helper. Per-job (j->walresv, j->walused) adjustments stay
+// at the call site.
 static inline void
 file_stage_account(File *f, int total)
 {
@@ -937,17 +962,12 @@ filewrcommit(File *f)
         f->w->resv  += total;
         f->resv     += total;
         f->w->alive -= f->uncommitted_alive;
-        // Truncate-marker bytes staged in this batch are gone from the
-        // tail too; forget them or walgc would over-subtract from
-        // w->alive when this file is eventually unlinked.
-        f->marker_bytes -= f->uncommitted_marker_bytes;
     }
     // On success or rollback, the counters are drained: success leaves
     // bytes durable, rollback has removed them from the tail. Either way
     // the next batch starts fresh.
     f->uncommitted_bytes = 0;
     f->uncommitted_alive = 0;
-    f->uncommitted_marker_bytes = 0;
     return r;
 }
 
@@ -1039,53 +1059,6 @@ filewrjobfull(File *f, Job *j)
 }
 
 
-// filewrtruncate stages a truncate-marker record (Invalid job, namelen>0,
-// jr.id=cutoff_id). Same stage semantics as filewrjob{short,full}: writev
-// + accounting now, fdatasync deferred to filewrcommit; tail ftruncate
-// and counter rollback on commit fail. Marker bytes are counted as live
-// so walgc's ratio() does not unlink a marker-only binlog before the
-// next compact_post re-emits the marker into w->cur (#701).
-int
-filewrtruncate(File *f, Tube *t, uint64 cutoff_id)
-{
-    int nl = t->name_len;
-    char body[2] = "\r\n";
-    Jobrec jr = {0};
-    jr.id = cutoff_id;
-    jr.state = Invalid;
-    jr.body_size = sizeof body;
-
-    uint32 crc = WAL_CRC32C_INIT;
-    crc = wal_crc32c(crc, &nl,     sizeof nl);
-    crc = wal_crc32c(crc, t->name, nl);
-    crc = wal_crc32c(crc, &jr,     sizeof jr);
-    crc = wal_crc32c(crc, body,    sizeof body);
-    unsigned char crc_bytes[4];
-    crc32c_trailer_le(crc, crc_bytes);
-
-    struct iovec iov[5] = {
-        { .iov_base = &nl,       .iov_len = sizeof nl },
-        { .iov_base = t->name,   .iov_len = nl },
-        { .iov_base = &jr,       .iov_len = sizeof jr },
-        { .iov_base = body,      .iov_len = sizeof body },
-        { .iov_base = crc_bytes, .iov_len = sizeof crc_bytes },
-    };
-
-    int total = sizeof(int) + nl + sizeof(Jobrec) + sizeof body + sizeof(uint32);
-    if (!writev_all(f->fd, iov, 5, total)) return 0;
-
-    file_stage_account(f, total);
-    // Remember the marker bytes per file: they are not in f->jlist, so
-    // filermjob never reclaims them from w->alive. walgc subtracts
-    // f->marker_bytes when the file is unlinked — without that, every
-    // compact_post re-emission would inflate w->alive forever and make
-    // ratio()-driven compaction monotonically lazier.
-    f->marker_bytes += total;
-    f->uncommitted_marker_bytes += total;
-    return 1;
-}
-
-
 void
 filewclose(File *f)
 {
@@ -1096,6 +1069,21 @@ filewclose(File *f)
         if (ftruncate(f->fd, f->w->filesize - f->free) != 0) {
             twarn("ftruncate");
         }
+    }
+    // Flush before close when running non-durable: close() drops the
+    // last fd for this binlog (rotation in usenext closes the old file
+    // through here), so this is the final chance to push its data out of
+    // the page cache. Cheap insurance against the power-fail window
+    // between the last periodic fsync and rotation. In durable_sync mode
+    // filewrcommit has already fdatasynced everything staged
+    // (uncommitted_bytes == 0), so a second sync here would be pure
+    // overhead. Failure is non-fatal — the file is closed regardless.
+    if (!(f->w->durable_sync && f->uncommitted_bytes == 0)) {
+        int sr;
+        while ((sr = fdatasync(f->fd)) == -1 && errno == EINTR)
+            ;
+        if (sr == -1)
+            twarn("fdatasync before close");
     }
     if (close(f->fd) == -1)
         twarn("close");

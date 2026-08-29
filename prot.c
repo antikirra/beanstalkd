@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "dat.h"
+#include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -69,7 +70,6 @@ static const char _Alignas(64) valid_name_char[256] = {
 #define CMD_STATS_TUBE "stats-tube "
 #define CMD_QUIT "quit"
 #define CMD_PAUSE_TUBE "pause-tube"
-#define CMD_TRUNCATE "truncate "
 
 #define CONSTSTRLEN(m) (sizeof(m) - 1)
 
@@ -96,7 +96,6 @@ static const char _Alignas(64) valid_name_char[256] = {
 #define CMD_LIST_TUBES_WATCHED_LEN CONSTSTRLEN(CMD_LIST_TUBES_WATCHED)
 #define CMD_STATS_TUBE_LEN CONSTSTRLEN(CMD_STATS_TUBE)
 #define CMD_PAUSE_TUBE_LEN CONSTSTRLEN(CMD_PAUSE_TUBE)
-#define CMD_TRUNCATE_LEN CONSTSTRLEN(CMD_TRUNCATE)
 
 #define MSG_FOUND "FOUND"
 #define MSG_NOTFOUND "NOT_FOUND\r\n"
@@ -148,8 +147,7 @@ static const char _Alignas(64) valid_name_char[256] = {
 #define OP_PAUSE_TUBE 23
 #define OP_KICKJOB 24
 #define OP_RESERVE_JOB 25
-#define OP_TRUNCATE 26
-#define TOTAL_OPS 27
+#define TOTAL_OPS 26
 
 #define STATS_FMT "---\n" \
     "current-jobs-urgent: %" PRIu64 "\n" \
@@ -179,7 +177,6 @@ static const char _Alignas(64) valid_name_char[256] = {
     "cmd-list-tube-used: %" PRIu64 "\n" \
     "cmd-list-tubes-watched: %" PRIu64 "\n" \
     "cmd-pause-tube: %" PRIu64 "\n" \
-    "cmd-truncate: %" PRIu64 "\n" \
     "job-timeouts: %" PRIu64 "\n" \
     "total-jobs: %" PRIu64 "\n" \
     "max-job-size: %zu\n" \
@@ -247,19 +244,6 @@ static uint64 ready_ct = 0;
 static uint64 delayed_ct = 0;
 static uint64 timeout_ct = 0;
 
-// Registry of tubes with non-zero purge_before_id (invariant #9): the
-// former truncated_tubes_ct counter is now truncated_tubes.len, so the
-// count and the membership cannot desync. Membership mutates only at
-// the documented #9 transition sites: OP_TRUNCATE (append on first
-// truncate / remove on WAL rollback), the prottick reap-drain clearance,
-// prot_remove_tube, and the prot_replay rebuild. Pointers are borrowed
-// (no tube_iref) — same weak-ref lifecycle as the global `tubes`:
-// prot_remove_tube runs inside tube_free before the Tube is freed.
-// Replaces the O(tubes.len) skip-scan in prottick's lazy reap with
-// O(registry.len) (the third such scan removed; see delay_tube_heap and
-// pause_tube_heap above).
-static Ms truncated_tubes;
-
 int64 now = 0;
 static uint64 op_ct[TOTAL_OPS] = {0};
 /* Not static: exposed for hostile unit tests in testinject2.c. */
@@ -269,6 +253,13 @@ struct stats global_stat = {0};
 // Provides O(1) lookup of the soonest delayed job across all tubes,
 // replacing the O(tubes.len) scan in soonest_delayed_job().
 static Heap delay_tube_heap;
+
+// OOM-degraded flags: a failed heapinsert into delay/pause_tube_heap
+// drops the tube from prottick's timer scanning until something else
+// touches it. While the matching flag is set, prottick rescans the full
+// tube list each tick and retries the missing inserts.
+static byte delay_heap_degraded = 0;
+static byte pause_heap_degraded = 0;
 
 static int
 tube_delay_less(void *ta, void *tb)
@@ -293,7 +284,8 @@ tube_delay_setpos(void *t, size_t pos)
 // On removal (delay.len == 0): always succeeds.
 // On insert/re-sort: may fail under OOM. Returns 0 on failure, 1 on success.
 // OOM failure is non-fatal: tube is temporarily invisible to
-// soonest_delayed_job(). Next insert into this tube retries.
+// soonest_delayed_job(). Next insert into this tube retries, and
+// prottick rescans all tubes while delay_heap_degraded is set.
 static int
 delay_tube_update(Tube *t)
 {
@@ -311,6 +303,7 @@ delay_tube_update(Tube *t)
     }
     t->in_delay_heap = heapinsert(&delay_tube_heap, t);
     if (!t->in_delay_heap) {
+        delay_heap_degraded = 1;
         twarnx("delay_tube_update: OOM inserting tube %s into delay heap", t->name);
     }
     return t->in_delay_heap;
@@ -353,6 +346,7 @@ pause_tube_update(Tube *t)
     }
     t->in_pause_heap = heapinsert(&pause_tube_heap, t);
     if (!t->in_pause_heap) {
+        pause_heap_degraded = 1;
         twarnx("pause_tube_update: OOM inserting tube %s into pause heap", t->name);
     }
 }
@@ -373,9 +367,6 @@ prot_remove_tube(Tube *t)
     if (t->in_pause_heap) {
         heapremove(&pause_tube_heap, t->pause_heap_index);
         t->in_pause_heap = 0;
-    }
-    if (t->purge_before_id) {
-        ms_remove(&truncated_tubes, t);
     }
 }
 
@@ -428,23 +419,11 @@ static const char * op_names[TOTAL_OPS] = {
     [OP_PAUSE_TUBE] = CMD_PAUSE_TUBE,
     [OP_KICKJOB] = CMD_KICKJOB,
     [OP_RESERVE_JOB] = CMD_RESERVE_JOB,
-    [OP_TRUNCATE] = CMD_TRUNCATE,
 };
 
 static Job *remove_ready_job(Job *j);
 static Job *remove_buried_job(Job *j);
 static Job *remove_delayed_job(Job *j);
-
-// job_is_purged reports whether a job id is logically dead under the
-// tube's truncate cutoff (invariant #8: never deliver id <=
-// purge_before_id). Centralizes the gate from the truncate
-// crosscutting checklist; every delivery/state-transition path must
-// call this (or its negation) instead of open-coding the comparison.
-static inline int
-job_is_purged(const Tube *t, uint64 id)
-{
-    return t->purge_before_id != 0 && id <= t->purge_before_id;
-}
 
 // epollq_add schedules connection c in the s->conns heap, adds c
 // to the epollq list to change expected operation in event notifications.
@@ -506,6 +485,28 @@ epollq_apply(void)
             }
         }
     }
+}
+
+// Test-only hooks (testprot2.c): exercise the in_epollq membership
+// guard directly, without trying to reproduce the double-insert tick
+// over the network. A conn with sock.fd == -1 makes epollq_apply skip
+// sockwant, so the list can be built and drained on fake conns.
+void
+epollq_test_add(Conn *c, char rw)
+{
+    epollq_add(c, rw);
+}
+
+void
+epollq_test_apply(void)
+{
+    epollq_apply();
+}
+
+Conn *
+epollq_test_head(void)
+{
+    return epollq;
 }
 
 #define reply_msg(c, m) \
@@ -1058,12 +1059,6 @@ reply_kicked(Conn *c, uint64 count)
     REPLY_WORD_U64(c, "KICKED", count, STATE_SEND_WORD);
 }
 
-static void
-reply_truncated(Conn *c, uint64 count)
-{
-    REPLY_WORD_U64(c, "TRUNCATED", count, STATE_SEND_WORD);
-}
-
 // reply "BURIED <id>\r\n" without vsnprintf.
 static void
 reply_buried(Conn *c, uint64 id)
@@ -1134,60 +1129,16 @@ enqueue_waiting_conn(Conn *c)
  * the OOM bury fallback on orphaned ready jobs (see process_tube below). */
 static int bury_job(Server *s, Job *j, char update_store);
 
-// reap_purged_job: dispose of a job whose id is covered by its tube's
-// purge_before_id cutoff. Writes an Invalid short record to WAL
-// best-effort; a failing walwrite merely disables WAL for this process —
-// the truncate marker already persisted by the truncate command protects
-// replay from ghosts. Used from process_tube (synchronous purge) and
-// prottick (lazy reap).
-//
-// The WAL block is gated on j->file (mirroring enqueue_job's purge
-// intercept): a job with no binlog record cannot be resurrected by
-// replay, so it needs no tombstone. Worse, walwrite on j->file==NULL
-// dispatches filewrjobfull — a full Invalid record with namelen>0 that
-// is byte-identical to a truncate marker. Such a phantom marker (a)
-// aborts replay at fileread's 64-byte Invalid-body cap when the body is
-// larger (#717), losing every later record, and (b) writes a full-size
-// record against a short-size reservation, driving w->resv negative
-// (invariant #6). Reachable via the heapinsert-OOM PUT path: bury_job
-// leaves a fresh job with file==NULL on the buried chain; truncate +
-// lazy reap then hits this function with the WAL still live.
-static void
-reap_purged_job(Server *s, Job *j)
-{
-    j->r.state = Invalid;
-    if (j->file) {
-        int z = walresvupdate(&s->wal);
-        if (z) {
-            j->walresv += z;
-            if (!walwrite(&s->wal, j)) {
-                twarnx("reap: walwrite failed for job %"PRIu64" "
-                       "(ghost protected by truncate marker)", j->r.id);
-            }
-        }
-    }
-    filermjob(j->file, j);
-    j->tube->stat.total_delete_ct++;
-    walresvreturn(&s->wal, j->walresv);
-    job_free(j);
-}
-
 // process_tube matches ready jobs with waiting connections in a single tube.
 __attribute__((hot)) static void
 process_tube(Tube *t)
 {
     if (t->pause) return;  // hoisted: pause can't change during the loop
-    int purge_limit = 64;
     while (t->ready.len > 0 && t->waiting_conns.len > 0) {
         Job *j = remove_ready_job(t->ready.data[0]);
         if (!j) {
             twarnx("job not ready");
             break;
-        }
-        if (unlikely(job_is_purged(t, j->r.id))) {
-            reap_purged_job(&srv, j);
-            if (unlikely(--purge_limit <= 0)) break;
-            continue;
         }
         // Prefetch new heap root for next iteration (hides L2/L3 latency).
         if (t->ready.len > 0)
@@ -1268,16 +1219,6 @@ enqueue_job(Server *s, Job *j, int64 delay, char update_store)
 {
     int r;
     Wal *w = &s->wal;
-
-    if (unlikely(job_is_purged(j->tube, j->r.id))) {
-        j->r.state = Invalid;
-        if (update_store && j->file) walwrite(w, j);
-        filermjob(j->file, j);
-        j->tube->stat.total_delete_ct++;
-        walresvreturn(w, j->walresv);
-        job_free(j);
-        return 1;
-    }
 
     // j->reserver is already NULL: new jobs from memset(0) in allocate_job,
     // re-enqueued jobs from remove_this_reserved_job.
@@ -1377,17 +1318,11 @@ enqueue_reserved_jobs(Conn *c)
         // on state==Reserved today, but that is one refactor away from
         // becoming a guard we can no longer rely on (#N5).
         j->reserver = NULL;
-        // Pin the tube across enqueue_job: if the job hits the purge
-        // intercept, job_free drops the tube reference via TUBE_ASSIGN.
-        // Without iref here, t may become dangling before reserved_ct--.
-        Tube *t = j->tube;
-        tube_iref(t);
         int r = enqueue_job(c->srv, j, 0, 0);
         if (r < 1)
             bury_job(c->srv, j, 0);
         global_stat.reserved_ct--;
-        t->stat.reserved_ct--;
-        tube_dref(t);
+        j->tube->stat.reserved_ct--;
     }
 }
 
@@ -1484,30 +1419,13 @@ static uint
 kick_buried_jobs(Server *s, Tube *t, uint n)
 {
     uint i;
-    int reaped = 0;
     for (i = 0; (i < n) && !job_list_is_empty(&t->buried); ) {
         Job *j = t->buried.next;
-        // Zombie (purge_before_id covers this id): reap in place and
-        // CONTINUE — do not count toward kicked N, do not break. Without
-        // this, a zombie at head of buried chain either (a) bumps N via
-        // enqueue_job's purge intercept (ghost KICKED count) or (b)
-        // causes an early break that hides post-cutoff kickable jobs.
-        if (job_is_purged(t, j->r.id)) {
-            if (!remove_buried_job(j)) break;
-            reap_purged_job(s, j);
-            reaped = 1;
-            continue;
-        }
         if (kick_buried_job(s, j))
             i++;
         else
             break;
     }
-    // Zombie reap issues walwrite(Invalid) but not walmaint. The normal
-    // delete path always pairs walwrite with walmaint so the async fsync
-    // thread is notified. Match that contract for zombie reaps in bulk
-    // kick (#719).
-    if (reaped) walmaint(&s->wal);
     return i;
 }
 
@@ -1516,21 +1434,13 @@ static uint
 kick_delayed_jobs(Server *s, Tube *t, uint n)
 {
     uint i;
-    int reaped = 0;
     for (i = 0; (i < n) && (t->delay.len > 0); ) {
         Job *j = (Job *)t->delay.data[0];
-        if (job_is_purged(t, j->r.id)) {
-            if (!remove_delayed_job(j)) break;
-            reap_purged_job(s, j);
-            reaped = 1;
-            continue;
-        }
         if (kick_delayed_job(s, j))
             i++;
         else
             break;
     }
-    if (reaped) walmaint(&s->wal);
     return i;
 }
 
@@ -1599,14 +1509,6 @@ static bool
 touch_job(Conn *c, Job *j)
 {
     if (is_job_reserved_by_conn(c, j)) {
-        // Refuse to extend the TTR on a zombie reserved job. Otherwise a
-        // client that keeps touching a pre-truncate reservation pins
-        // reserved_ct > 0 forever, preventing the reap loop from clearing
-        // purge_before_id (the reap-drain clearance gate in prottick,
-        // rt->purge_before_id = 0). That wastes a reap slot every tick
-        // and keeps the tube in truncated state indefinitely.
-        if (job_is_purged(j->tube, j->r.id))
-            return false;
         j->r.deadline_at = now + j->r.ttr;
         c->soonest_job = NULL;
         return true;
@@ -1713,10 +1615,7 @@ which_cmd(Conn *c)
         TEST_CMD(c->cmd, CMD_KICKJOB, OP_KICKJOB);   // "kick-job "
         break;
     case 't':
-        switch (c->cmd[1]) {
-        case 'r': TEST_CMD(c->cmd, CMD_TRUNCATE, OP_TRUNCATE); break;
-        case 'o': TEST_CMD(c->cmd, CMD_TOUCH, OP_TOUCH); break;
-        }
+        TEST_CMD(c->cmd, CMD_TOUCH, OP_TOUCH);
         break;
     case 's':
         if (c->cmd_len < 7) break; // shortest: "stats\r\n" = 7
@@ -1862,6 +1761,13 @@ enqueue_incoming_job(Conn *c)
     }
 
     if (unlikely(j->walresv)) {
+        // Defensive: a freshly made incoming job must not carry a WAL
+        // reservation. If it does (recycled job slot with a stale resv),
+        // return it before freeing — job_free does not touch walresv, so
+        // skipping this permanently inflates w->resv (mirrors the OOM
+        // return below).
+        walresvreturn(&c->srv->wal, j->walresv);
+        j->walresv = 0;
         job_free(j);
         reply_serr(c, MSG_INTERNAL_ERROR);
         return;
@@ -1911,36 +1817,6 @@ uptime(void)
     return (now - started_at) / 1000000000;
 }
 
-// tube_count_vs_cutoff scans one tube's ready heap, delay heap and
-// buried chain, counting jobs relative to a truncate cutoff.
-// below=1 counts zombies (id <= cutoff, the fmt_stats/fmt_stats_tube
-// subtraction); below=0 counts survivors (id > cutoff, the re-truncate
-// "newly dead" count). Counts are ADDED to the out parameters so
-// callers can aggregate across tubes; urgent (pri < URGENT_THRESHOLD
-// among counted ready jobs) is tallied only when non-NULL.
-static void
-tube_count_vs_cutoff(Tube *t, uint64 cutoff, int below,
-                     uint64 *ready, uint64 *delay, uint64 *buried, uint64 *urgent)
-{
-    for (size_t i = 0; i < t->ready.len; i++) {
-        Job *j = (Job *)t->ready.data[i];
-        if (below ? (j->r.id <= cutoff) : (j->r.id > cutoff)) {
-            (*ready)++;
-            if (urgent && j->r.pri < URGENT_THRESHOLD)
-                (*urgent)++;
-        }
-    }
-    for (size_t i = 0; i < t->delay.len; i++) {
-        Job *j = (Job *)t->delay.data[i];
-        if (below ? (j->r.id <= cutoff) : (j->r.id > cutoff))
-            (*delay)++;
-    }
-    for (Job *bj = t->buried.next; bj != &t->buried; bj = bj->next) {
-        if (below ? (bj->r.id <= cutoff) : (bj->r.id > cutoff))
-            (*buried)++;
-    }
-}
-
 // Snapshot of drain_mode captured once at do_stats entry; fmt_stats
 // reads it via this static so cache-check / body-build / cache-stamp
 // agree even if SIGUSR1 flips drain_mode between the three reads.
@@ -1972,29 +1848,6 @@ fmt_stats(char *buf, size_t size, void *x)
     uint64 agg_timeout = timeout_ct;
     uint64 agg_total_jobs = global_stat.total_jobs_ct;
 
-    // Global stats must match per-tube semantics: zombies (jobs covered
-    // by a tube's purge_before_id) are logically dead and must not be
-    // counted. Fast-path skipped when no tube is truncated. Slow-path is
-    // O(zombie_count) across the truncated-tube registry, which is
-    // typically tiny. Urgent and reserved are
-    // handled separately: urgent counts only pri<URGENT_THRESHOLD zombies
-    // in ready; reserved is left as-is because a zombie-reserved job is
-    // genuinely reserved until the owner releases/times out (the owner
-    // will then see NOT_FOUND; the count reflects resource state not
-    // deliverability) (#712).
-    if (truncated_tubes.len > 0) {
-        uint64 zr_total = 0, zd_total = 0, zb_total = 0, zu_total = 0;
-        for (size_t i = 0; i < truncated_tubes.len; i++) {
-            Tube *zt = truncated_tubes.items[i];
-            if (!zt->purge_before_id) continue;
-            tube_count_vs_cutoff(zt, zt->purge_before_id, 1,
-                                 &zr_total, &zd_total, &zb_total, &zu_total);
-        }
-        agg_ready   = (agg_ready   >= zr_total) ? agg_ready   - zr_total : 0;
-        agg_delayed = (agg_delayed >= zd_total) ? agg_delayed - zd_total : 0;
-        agg_buried  = (agg_buried  >= zb_total) ? agg_buried  - zb_total : 0;
-        agg_urgent  = (agg_urgent  >= zu_total) ? agg_urgent  - zu_total : 0;
-    }
     uint64 agg_op[TOTAL_OPS];
     for (int i = 0; i < TOTAL_OPS; i++)
         agg_op[i] = op_ct[i];
@@ -2040,7 +1893,6 @@ fmt_stats(char *buf, size_t size, void *x)
                     agg_op[OP_LIST_TUBE_USED],
                     agg_op[OP_LIST_TUBES_WATCHED],
                     agg_op[OP_PAUSE_TUBE],
-                    agg_op[OP_TRUNCATE],
                     agg_timeout,
                     agg_total_jobs,
                     job_data_size_limit,
@@ -2335,31 +2187,13 @@ fmt_stats_tube(char *buf, size_t size, void *x)
         time_left = 0;
     }
 
-    // Subtract zombie jobs (id <= purge_before_id) from current-jobs-*
-    // counters. Without this, stats-tube contradicts a preceding TRUNCATED N
-    // reply by still showing N ready/delayed/buried until lazy reap catches up.
-    // Fast path: when no truncate is active, skip the scan entirely.
-    // Slow path (O(n)): only while the tube has outstanding zombies.
-    uint64 zread = 0, zdelay = 0, zbury = 0;
-    if (t->purge_before_id) {
-        tube_count_vs_cutoff(t, t->purge_before_id, 1,
-                             &zread, &zdelay, &zbury, NULL);
-    }
-
-    // Defensive underflow guards: zread/zdelay are computed from the
-    // same heap they are subtracted from, so mathematically cannot
-    // exceed .len, but a future refactor could break that invariant.
-    size_t live_ready   = (t->ready.len >= zread) ? t->ready.len - zread : 0;
-    size_t live_delayed = (t->delay.len >= zdelay) ? t->delay.len - zdelay : 0;
-    uint64 live_buried  = (t->stat.buried_ct >= zbury) ? t->stat.buried_ct - zbury : 0;
-
     return snprintf(buf, size, STATS_TUBE_FMT,
             t->name,
             t->stat.urgent_ct,
-            live_ready,
+            t->ready.len,
             t->stat.reserved_ct,
-            live_delayed,
-            live_buried,
+            t->delay.len,
+            t->stat.buried_ct,
             t->stat.total_jobs_ct,
             t->using_ct,
             t->watching_ct,
@@ -2423,18 +2257,12 @@ restore_reserved_job(Conn *c, Job *j)
 }
 
 // reply_peeked_copy finishes peek-ready/-delayed/-buried: copy the
-// container head (heap root / chain head) of c->use unless it is a
-// zombie under the tube's truncate cutoff, then reply FOUND with the
-// copy or NOT_FOUND. The purge guard intentionally applies to the head
-// only (truncate checklist "heap-root guard"): a zombie at the head
-// hides deeper live jobs until lazy reap clears it. top may be NULL
-// (empty container).
+// container head (heap root / chain head) of c->use, then reply FOUND
+// with the copy or NOT_FOUND. top may be NULL (empty container).
 static void
 reply_peeked_copy(Conn *c, Job *top)
 {
-    Job *j = NULL;
-    if (top && !job_is_purged(c->use, top->r.id))
-        j = job_copy(top);
+    Job *j = top ? job_copy(top) : NULL;
     if (!j) {
         reply_msg(c, MSG_NOTFOUND);
         return;
@@ -2643,8 +2471,6 @@ dispatch_cmd(Conn *c)
          * free the copy when it's done sending, in the "conn_want_command" function. */
         {
             Job *orig = job_find(id);
-            if (orig && job_is_purged(orig->tube, orig->r.id))
-                orig = NULL;
             j = job_copy(orig);
         }
 
@@ -2679,20 +2505,11 @@ dispatch_cmd(Conn *c)
             return;
         }
 
-        /* Fast path: scan watched tubes for a ready job.
-         * For truncated tubes, check the heap root's id against the
-         * cutoff rather than skipping the entire tube — otherwise a
-         * tube with a single long-lived reserved zombie (which blocks
-         * purge_before_id clearance) forces all reserves into the slow
-         * path forever, even when fresh post-cutoff jobs sit at the
-         * heap root. Zombies at root still fall through to slow path,
-         * where process_tube reaps them. */
+        /* Fast path: scan watched tubes for a ready job. */
         for (size_t wi = 0; wi < c->watch.len; wi++) {
             Tube *wt = c->watch.items[wi];
             if (wt->ready.len > 0 && !wt->pause) {
                 Job *top = wt->ready.data[0];
-                if (job_is_purged(wt, top->r.id))
-                    continue;
                 j = remove_ready_job(top);
                 if (likely(j)) {
                     global_stat.reserved_ct++;
@@ -2725,10 +2542,6 @@ dispatch_cmd(Conn *c)
 
         j = job_find(id);
         if (!j) {
-            reply_msg(c, MSG_NOTFOUND);
-            return;
-        }
-        if (job_is_purged(j->tube, j->r.id)) {
             reply_msg(c, MSG_NOTFOUND);
             return;
         }
@@ -2828,15 +2641,6 @@ dispatch_cmd(Conn *c)
             return;
         }
 
-        // Zombie release: do not reply RELEASED for an id that is
-        // logically dead. Reap and tell the client NOTFOUND — matches
-        // what peek-job/stats-job now return for the same id.
-        if (job_is_purged(j->tube, j->r.id)) {
-            reap_purged_job(c->srv, j);
-            reply_msg(c, MSG_NOTFOUND);
-            return;
-        }
-
         /* Reserve WAL space unconditionally: even with delay=0, the new
          * priority and release_ct must be persisted (#597). */
         int z = 0;
@@ -2884,16 +2688,6 @@ dispatch_cmd(Conn *c)
         j = remove_reserved_job(c, job_find(id));
 
         if (!j) {
-            reply_msg(c, MSG_NOTFOUND);
-            return;
-        }
-
-        // Zombie bury: burying a purge-eligible reservation only makes
-        // the zombie live longer in the buried chain (peek-buried hides
-        // it, lazy reap eventually frees) while inflating buried_ct.
-        // Short-circuit: reap now, tell client NOTFOUND.
-        if (job_is_purged(j->tube, j->r.id)) {
-            reap_purged_job(c->srv, j);
             reply_msg(c, MSG_NOTFOUND);
             return;
         }
@@ -2952,12 +2746,6 @@ dispatch_cmd(Conn *c)
 
         j = job_find(id);
         if (!j) {
-            reply_msg(c, MSG_NOTFOUND);
-            return;
-        }
-        // Zombie kick-job: do not advertise KICKED for a dead id.
-        // Matches peek-job / stats-job semantics.
-        if (job_is_purged(j->tube, j->r.id)) {
             reply_msg(c, MSG_NOTFOUND);
             return;
         }
@@ -3025,12 +2813,6 @@ dispatch_cmd(Conn *c)
 
         if (!j->tube) {
             reply_serr(c, MSG_INTERNAL_ERROR);
-            return;
-        }
-        // Mirror peek-job's purge guard: a job below its tube's cutoff
-        // is logically dead, must not be visible via stats-job either.
-        if (job_is_purged(j->tube, j->r.id)) {
-            reply_msg(c, MSG_NOTFOUND);
             return;
         }
         do_stats(c, fmt_job_stats, j);
@@ -3228,92 +3010,6 @@ dispatch_cmd(Conn *c)
         return;
     }
 
-    case OP_TRUNCATE: {
-        size_t namelen;
-        char *endpos;
-        if (read_tube_name(&name, c->cmd + CMD_TRUNCATE_LEN, &endpos)) {
-            reply_msg(c, MSG_BAD_FORMAT);
-            return;
-        }
-
-        if (*endpos != '\0') {
-            reply_msg(c, MSG_BAD_FORMAT);
-            return;
-        }
-        namelen = is_valid_tube(name, MAX_TUBE_NAME_LEN - 1);
-        if (!namelen) {
-            reply_msg(c, MSG_BAD_FORMAT);
-            return;
-        }
-        op_ct[type]++;
-        t = tube_find_name(name, namelen);
-        if (!t) {
-            reply_msg(c, MSG_NOTFOUND);
-            return;
-        }
-
-        uint64 cutoff = job_next_id() - 1;
-        if (cutoff == 0) {
-            reply_truncated(c, 0);
-            return;
-        }
-
-        uint64 old_purge = t->purge_before_id;
-        uint64 count;
-        if (likely(!old_purge)) {
-            // First truncate on this tube — every job is newly dead.
-            // Fast path: no per-job id comparison needed.
-            count = t->ready.len + t->delay.len;
-            for (Job *bj = t->buried.next; bj != &t->buried; bj = bj->next)
-                count++;
-        } else {
-            // Tube was already truncated and still holds zombies waiting
-            // for lazy reap. Do not count them again — clients see
-            // TRUNCATED N where N is "jobs made dead by THIS call", not
-            // "jobs invisible to clients right now". Prevents inflated
-            // counts on re-truncate (#TR-A1).
-            uint64 cr = 0, cd = 0, cb = 0;
-            tube_count_vs_cutoff(t, old_purge, 0, &cr, &cd, &cb, NULL);
-            count = cr + cd + cb;
-        }
-
-        if (!old_purge && !ms_append(&truncated_tubes, t)) {
-            // Unregistered tube would strand its zombies (lazy reap walks
-            // the registry) and desync stats gating — refuse instead.
-            reply_serr(c, MSG_OUT_OF_MEMORY);
-            return;
-        }
-        t->purge_before_id = cutoff;
-        // New zombies exist again: re-arm the lazy-reap scan memo.
-        t->purge_drained = 0;
-        if (!wal_write_truncate(&c->srv->wal, t, cutoff)) {
-            t->purge_before_id = old_purge;
-            if (!old_purge) ms_remove(&truncated_tubes, t);
-            reply_serr(c, MSG_INTERNAL_ERROR);
-            return;
-        }
-        walmaint(&c->srv->wal);
-
-        // Invalidate the global stats cache: a client that fetched stats
-        // within the last 500ms has a zombie-inclusive snapshot; any read
-        // between now and TTL expiry would contradict the TRUNCATED N
-        // reply we are about to send. Fresh rebuild on next stats call
-        // runs the fmt_stats zombie-subtract loop (#715).
-        stats_cache.len = 0;
-
-        // Defer ack until walcommit at end of tick. On inline-drain
-        // commit failure do NOT roll back purge_before_id: the rollback
-        // above is only for a failed wal_write_truncate; here the marker
-        // was staged and lost with the rest of the tick — identical
-        // divergence semantics to an end-of-tick commit failure.
-        if (!dur_enqueue(c)) {
-            reply_serr(c, MSG_INTERNAL_ERROR);
-            return;
-        }
-        reply_truncated(c, count);
-        return;
-    }
-
     default:
         reply_msg(c, MSG_UNKNOWN_COMMAND);
     }
@@ -3377,15 +3073,8 @@ conn_timeout(Conn *c)
             }
         }
 
-        // Don't count a ttr-expiry as a timeout if the job is already
-        // purge-eligible: no real client observed a timeout, the job is
-        // about to be reaped by enqueue_job's purge intercept. Phantom
-        // stats.timeouts bumps would confuse monitoring (#713).
-        int is_zombie = job_is_purged(j->tube, j->r.id);
-        if (!is_zombie) {
-            timeout_ct++; /* stats */
-            j->r.timeout_ct++;
-        }
+        timeout_ct++; /* stats */
+        j->r.timeout_ct++;
         int r = enqueue_job(c->srv, remove_this_reserved_job(c, j), 0, 0);
         if (r < 1)
             bury_job(c->srv, j, 0); /* out of memory, so bury it */
@@ -3528,6 +3217,9 @@ conn_process_io(Conn *c)
     case STATE_WANT_DATA: {
         j = c->in_job;
 
+        // Regression guard: over-reading the body buffer would smash the
+        // job allocation; the FSM must keep in_job_read within body_size.
+        assert(c->in_job_read <= j->r.body_size);
         r = read(c->sock.fd, j->body + c->in_job_read, j->r.body_size - c->in_job_read);
         if (unlikely(r == -1)) {
             check_err(c, "read()");
@@ -3620,16 +3312,8 @@ conn_process_io(Conn *c)
 #define cmd_data_ready(c) (want_command(c) && (c)->cmd_read)
 
 __attribute__((hot)) static void
-h_conn(const int fd, const short which, Conn *c)
+h_conn(Conn *c, const short which)
 {
-    if (unlikely(fd != c->sock.fd)) {
-        twarnx("Argh! event fd doesn't match conn fd.");
-        close(fd);
-        connclose(c);
-        epollq_apply();
-        return;
-    }
-
     if (unlikely(which == 'h')) {
         c->halfclosed = 1;
     }
@@ -3673,7 +3357,15 @@ h_conn(const int fd, const short which, Conn *c)
 static void
 prothandle(Conn *c, int ev)
 {
-    h_conn(c->sock.fd, ev, c);
+    // Stale event from the current epoll batch: the conn was closed
+    // earlier in this drain (e.g. a sockwant failure in epollq_apply, or
+    // STATE_CLOSE after a preceding pipelined command). connclose defers
+    // the pool return until the drain ends, so the struct is still valid
+    // and sock.fd == -1 is the dead marker — skip the event. Dispatching
+    // anyway would run I/O on a dead conn, or worse on a recycled one.
+    if (unlikely(c->sock.fd < 0))
+        return;
+    h_conn(c, ev);
 }
 
 // prottick returns nanoseconds till the next work.
@@ -3691,22 +3383,6 @@ prottick(Server *s)
     // Capture the smallest period from the soonest delayed job.
     // Loop bound: each iteration removes one job via remove_delayed_job.
     while (delayed_ct > 0 && (j = soonest_delayed_job())) {
-        // Zombie at the head of a delay heap must not drive prottick's
-        // wakeup period — otherwise the event loop sleeps until a dead
-        // deadline just to wake up and reap (#708). Reap inline and
-        // continue; the next heap root becomes the real soonest job.
-        if (job_is_purged(j->tube, j->r.id)) {
-            // Guard the remove result like the non-zombie branch below:
-            // remove_delayed_job returns NULL on state mismatch / stale
-            // heap_index, and reaping (freeing) a job still linked as
-            // the heap root is a UAF — the next soonest_delayed_job
-            // would return the freed pointer (#720). break, not
-            // continue: continuing would refetch the same root forever.
-            if (!remove_delayed_job(j))
-                break;
-            reap_purged_job(s, j);
-            continue;
-        }
         d = j->r.deadline_at - now;
         if (d > 0) {
             period = min(period, d);
@@ -3717,121 +3393,6 @@ prottick(Server *s)
         int r = enqueue_job(s, j, 0, 0);
         if (r < 1)
             bury_job(s, j, 0);  /* out of memory */
-    }
-
-    // Lazy reap: remove dead jobs from truncated tubes, up to 64 per tick.
-    // Iterates the truncated-tube registry, not the global tube list —
-    // O(truncated tubes) per tick instead of O(all tubes).
-    //
-    // Refcount discipline: the per-tube body must run with `rt` pinned by an
-    // extra iref. Without it, the final job_free of a tube with no external
-    // refs drops refs to 0, triggers tube_free -> prot_remove_tube ->
-    // ms_remove on both `tubes` and the registry, mutating the iteration
-    // list AND freeing `rt` while lines below still read it (UAF).
-    // Pinning defers the free to our explicit tube_dref; we then detect
-    // any swap-remove (clearance below, or prot_remove_tube inside the
-    // dref) via a registry length check and avoid skipping the tube that
-    // got moved into position ti.
-    if (truncated_tubes.len > 0) {
-        int reaped = 0;
-        size_t ti = 0;
-        while (ti < truncated_tubes.len && reaped < 64) {
-            Tube *rt = truncated_tubes.items[ti];
-            tube_iref(rt);
-            size_t before_len = truncated_tubes.len;
-
-            // Self-heal: a registry entry must have a live cutoff. A
-            // stale entry (unreachable unless a transition site is added
-            // without its registry update) would otherwise be re-scanned
-            // forever; drop it instead of trusting it.
-            if (!rt->purge_before_id) {
-                ms_remove_at(&truncated_tubes, ti, rt);
-                tube_dref(rt);
-                if (truncated_tubes.len == before_len) ti++;
-                continue;
-            }
-
-            if (!rt->purge_drained) {
-                for (size_t i = 0; i < rt->ready.len && reaped < 64; ) {
-                    Job *rj = rt->ready.data[i];
-                    if (rj->r.id <= rt->purge_before_id) {
-                        if (!remove_ready_job(rj)) { i++; continue; }
-                        reap_purged_job(s, rj);
-                        reaped++;
-                    } else { i++; }
-                }
-
-                for (size_t i = 0; i < rt->delay.len && reaped < 64; ) {
-                    Job *rj = rt->delay.data[i];
-                    if (rj->r.id <= rt->purge_before_id) {
-                        // Guard against remove_delayed_job returning NULL
-                        // (stale heap_index / state != Delayed). Without this,
-                        // a corrupted invariant would cause reap_purged_job
-                        // to free a job still linked in the heap — UAF (#720).
-                        if (!remove_delayed_job(rj)) { i++; continue; }
-                        reap_purged_job(s, rj);
-                        reaped++;
-                    } else { i++; }
-                }
-
-                Job *next;
-                for (Job *bj = rt->buried.next; bj != &rt->buried && reaped < 64; bj = next) {
-                    next = bj->next;
-                    if (bj->r.id <= rt->purge_before_id) {
-                        // Same guard as above: if remove_buried_job returns
-                        // NULL (state mismatch), do NOT free — the job is
-                        // still in someone's chain and freeing it is UAF.
-                        if (!remove_buried_job(bj)) continue;
-                        reap_purged_job(s, bj);
-                        reaped++;
-                    }
-                }
-
-                // Memo: a pass that was NOT cut short by the 64/tick
-                // budget visited every ready/delay/buried entry, so all
-                // zombies there are gone — and none can re-enter those
-                // structures (enqueue_job's purge intercept reaps on
-                // entry; OP_BURY/OP_RELEASE reject zombies; replay is
-                // purge-guarded). Skip the full heap walks on later
-                // ticks; OP_TRUNCATE re-arms the memo when it mints new
-                // zombies. A still-reserved zombie keeps the tube
-                // flagged (clearance below), but costs O(1) per tick
-                // instead of a walk over every live job.
-                if (reaped < 64)
-                    rt->purge_drained = 1;
-            }
-
-            // Clearance: a fully empty tube cannot hold or regrow
-            // zombies (ids only grow past the cutoff), so retire the
-            // cutoff and unregister. reserved_ct gate: a reserved zombie
-            // is invisible to the scans above and still needs the
-            // cutoff when it comes back through enqueue_job.
-            if (rt->ready.len == 0 && rt->delay.len == 0
-                && job_list_is_empty(&rt->buried)
-                && rt->stat.reserved_ct == 0) {
-                rt->purge_before_id = 0;
-                rt->purge_drained = 0;
-                ms_remove_at(&truncated_tubes, ti, rt);
-            }
-
-            tube_dref(rt);
-            // If clearance unregistered rt, or our dref freed it
-            // (prot_remove_tube), ms_delete swap-moved a previously
-            // unvisited tube into items[ti]; do not skip it with ti++.
-            // The two removals cannot both fire: clearance zeroes
-            // purge_before_id first, so prot_remove_tube skips the
-            // registry.
-            if (truncated_tubes.len == before_len) ti++;
-        }
-        if (reaped > 0) walmaint(&s->wal);
-
-        // Keep prottick firing frequently while any tube stays
-        // truncated. On an otherwise-idle server the period would jump
-        // to 1h, stranding thousands of zombies unreaped until the next
-        // client command. 1ms is a conservative wake-up; with the memo
-        // set each visit is O(1).
-        if (truncated_tubes.len > 0)
-            period = min(period, 1000000LL);
     }
 
     // Unpause tubes whose deadline has arrived. O(k log n) for k expired tubes.
@@ -3849,8 +3410,38 @@ prottick(Server *s)
         process_tube(t);
     }
 
+    // OOM recovery for the timer heaps: a failed heapinsert dropped a
+    // tube from the delay/pause heaps above, making its timers invisible
+    // until the next PUT/pause touches it. While degraded, rescan the
+    // full tube list each tick and retry the missing inserts; a flag
+    // clears once every pending insert succeeds again.
+    if (unlikely(delay_heap_degraded | pause_heap_degraded)) {
+        delay_heap_degraded = pause_heap_degraded = 0;
+        for (size_t i = 0; i < tubes.len; i++) {
+            Tube *t = tubes.items[i];
+            if (t->delay.len > 0 && !t->in_delay_heap) {
+                t->in_delay_heap = heapinsert(&delay_tube_heap, t);
+                if (!t->in_delay_heap)
+                    delay_heap_degraded = 1;
+            }
+            if (t->pause && !t->in_pause_heap) {
+                t->in_pause_heap = heapinsert(&pause_tube_heap, t);
+                if (!t->in_pause_heap)
+                    pause_heap_degraded = 1;
+            }
+        }
+    }
+
     // Process connections with pending timeouts. Release jobs with expired ttr.
     // Capture the smallest period from the soonest connection.
+
+    // Same OOM recovery for the conn scheduling heap: a failed heapinsert
+    // in connsched left a conn's TTR/deadline/idle timers invisible.
+    // Retry the dropped inserts from the live-conns list; while OOM
+    // persists, wake within a second to retry instead of parking.
+    if (unlikely(conn_sched_recover()))
+        period = min(period, 1000000000LL);
+
     while (s->conns.len) {
         Conn *c = s->conns.data[0];
         d = c->tickat - now;
@@ -3964,25 +3555,11 @@ h_accept(const int fd, const short which, Server *s)
     epollq_apply();
 }
 
-static int
-wal_compact_post(Wal *w)
-{
-    for (size_t i = 0; i < truncated_tubes.len; i++) {
-        Tube *t = truncated_tubes.items[i];
-        if (t->purge_before_id) {
-            if (!wal_write_truncate(w, t, t->purge_before_id))
-                return 0;
-        }
-    }
-    return 1;
-}
-
 __attribute__((cold)) void
 prot_init(void)
 {
     now = nanoseconds();
     started_at = now;
-    srv.wal.compact_post = wal_compact_post;
 
     // O_CLOEXEC: keep consistent with every other open() in the binary.
     // prot_init runs before any conceivable fork/exec path, so a leak here
@@ -4012,7 +3589,6 @@ prot_init(void)
     }
 
     ms_init(&tubes, NULL, NULL);
-    ms_init(&truncated_tubes, NULL, NULL);
 
     delay_tube_heap.less = tube_delay_less;
     delay_tube_heap.setpos = tube_delay_setpos;
@@ -4038,59 +3614,11 @@ prot_replay(Server *s, Job *list)
 
     now = nanoseconds();
 
-    // Re-emit in-memory truncate markers into the freshly-opened w->cur
-    // before we touch any job. A binlog that held only a marker (no job
-    // records) has refs==0 after walread -> filedecref, and walgc will
-    // unlink it. The marker survives in tube->purge_before_id, but a
-    // crash before the next compact_post would lose it. Persisting here
-    // closes that window for the common case (#706). A small window still
-    // remains between walread's filedecref and this rewrite; acceptable
-    // for durability/complexity trade.
-    for (size_t i = 0; i < tubes.len; i++) {
-        Tube *rt = tubes.items[i];
-        if (rt->purge_before_id) {
-            if (!wal_write_truncate(&s->wal, rt, rt->purge_before_id)) {
-                // Do NOT abort startup on marker re-emit failure: the
-                // in-memory purge_before_id still protects this process's
-                // clients; the next compact_post will retry; and a boot
-                // that refuses to come up on ENOSPC is worse than one
-                // that serves with a narrower durability window (#711).
-                // `continue` (not `break`): one tube's failure must not
-                // wipe durability protection for unrelated tubes. A tube
-                // that succeeds here survives subsequent WAL-disabled
-                // state because the marker is on disk.
-                twarnx("prot_replay: failed to re-emit truncate marker "
-                       "for tube %s; serving with in-memory cutoff only",
-                       rt->name);
-                continue;
-            }
-        }
-    }
-    walmaint(&s->wal);
-
     int ok = 1;
     for (j = list->next ; j != list ; j = nj) {
         nj = j->next;
         job_list_remove(j);
         Wal *w = &s->wal;
-
-        // Purge-guard FIRST: if a resurrected job is covered by the
-        // tube's truncate cutoff, it is already logically dead. Reap
-        // BEFORE walresvupdate so we don't (a) consume WAL space for a
-        // job about to be freed, and (b) fall through to bury_job on
-        // WAL-exhaustion — which would place a zombie on the buried
-        // chain and inflate buried_ct at boot. Hoisting the guard over
-        // the reservation also incidentally fixes the bury_ct double-
-        // increment on the walresvupdate-fail path (#668 analogue):
-        // zombies never reach bury_job, so their ct cannot be bumped.
-        // (#TR-A3).
-        if (unlikely(job_is_purged(j->tube, j->r.id))) {
-            j->r.state = Invalid;
-            filermjob(j->file, j);
-            j->tube->stat.total_delete_ct++;
-            job_free(j);
-            continue;
-        }
 
         int z = walresvupdate(w);
         if (!z) {
@@ -4124,23 +3652,6 @@ prot_replay(Server *s, Job *list)
                 j->walresv -= z;
                 bury_job(s, j, 0);
                 ok = 0;
-            }
-        }
-    }
-
-    // Rebuild the truncated-tube registry (invariant #9): membership ==
-    // tubes with a non-zero purge_before_id. Fresh tubes boot with
-    // purge_drained == 0, so the lazy reap re-scans replayed zombies.
-    ms_clear(&truncated_tubes);
-    for (size_t i = 0; i < tubes.len; i++) {
-        Tube *rt = tubes.items[i];
-        if (rt->purge_before_id) {
-            if (!ms_append(&truncated_tubes, rt)) {
-                // A flagged-but-unregistered tube would serve correct
-                // (purge-gated) replies but desync the stats gate and
-                // never drain — refuse to boot in that state.
-                twarnx("OOM rebuilding truncated-tube registry");
-                return 0;
             }
         }
     }

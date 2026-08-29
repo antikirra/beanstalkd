@@ -1,5 +1,6 @@
 #include "ct/ct.h"
 #include "dat.h"
+#include "testinject.h"
 #include <stdint.h>
 #include <inttypes.h>
 #include <stdlib.h>
@@ -1029,8 +1030,8 @@ cttest_prottick_idle_trim_deadline_bounds_period()
             "tick 1: period must be bounded by the -m deadline, got %" PRId64,
             p1);
 
-    // Second tick: the server is completely idle (no delayed jobs, no
-    // truncated tubes, no conns) — only the trim deadline can bound it.
+    // Second tick: the server is completely idle (no delayed jobs,
+    // no conns) — only the trim deadline can bound it.
     int64 p2 = prottick(&s);
     assertf(p2 > 0 && p2 <= mem_trim_rate,
             "tick 2: idle period must stay at the -m cadence, got %" PRId64,
@@ -1153,150 +1154,6 @@ cttest_conn_pool_drain_spares_live_conns()
 
     conn_pool_drain();
     tube_dref(t);
-}
-
-
-/* ------------------------------------------------------------------ */
-/* prottick zombie-head guard (delayed-reap-ignores-remove-result)    */
-/* ------------------------------------------------------------------ */
-
-// Deliberately violate invariant #1 (the #720 precondition): the delay
-// heap root claims state Reserved, so remove_delayed_job must fail.
-// Pre-fix, prottick ignored that result and reap_purged_job freed the
-// job while it was still linked as t->delay.data[0]; the loop then
-// refetched the freed pointer from soonest_delayed_job and dereferenced
-// j->tube (NULLed by job_free) — deterministic SIGSEGV in this
-// fork-isolated test (ASan UAF under the loadtest gate). Fixed code
-// breaks out, leaving the corrupt-but-alive job in place.
-void
-cttest_prottick_zombie_head_corrupted_state_no_uaf()
-{
-    now = nanoseconds();
-    prot_init();
-    Server s = {0};
-
-    Tube *t = tube_find_or_make("zombie-head");
-    tube_iref(t);
-
-    // Install a delayed job through prot_replay — the only exported
-    // path into enqueue_job and its delayed_ct / delay_tube_heap
-    // bookkeeping (the prottick loop gates on both).
-    Job list = {0};
-    list.prev = list.next = &list;
-    Job *j = make_job(1, 3600000000000LL, 1000000000LL, 0, t);
-    assertf(j, "job must allocate");
-    j->r.state = Delayed;
-    j->r.deadline_at = nanoseconds() + 3600000000000LL;
-    job_list_insert(&list, j);
-    assertf(prot_replay(&s, &list) == 1, "replay must install the job");
-    assertf(t->delay.len == 1 && t->delay.data[0] == j,
-            "precondition: j must be the delay heap root");
-
-    // Make j a zombie, then corrupt its state.
-    t->purge_before_id = j->r.id;
-    j->r.state = Reserved;
-
-    prottick(&s);
-
-    assertf(t->delay.len == 1 && t->delay.data[0] == j,
-            "guard must skip, not free, a job it failed to unlink");
-    assertf(j->r.state == Reserved,
-            "job state must be untouched by the skipped reap, got %d",
-            j->r.state);
-
-    // Cleanup: restore the invariant, then dispose properly (no leak).
-    t->purge_before_id = 0;
-    heapremove(&t->delay, j->heap_index);
-    j->r.state = Ready; /* so job_free doesn't complain */
-    job_free(j);
-    tube_dref(t);
-}
-
-
-/* ------------------------------------------------------------------ */
-/* truncated-tube registry (prottick-truncated-tube-full-scan)        */
-/* ------------------------------------------------------------------ */
-
-// The lazy reap now walks a registry of truncated tubes instead of the
-// whole tube list. This test proves the full lifecycle through the two
-// exported entry points: prot_replay rebuilds the registry from
-// purge_before_id (boot path), prottick drains the zombies, and the
-// clearance retires the cutoff and unregisters. Tube reg-c is
-// deliberately NOT pinned by the test: its only refs are its job's, so
-// the reap's final job_free drops it to zero and tube_free runs INSIDE
-// the registry iteration — the mid-scan swap-remove must neither skip
-// the swapped-in tube nor touch freed memory (UAF visible under the
-// ASan loadtest gate).
-void
-cttest_prottick_truncate_registry_reaps_and_clears()
-{
-    now = nanoseconds();
-    prot_init();
-    Server s = {0};
-
-    size_t jobs_before = get_all_jobs_used();
-
-    Tube *ta = tube_find_or_make("reg-a");
-    Tube *tb = tube_find_or_make("reg-b");
-    Tube *tc = tube_find_or_make("reg-c");
-    assertf(ta && tb && tc, "tubes must allocate");
-    tube_iref(ta);
-    tube_iref(tb);
-    /* no iref on tc — see comment above */
-
-    // Seed ready jobs via replay #1 (purge not set yet, so the replay
-    // purge-guard must NOT eat them).
-    Job list = {0};
-    list.prev = list.next = &list;
-    for (int i = 0; i < 5; i++) {
-        Tube *dst = (i < 2) ? ta : (i < 4) ? tb : tc;
-        Job *j = make_job(1, 0, 1000000000LL, 0, dst);
-        assertf(j, "job %d must allocate", i);
-        j->r.state = Ready;
-        job_list_insert(&list, j);
-    }
-    assertf(prot_replay(&s, &list) == 1, "replay #1 must succeed");
-    assertf(ta->ready.len == 2 && tb->ready.len == 2 && tc->ready.len == 1,
-            "precondition: jobs distributed 2/2/1");
-
-    // Truncate all three tubes the way a binlog marker would, then let
-    // replay #2 (empty list) rebuild the registry from purge_before_id.
-    uint64 cutoff = job_next_id() - 1;
-    ta->purge_before_id = cutoff;
-    tb->purge_before_id = cutoff;
-    tc->purge_before_id = cutoff;
-    Job list2 = {0};
-    list2.prev = list2.next = &list2;
-    assertf(prot_replay(&s, &list2) == 1,
-            "replay #2 (registry rebuild) must succeed");
-
-    prottick(&s);
-
-    // All zombies reaped, cutoffs retired, registry drained.
-    assertf(ta->ready.len == 0 && tb->ready.len == 0,
-            "zombies must be reaped (ta %zu, tb %zu)",
-            ta->ready.len, tb->ready.len);
-    assertf(ta->purge_before_id == 0,
-            "reg-a cutoff must clear, got %" PRIu64, ta->purge_before_id);
-    assertf(tb->purge_before_id == 0,
-            "reg-b cutoff must clear, got %" PRIu64, tb->purge_before_id);
-    assertf(ta->stat.total_delete_ct == 2,
-            "reaps must count as deletes, got %" PRIu64,
-            ta->stat.total_delete_ct);
-    // reg-c was freed mid-scan: gone from the name table entirely.
-    assertf(tube_find_name("reg-c", 5) == NULL,
-            "reg-c must be freed once its last zombie is reaped");
-    assertf(get_all_jobs_used() == jobs_before,
-            "every seeded job must be freed (before %zu, after %zu)",
-            jobs_before, get_all_jobs_used());
-
-    // A second tick over the (now empty) registry must be a no-op.
-    prottick(&s);
-    assertf(ta->purge_before_id == 0 && tb->purge_before_id == 0,
-            "second tick must not resurrect cutoffs");
-
-    tube_dref(ta);
-    tube_dref(tb);
 }
 
 
@@ -1431,4 +1288,236 @@ cttest_waitpos_hint_invariant_churn()
         connclose(cs[k]);
     for (int i = 0; i < 3; i++)
         tube_dref(tubes3[i]);
+}
+
+
+/* ------------------------------------------------------------------ */
+/* conn defer-free: stale epoll batch events (UAF guard)               */
+/* ------------------------------------------------------------------ */
+
+// While a drain is bracketed by conn_defer_free_begin/end, connclose
+// must NOT return the struct to the slab pool: ep_buf may still hold
+// events whose data.ptr targets it, and a pooled struct could be
+// recycled by make_conn before the stale event is dispatched.
+void
+cttest_conn_defer_free_holds_struct_during_drain()
+{
+    now = nanoseconds();
+    prot_init();
+
+    Tube *t = tube_find_or_make("conndefer");
+    tube_iref(t);
+
+    conn_pool_drain();
+    int count = -1;
+    get_conn_pool_stats(&count);
+    assertf(count == 0, "pool must start empty, got %d", count);
+
+    Conn *c = make_conn(dup(2), 0, t, t);
+    assertf(c, "make_conn must succeed");
+
+    conn_defer_free_begin();
+    connclose(c);
+
+    get_conn_pool_stats(&count);
+    assertf(count == 0,
+            "closed conn must stay out of the pool during drain, got %d",
+            count);
+    assertf(c->sock.fd == -1,
+            "closed conn must keep the dead-fd marker for prothandle");
+
+    // make_conn must not hand out the deferred struct.
+    Conn *c2 = make_conn(dup(2), 0, t, t);
+    assertf(c2, "make_conn must succeed");
+    assertf(c2 != c, "reusing a deferred conn mid-drain would be UAF");
+    connclose(c2); // also deferred
+
+    // Nested begin/end: only the outermost end releases.
+    conn_defer_free_begin();
+    conn_defer_free_end();
+    get_conn_pool_stats(&count);
+    assertf(count == 0,
+            "inner end must not release while outer begin is active");
+
+    conn_defer_free_end();
+    get_conn_pool_stats(&count);
+    assertf(count == 2,
+            "both conns must pool when the outermost end runs, got %d",
+            count);
+
+    // Reuse is allowed again after the drain; the gen counter must
+    // advance on pool take so any external stale reference is detectable.
+    uint64 old_gen = c->gen;
+    Conn *c3 = make_conn(dup(2), 0, t, t);
+    assertf(c3 == c2 || c3 == c, "post-drain make_conn must reuse pool");
+    Conn *c4 = make_conn(dup(2), 0, t, t);
+    Conn *reused = (c3 == c) ? c3 : c4;
+    assertf(reused->gen == old_gen + 1,
+            "pool reuse must bump gen (%" PRIu64 " -> %" PRIu64 ")",
+            old_gen, reused->gen);
+    connclose(c3);
+    connclose(c4);
+
+    conn_pool_drain();
+    tube_dref(t);
+}
+
+
+/* --- epollq double-insert guard (in_epollq) --- */
+
+// One dispatch tick can legitimately epollq_add the SAME conn twice
+// with another conn queued in between: reserve's slow path registers
+// 'h' (wait_for_job), then process_tube serves that conn in the same
+// dispatch and re-arms 'r' (reply fast path → conn_want_command).
+// Without the in_epollq membership guard the second blind prepend
+// overwrote X->next (which pointed at Y), turning the list into an X
+// self-cycle and ORPHANING Y: its queued sockwant never ran, so its
+// kernel registration stayed hangup-only while y.rw already claimed
+// the new mode — the server went permanently deaf to Y (invariants
+// #5/#10).
+//
+// This is the direct, deterministic version of the old network test:
+// the truncate-based integration scenario reached the same X,Y,X tick
+// through zombie ready-heap roots; with truncate gone the tick cannot
+// be reproduced over the wire (a parked reserve halts the conn's
+// pipeline loop, so the mid-dispatch re-serve can no longer be
+// scripted from the client side), so the invariant is checked straight
+// on the list.
+void
+cttest_epollq_double_insert_does_not_orphan_worker()
+{
+    prot_init();
+
+    static Conn x, y; // worker X double-queued, worker Y queued between
+    memset(&x, 0, sizeof x);
+    memset(&y, 0, sizeof y);
+    x.srv = y.srv = &srv;                       // connsched heap access
+    x.pending_timeout = y.pending_timeout = -1; // make connsched a no-op
+    x.sock.fd = y.sock.fd = -1;                 // apply skips sockwant
+    job_list_reset(&x.reserved_jobs);           // conntickat walks these
+    job_list_reset(&y.reserved_jobs);
+
+    // The tick: X parks in reserve ('h'), a put wakes Y mid-dispatch
+    // ('r'), then X's own wait is served ('r') — the double insert.
+    epollq_test_add(&x, 'h');
+    epollq_test_add(&y, 'r');
+    epollq_test_add(&x, 'r');
+
+    // Walk the pending list: it must terminate and hold both conns
+    // exactly once. Without the guard the walk either cycles on X
+    // forever or never reaches Y — both mean Y is orphaned.
+    int saw_x = 0, saw_y = 0, steps = 0;
+    for (Conn *c = epollq_test_head(); c; c = c->next) {
+        assertf(++steps <= 2,
+                "epollq walk must terminate: double insert cycled the list");
+        if (c == &x) saw_x++;
+        else if (c == &y) saw_y++;
+        else assertf(0, "unexpected conn %p in epollq", (void *)c);
+    }
+    assertf(saw_x == 1 && saw_y == 1,
+            "double insert must keep both conns queued exactly once,"
+            " got x=%d y=%d (orphan!)", saw_x, saw_y);
+
+    // The single apply must use the freshest rw for X, not the stale 'h'.
+    assertf(x.rw == 'r',
+            "re-arm must win: x.rw must be 'r', got '%c'", x.rw);
+    assertf(y.rw == 'r', "y.rw must be 'r', got '%c'", y.rw);
+
+    // Apply drains the whole list and clears membership on BOTH conns;
+    // an orphaned Y would keep in_epollq set and miss its sockwant.
+    epollq_test_apply();
+    assertf(epollq_test_head() == NULL, "apply must drain the list");
+    assertf(!x.in_epollq && !y.in_epollq,
+            "apply must clear in_epollq on both conns, got x=%d y=%d",
+            x.in_epollq, y.in_epollq);
+    assertf(x.next == NULL && y.next == NULL,
+            "apply must unlink both conns");
+
+    // Re-queue after apply: a conn must be insertable again (the flag
+    // was really cleared, not just the head pointer advanced).
+    epollq_test_add(&y, 'h');
+    assertf(epollq_test_head() == &y && y.in_epollq,
+            "conn must be re-insertable after apply");
+    epollq_test_apply();
+}
+
+
+// connsched OOM recovery: when heapinsert(&srv->conns) fails, the conn's
+// timers (TTR / reserve deadline / idle) vanish from prottick — the heap
+// itself cannot enumerate its missing members. connsched must flag the
+// heap degraded and conn_sched_recover must rebuild membership from the
+// live-conns list, including surviving a SECOND OOM during the rebuild.
+void
+cttest_connsched_oom_recovery_reinserts_conn()
+{
+    now = nanoseconds();
+    prot_init();
+
+    Tube *t = tube_find_or_make("connsched-oom");
+    tube_iref(t);
+
+    /* Private Server so the test controls the heap's len==cap edge and
+     * connclose stays away from the global listener socket. */
+    Server s;
+    memset(&s, 0, sizeof s);
+    s.conns.less = conn_less;
+    s.conns.setpos = conn_setpos;
+    s.sock.fd = -1;
+    s.sock.added = 1;
+
+    Conn *c = make_conn(dup(2), 0, t, t);
+    assertf(c, "make_conn must succeed");
+    c->srv = &s;
+    c->pending_timeout = 5; // conntickat: now + 5s
+
+    /* A second conn with NO outstanding timeout: recovery must skip it
+     * (conntickat returns 0), proving the walk re-derives eligibility
+     * instead of blindly reinserting every live conn. */
+    Conn *d = make_conn(dup(2), 0, t, t);
+    assertf(d, "make_conn d must succeed");
+    d->srv = &s;
+
+    /* len==cap==0: the insert must grow → realloc. Kill it. */
+    fault_set(FAULT_REALLOC, 0, ENOMEM);
+    connsched(c);
+    assertf(!c->in_conns, "failed heapinsert must leave in_conns=0");
+    assertf(s.conns.len == 0, "heap must stay empty after OOM");
+    assertf(fault_hits(FAULT_REALLOC) == 1, "realloc fault must fire once");
+
+    /* First recovery attempt also OOMs: must report still-degraded and
+     * leave the conn out — not corrupt or forget it. */
+    fault_set(FAULT_REALLOC, 0, ENOMEM);
+    assertf(conn_sched_recover() == 1,
+            "recovery under continued OOM must report still degraded");
+    assertf(!c->in_conns && s.conns.len == 0,
+            "conn must still be out of the heap after failed recovery");
+
+    /* OOM over: recovery reinserts with a tickat rebuilt from the
+     * conn's live timeout state. */
+    assertf(conn_sched_recover() == 0, "recovery must clear the flag");
+    assertf(c->in_conns, "recovery must reinsert the dropped conn");
+    assertf(s.conns.len == 1 && s.conns.data[0] == c,
+            "heap must contain exactly the recovered conn");
+    assertf(!d->in_conns, "conn without a timeout must stay out");
+    int64 want = now + 5LL * 1000000000;
+    assertf(c->tickat > now - 1000000000LL && c->tickat <= want,
+            "tickat must be rebuilt from pending_timeout, got %" PRId64,
+            c->tickat);
+
+    /* The recovered entry is fully functional: connsched's remove path
+     * (tickpos from conn_setpos during recovery) must unlink it. */
+    c->pending_timeout = -1;
+    connsched(c);
+    assertf(!c->in_conns && s.conns.len == 0,
+            "connsched must remove the recovered conn cleanly");
+
+    /* Live-list hygiene: closing both conns must leave the list empty,
+     * so a later recovery on a stale flag walks nothing. */
+    connclose(c);
+    connclose(d);
+    assertf(conn_sched_recover() == 0,
+            "recovery with no live conns must be a no-op");
+
+    free(s.conns.data);
+    tube_dref(t);
 }

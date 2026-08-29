@@ -4,8 +4,6 @@
 # captures responses, normalizes time-dependent stats lines, diffs.
 #
 # Expected differences vs upstream (declared in README + CLAUDE.md):
-#   - `cmd-truncate` line in stats (additive, fork only)
-#   - `truncate <tube>` command (unknown in upstream)
 #   - trailing-space variants: `stats \r\n` → UNKNOWN_COMMAND in fork, BAD_FORMAT upstream
 #   - `-H` HTTP responses (not exercised here)
 # This script labels those as EXPECTED-DIFF, everything else as UNEXPECTED.
@@ -49,8 +47,7 @@ WIRE_FILE="$OUT_DIR/wire.txt"
   printf 'stats\r\n'
   printf 'list-tubes\r\n'
   printf 'pause-tube testtube 0\r\n'
-  # known EXPECTED-DIFF zone: these are behavior differences
-  printf 'truncate testtube\r\n'
+  # unknown command must be UNKNOWN_COMMAND on both
   printf 'cmd-no-such-command\r\n'
   printf 'quit\r\n'
 } > "$WIRE_FILE"
@@ -112,11 +109,6 @@ REPORT="$OUT_DIR/report.txt"
   else
     echo "--- Diff (after normalization) ---"
     cat "$DIFF_RAW"
-    echo
-    # Expected-diff markers: lines mentioning cmd-truncate, truncate verb, etc.
-    if grep -qE '(cmd-truncate|^\+TRUNCATED|truncate)' "$DIFF_RAW"; then
-      echo "NOTE: contains EXPECTED fork additions (truncate/cmd-truncate)."
-    fi
     echo
     echo "VERDICT: DIFF PRESENT — inspect manually, mark expected vs regression."
   fi

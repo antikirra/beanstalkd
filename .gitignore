@@ -8,3 +8,4 @@ ct/_ctcheck.c
 ct/_ctcheck.o
 ct/*.o
 bench/results/
+.cflags-stamp

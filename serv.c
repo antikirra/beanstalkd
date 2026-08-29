@@ -149,6 +149,11 @@ srvserve(Server *s)
         // Drain all ready events before next prottick.
         // Update `now` once per batch — events within a batch are
         // effectively simultaneous, saves ~5ns vDSO call per event.
+        // conn_defer_free_begin/end brackets the drain: connclose during
+        // dispatch (e.g. a sockwant failure in epollq_apply) must not let
+        // make_conn recycle the struct while later events in the same
+        // epoll batch still point at it.
+        conn_defer_free_begin();
         int rw;
         while ((rw = socknext(&sock, period)) > 0) {
             if (period) {
@@ -157,6 +162,7 @@ srvserve(Server *s)
             }
             sock->f(sock->x, rw);
         }
+        conn_defer_free_end();
         if (rw == -1) {
             twarnx("socknext");
             exit(1);

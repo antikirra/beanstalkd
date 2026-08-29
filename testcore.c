@@ -30,12 +30,43 @@ void
 cttest_nanoseconds_advances()
 {
     int64 t1 = nanoseconds();
-    // CLOCK_MONOTONIC_COARSE has jiffy resolution (~1-4ms).
-    // Sleep 5ms to guarantee crossing a jiffy boundary.
-    usleep(5000);
+    // CLOCK_MONOTONIC_COARSE has jiffy resolution: 10ms at HZ=100,
+    // 4ms at HZ=250. Sleep 30ms (> 2 jiffies at HZ=100) to guarantee
+    // crossing a jiffy boundary.
+    usleep(30000);
     int64 t2 = nanoseconds();
     assertf(t2 > t1, "time must advance after work: %lld > %lld",
             (long long)t2, (long long)t1);
+}
+
+/* --- wal_crc32c --- */
+
+// Known-answer: CRC32C("123456789") with init 0xFFFFFFFF and final
+// xor 0xFFFFFFFF is 0xE3069283, the CRC-32/ISCSI check value.
+// Guards all three wal_crc32c implementations (SSE4.2, ARM ACLE,
+// software table) against bit-level drift.
+void
+cttest_crc32c_known_vector()
+{
+    const char *s = "123456789";
+    uint32 c = wal_crc32c(WAL_CRC32C_INIT, s, 9) ^ WAL_CRC32C_XOR;
+    assertf(c == 0xE3069283u,
+            "CRC32C(\"123456789\") = 0x%08x, want 0xE3069283", c);
+}
+
+// Streaming must equal one-shot: exercises the 8-byte main loop plus
+// every tail length (0..7 bytes).
+void
+cttest_crc32c_incremental()
+{
+    const char *s = "123456789";
+    uint32 one = wal_crc32c(WAL_CRC32C_INIT, s, 9);
+    for (size_t split = 0; split <= 9; split++) {
+        uint32 c = wal_crc32c(WAL_CRC32C_INIT, s, split);
+        c = wal_crc32c(c, s + split, 9 - split);
+        assertf(c == one, "split at %zu: 0x%08x != 0x%08x",
+                split, c, one);
+    }
 }
 
 /* --- allocate_job edge cases --- */

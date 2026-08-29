@@ -20,12 +20,38 @@ int verbose = 0;
 static Conn *conn_pool = NULL;
 static int conn_pool_len = 0;
 
+// Deferred pool return: while the epoll batch drain runs (serv.c wraps
+// it in conn_defer_free_begin/end), ep_buf can still hold events whose
+// data.ptr targets a struct being closed right now. Pooling it
+// immediately would let make_conn recycle the memory before the stale
+// event is dispatched — a use-after-reuse. Deferral keeps the struct
+// frozen (sock.fd == -1, gen unchanged) until the batch is drained, so
+// prothandle can detect the dead conn and skip the event.
+static int conn_free_defer = 0;
+static Conn *conn_deferred = NULL;
+
+// Live-conns list: every Conn between make_conn and connclose is linked
+// here (conn_live_next/prev in struct Conn). It exists for one reason:
+// when heapinsert(&srv->conns) fails in connsched, the conn's TTR /
+// reserve-deadline / idle timers become invisible to prottick, and
+// srv->conns alone cannot enumerate the victims (they are exactly the
+// conns NOT in the heap). conn_sched_recover walks this list to retry
+// the dropped inserts. conns_heap_degraded is the dirty flag.
+static Conn *conn_live = NULL;
+static int conns_heap_degraded = 0;
+
 // conn_pool_put returns c to the slab pool, or frees it when the pool
 // is full. Sole owner of the pool-push invariant (its pair is the pool
-// take at the top of make_conn).
+// take at the top of make_conn). During a batch drain it parks c on the
+// deferred list instead (see above).
 static void
 conn_pool_put(Conn *c)
 {
+    if (unlikely(conn_free_defer > 0)) {
+        c->next = conn_deferred;
+        conn_deferred = c;
+        return;
+    }
     if (conn_pool_len < CONN_POOL_MAX) {
         c->next = conn_pool;
         conn_pool = c;
@@ -57,6 +83,28 @@ conn_pool_drain(void)
     }
     conn_pool = NULL;
     conn_pool_len = 0;
+}
+
+void
+conn_defer_free_begin(void)
+{
+    conn_free_defer++;
+}
+
+// conn_defer_free_end releases every conn parked during the drain.
+// Nested begins are counted; only the outermost end flushes.
+void
+conn_defer_free_end(void)
+{
+    if (--conn_free_defer > 0)
+        return;
+    Conn *c = conn_deferred;
+    conn_deferred = NULL;
+    while (c) {
+        Conn *next = c->next;
+        conn_pool_put(c);
+        c = next;
+    }
 }
 
 /* for unit tests: number of Conns currently sitting in the slab pool */
@@ -190,6 +238,16 @@ make_conn(int fd, char start_state, Tube *use, Tube *watch)
     cur_conn_ct++;
     tot_conn_ct++;
 
+    // Link into the live-conns list (connsched OOM recovery — see top).
+    // Done last so the early-failure path above never links a conn that
+    // goes straight back to the pool. c->srv is still NULL here;
+    // conn_sched_recover skips such conns.
+    c->live_prev = NULL;
+    c->live_next = conn_live;
+    if (conn_live)
+        conn_live->live_prev = c;
+    conn_live = c;
+
     return c;
 }
 
@@ -300,7 +358,37 @@ connsched(Conn *c)
     } else if (newtickat) {
         c->tickat = newtickat;
         c->in_conns = heapinsert(&c->srv->conns, c);
+        if (unlikely(!c->in_conns)) {
+            // OOM: c's timeouts are now invisible to prottick. Flag it;
+            // conn_sched_recover retries the insert from the live list.
+            conns_heap_degraded = 1;
+        }
     }
+}
+
+// conn_sched_recover retries the srv->conns inserts that heapinsert OOM
+// dropped in connsched. Walks the live-conns list (the heap itself
+// cannot enumerate its missing members). Called from prottick; returns
+// nonzero while still degraded so the caller can shorten its wake-up
+// period and retry instead of parking for an hour.
+int
+conn_sched_recover(void)
+{
+    if (likely(!conns_heap_degraded))
+        return 0;
+    conns_heap_degraded = 0;
+    for (Conn *c = conn_live; c; c = c->live_next) {
+        if (c->in_conns || !c->srv)
+            continue;
+        int64 t = conntickat(c);
+        if (!t)
+            continue;
+        c->tickat = t;
+        c->in_conns = heapinsert(&c->srv->conns, c);
+        if (!c->in_conns)
+            conns_heap_degraded = 1;
+    }
+    return conns_heap_degraded;
 }
 
 // conn_set_soonestjob updates c->soonest_job with j
@@ -391,7 +479,12 @@ connclose(Conn *c)
         close(c->sock.fd);
         c->sock.fd = -1;
     } else {
-        return; // already closed — guard against double-close/double-pool
+        // Already closed — guard against double-close/double-pool.
+        // Sufficient on its own: a closed conn keeps sock.fd == -1 while
+        // pooled, and conn_defer_free_begin/end guarantees the struct is
+        // never reused while an event batch that could re-enter us is
+        // still draining.
+        return;
     }
 
     // Detach from durable-commit batch if pending; must happen before
@@ -412,6 +505,16 @@ connclose(Conn *c)
     if (c->type & CONN_TYPE_WORKER) cur_worker_ct--; /* stats */
 
     cur_conn_ct--; /* stats */
+
+    // Unlink from the live-conns list before the struct can be pooled
+    // or freed — conn_sched_recover must never walk a recycled conn.
+    if (c->live_prev)
+        c->live_prev->live_next = c->live_next;
+    else
+        conn_live = c->live_next;
+    if (c->live_next)
+        c->live_next->live_prev = c->live_prev;
+    c->live_next = c->live_prev = NULL;
 
     remove_waiting_conn(c);
     if (has_reserved_job(c))

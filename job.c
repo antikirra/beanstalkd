@@ -122,12 +122,6 @@ store_job(Job *j)
         rehash_start(1);
 }
 
-uint64
-job_next_id(void)
-{
-    return next_id;
-}
-
 __attribute__((hot)) Job *
 job_find(uint64 job_id)
 {
@@ -157,6 +151,12 @@ __attribute__((hot, malloc)) Job *
 allocate_job(int body_size)
 {
     Job *j = NULL;
+
+    // Defensive gate: a negative size would wrap the malloc below and
+    // under-allocate, so reject before pool_class() ever sees it.
+    if (body_size < 0)
+        return (Job *) 0;
+
     int cls = pool_class(body_size);
     int asize = cls >= 0 ? ((64 << cls) + POOL_PAD) : body_size;
 

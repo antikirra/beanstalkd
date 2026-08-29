@@ -16,7 +16,7 @@ Requires **Linux 6.1+**, glibc, gcc 12+. Compatible with GCC 15.
 
 ## Compatibility
 
-Drop-in replacement for upstream beanstalkd v1.13 for every non-administrative workload. All client libraries (Go, Python, Ruby, PHP, Java, etc.) connect and drive jobs without changes; every upstream command, response, error string, and stats key is preserved. The differences are limited to one new command (`truncate`), one additive stats field (`cmd-truncate`), and a few strict-parsing edges — see "Wire-observable differences" below before migrating.
+Drop-in replacement for upstream beanstalkd v1.13 for every non-administrative workload. All client libraries (Go, Python, Ruby, PHP, Java, etc.) connect and drive jobs without changes; every upstream command, response, error string, and stats key is preserved. The differences are limited to a few strict-parsing edges and the opt-in durability mode — see "Wire-observable differences" below before migrating.
 
 WAL writer emits v8 (4-byte CRC32C trailer per record for silent-corruption detection); upstream v7 binlogs are read transparently on startup, so upgrade requires no migration. Downgrade to a pre-v8 binary is not supported. Legacy v5 (beanstalkd 1.4.6) reader removed — drain pre-v7 binlogs on the old binary before upgrading.
 
@@ -24,16 +24,13 @@ WAL writer emits v8 (4-byte CRC32C trailer per record for silent-corruption dete
 
 | Case | Upstream | This fork | Impact on legacy clients |
 |---|---|---|---|
-| `truncate <tube>\r\n` | `UNKNOWN_COMMAND` | `TRUNCATED <count>\r\n` | None — legacy clients never send `truncate`. |
-| `touch <id>` on a job whose tube was `truncate`d since it was reserved | `TOUCHED` | `NOT_FOUND` | Only observable in deployments that use `truncate`. |
-| `stats` YAML body | — | One additive line `cmd-truncate: N` inserted between `cmd-pause-tube` and `job-timeouts`. | Key-value (YAML) parsers: none. Line-index parsers: `job-timeouts` and later fields shift down one line. |
 | Command with trailing space (e.g. `"stats \r\n"`, `"list-tubes \r\n"`) | `BAD_FORMAT` | `UNKNOWN_COMMAND` | Only if the client specifically switches on `BAD_FORMAT`. Canonical clients send the bare verb and are unaffected. (Invariant #13: strict literal prefix dispatch closes a namespace-leak through `sleep\r\n` / `steal\r\n` / `l12345678s\r\n`.) |
 | `-D` without `-b` | flag does not exist | Server starts, but every persistent command (put, release, bury, kick) surfaces a real error (`BURIED` / `INTERNAL_ERROR` / `OUT_OF_MEMORY`) rather than ghost-acknowledging. Canonical durable use is `-D -b`. | Only affects deployments that misconfigure `-D`; no client sees this under `-D -b`. |
 | `-D` group-commit failure (fdatasync error) | flag does not exist | Every connection whose ack was pending on the failed commit receives `INTERNAL_ERROR\r\n` followed by FIN (connection close). The close is what keeps a pipelining client's reply stream aligned: outstanding commands resolve as "connection closed" instead of being silently unanswered. The WAL is disabled for the rest of the process lifetime (same as upstream's binlog-failure semantics). | Only reachable under `-D` on a failing disk; upstream clients never see this path. |
 
 Opt-in features that are silent unless enabled: HTTP health (`-H`) replies only to `GET `/`HEAD ` prefixes (no beanstalk verb starts with either); idle timeout (`-I SEC`) just closes connections that would otherwise idle forever; connection cap (`-c N`) is off by default.
 
-No upstream command, response string, error string, or stats key was removed or renamed.
+No upstream command, response string, error string, or stats key was removed or renamed. The fork-specific `truncate` command was removed (2026-08-29), so the wire command set is again identical to upstream.
 
 CLI (not wire-observable): upstream's deprecated no-op stubs `-c`/`-n` (warn-and-continue since upstream 1.10, "binlog is always compacted") were dropped. In this fork `-n` is a fatal unknown flag, and `-c` is repurposed as the connection cap and requires an argument (`-c N`). Impact is limited to init scripts that still pass these deprecated flags — such scripts must drop them before migrating; no protocol client is affected.
 
@@ -49,18 +46,18 @@ CLI (not wire-observable): upstream's deprecated no-op stubs `-c`/`-n` (warn-and
 | Job hash rehash | Stop-the-world | Incremental, 16 buckets/op |
 | Job memory | malloc/free per job | 11 size classes, O(1) pool reuse |
 | WAL compaction | Broken on release cycles | Fixed alive tracking |
-| WAL integrity | None | CRC32C per record (v8 format, SSE4.2) |
+| WAL integrity | None | CRC32C per record (v8 format; SSE4.2 on x86-64, ARM CRC32 with runtime dispatch on aarch64, portable fallback elsewhere) |
 | WAL durability | Async only, errors can be silently dropped | Async with `_Atomic` error signalling + EINTR retry; opt-in synchronous `-D` (`ack ⇒ durable`) with **group commit** — one `fdatasync` per event-loop tick amortises across every staged record, durable pipelined throughput now matches async mode |
 | Tube hash | Stock DJB2 | wyhash v4 (avalanche + length-aware) |
 | Heap layout | Binary (2-ary) | 4-ary (shallower, cache-line-fit children) |
 | Crash/data bugs | 22+ open in upstream tracker | see §Bug fixes and `CHANGELOG.md` |
-| Tests | ~100 unit | 360 unit + hostile WAL + ASan + Valgrind |
+| Tests | ~100 unit | 378 unit + hostile WAL + ASan + Valgrind |
 | Status | Maintenance mode (last code 2020) | Active development |
 
 ## Build and test
 
 ```sh
-make check                                # 360 unit tests (UBSan in CI)
+make check                                # 378 unit tests (UBSan in CI)
 docker build -f Dockerfile.build .        # CI: UBSan + cppcheck (C11)
 docker build -f Dockerfile.benchmark .    # A/B benchmark vs upstream
 docker build -f test/Dockerfile.loadtest -t loadtest . && docker run --rm loadtest
@@ -73,8 +70,8 @@ Tested with GCC 12 (Debian bookworm) and GCC 15 (Debian sid). Production Dockerf
 
 The lists below are not exhaustive — they cover named regressions against
 upstream beanstalkd v1.13. The 2026-04-23/24 pre-production audit added a
-further ~75 fixes and hardening patches across WAL replay, truncate
-crosscutting, and fault-injection paths; see `CHANGELOG.md` for the canonical log.
+further ~75 fixes and hardening patches across WAL replay and
+fault-injection paths; see `CHANGELOG.md` for the canonical log.
 
 **Crashes:**
 NULL deref in conn_timeout, infinite loop in rawfalloc, WAL rollback corruption, unsafe signal handler exit, EPOLLERR 100% CPU, prot_init OOM SIGSEGV.
@@ -106,7 +103,7 @@ u64toa two-digit pair table. reply_inserted/reply_job backward build into reply_
 11-class job pool (64B-64KB, `__attribute__((malloc))`). Cache-line Conn/Tube struct layout. Conn slab pool (256). Incremental rehash (16 buckets/op, dual-table). wyhash (final v4) tube hash with hash-first filter and length-aware API. `mallopt(M_ARENA_MAX, 1)`. Periodic malloc_trim.
 
 **WAL:**
-Async fsync thread (_Atomic error signaling). Optional synchronous mode via `-D` (`ack ⇒ durable`, EINTR-aware retry) with **group commit**: `walwrite` stages the record (writev + accounting) without fsync, the event loop batches every WAL-dirty command in the current epoll drain, and one `walcommit` issues a single `fdatasync` covering the whole batch before acks fan out. Buffered replies land in `Conn::dur_reply_buf` and are drained by `dur_flush_all` after commit; commit failure ftruncates the tail, rolls back global counters, disables the WAL, and emits `INTERNAL_ERROR` to every conn in the batch — `ack ⇒ durable` holds. writev records with per-record CRC32C trailer (v8 format, Intel SSE4.2 `_mm_crc32_u64` ~0.33 cyc/byte, negligible overhead). fallocate prealloc. Rate-limited compaction with correct alive tracking. Lock-free error check. Readahead on recovery. _Static_assert guards on WAL record sizes. Transparent v7 binlog replay for upgrade from upstream.
+Async fsync thread (_Atomic error signaling). Optional synchronous mode via `-D` (`ack ⇒ durable`, EINTR-aware retry) with **group commit**: `walwrite` stages the record (writev + accounting) without fsync, the event loop batches every WAL-dirty command in the current epoll drain, and one `walcommit` issues a single `fdatasync` covering the whole batch before acks fan out. Buffered replies land in `Conn::dur_reply_buf` and are drained by `dur_flush_all` after commit; commit failure ftruncates the tail, rolls back global counters, disables the WAL, and emits `INTERNAL_ERROR` to every conn in the batch — `ack ⇒ durable` holds. writev records with per-record CRC32C trailer (v8 format; SSE4.2 on x86-64, ARM CRC32 with runtime `getauxval(AT_HWCAP)` dispatch on aarch64, portable table fallback elsewhere, ~0.33 cyc/byte on SSE4.2, negligible overhead). fallocate prealloc. Rate-limited compaction with correct alive tracking. Lock-free error check. Readahead on recovery. _Static_assert guards on WAL record sizes. Transparent v7 binlog replay for upgrade from upstream.
 
 **Network:**
 TCP_FASTOPEN(1024). TCP_DEFER_ACCEPT. TCP_NOTSENT_LOWAT(16KB). TCP_USER_TIMEOUT(30s). SO_INCOMING_CPU. sched_setaffinity.

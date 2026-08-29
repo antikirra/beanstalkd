@@ -15,6 +15,10 @@ ms_init(Ms *a, ms_event_fn oninsert, ms_event_fn onremove)
 static int
 grow(Ms *a)
 {
+    // Overflow check before the shift: cap * 2 pointers must fit
+    // size_t both as a count and as a byte size.
+    if (a->cap > SIZE_MAX / sizeof(void *) / 2)
+        return 0;
     size_t ncap = a->cap << 1;
     if (!ncap)
         ncap = 1;
@@ -78,8 +82,8 @@ ms_remove(Ms *a, void *item)
 
 // ms_remove_at removes item from position i in O(1) if the hint is correct.
 // Falls back to O(n) linear scan if the hint is stale — a wrong hint
-// degrades to ms_remove's cost, never to corruption. Prod users:
-// waiting_conns removal via Conn.waitpos and the truncated-tube registry.
+// degrades to ms_remove's cost, never to corruption. Prod user:
+// waiting_conns removal via Conn.waitpos.
 int
 ms_remove_at(Ms *a, size_t i, void *item)
 {

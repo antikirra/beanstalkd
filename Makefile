@@ -2,7 +2,7 @@ PREFIX?=/usr/local
 BINDIR=$(DESTDIR)$(PREFIX)/bin
 
 CFLAGS ?= -O2 -flto=auto
-override CFLAGS+=-Wall -Werror -Wformat=2 -g
+override CFLAGS+=-Wall -Wextra -Werror -Wformat=2 -g
 override LDFLAGS?=
 override LDFLAGS+=-flto=auto
 
@@ -91,9 +91,19 @@ CLEANFILES+=$(TARG)
 
 $(OFILES) $(MOFILE): $(HFILES)
 
-# crc32c.c uses Intel SSE4.2 _mm_crc32_u64 intrinsic; flag it locally
-# rather than globally so the rest of the tree stays portable-ready.
+# crc32c.c selects its implementation via predefined macros (SSE4.2,
+# ARM ACLE, or a portable software table). The SSE4.2 path needs
+# -msse4.2; add it only when the compiler targets x86_64 so other
+# arches keep their baseline. Detect via the compiler's predefined
+# macros (not uname) so cross-builds work.
+ifneq ($(shell $(CC) -dM -E - </dev/null 2>/dev/null | grep __x86_64__),)
 crc32c.o: override CFLAGS += -msse4.2
+endif
+
+# Test objects must stay inspectable by nm for ct/gen: slim-LTO
+# bytecode objects export no symbols, which would silently generate
+# an empty test list and a falsely green `make check`.
+$(TOFILES): override CFLAGS += -fno-lto
 
 CLEANFILES+=$(wildcard *.o)
 
@@ -137,6 +147,20 @@ ct/ct.o ct/_ctcheck.o: ct/ct.h ct/internal.h
 
 $(TOFILES): $(HFILES) ct/ct.h
 testinject.o testinject2.o: testinject.h
+
+# Rebuild objects when the effective flags change (e.g. make, then
+# make pgo, then make check): record CC/flags in a stamp file that is
+# rewritten only on change, and make every object depend on it.
+CFLAGS_STAMP=.cflags-stamp
+$(CFLAGS_STAMP): FORCE
+	@printf '%s\n' '$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS)' >$@.tmp
+	@if ! cmp -s $@.tmp $@; then mv $@.tmp $@; else rm $@.tmp; fi
+.PHONY: FORCE
+FORCE:
+
+$(OFILES) $(MOFILE) $(TOFILES) ct/ct.o ct/_ctcheck.o: $(CFLAGS_STAMP)
+
+CLEANFILES+=$(CFLAGS_STAMP)
 
 CLEANFILES+=$(wildcard ct/_* ct/*.o ct/*.gc*)
 

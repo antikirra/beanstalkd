@@ -9,9 +9,9 @@
 // Compared to the binary heap, tree depth is halved (log4 vs log2)
 // so siftdown does ~half as many parent comparisons. Siftup pays
 // for the shallower tree with 4 child comparisons per level, but
-// the 4 sibling pointers occupy one 64-byte cache line on LP64
-// (4 * 8 = 32 bytes, i.e. half a line), so the extra compares hit
-// L1 only. Net win: ~25–35% faster on delay heaps with ≥1k entries.
+// the 4 sibling pointers span 4 * 8 = 32 bytes on LP64 — one 64-byte
+// cache line when the parent index is even, at worst two adjacent
+// lines when odd — so the extra compares almost always hit L1 only. Net win: ~25–35% faster on delay heaps with ≥1k entries.
 //
 // Invariant (min-heap): h->less(parent, child) is true for every
 // (parent, child) pair. The type-erased less() is supplied by the
@@ -101,10 +101,12 @@ __attribute__((hot)) int
 heapinsert(Heap *h, void *x)
 {
     if (unlikely(h->len == h->cap)) {
-        size_t ncap = (h->len + 1) * 2;
-        if (ncap > SIZE_MAX / sizeof(void *)) {
+        // Overflow check before the multiply: (len + 1) * 2 pointers
+        // must fit size_t both as a count and as a byte size.
+        if (h->len > SIZE_MAX / sizeof(void *) / 2 - 1) {
             return 0;
         }
+        size_t ncap = (h->len + 1) * 2;
         void **ndata = realloc(h->data, sizeof(void *) * ncap);
         if (!ndata) {
             return 0;
@@ -131,6 +133,11 @@ heapremove(Heap *h, size_t k)
 
     void *x = h->data[k];
     h->len--;
+    // Upstream beanstalkd had a UAF here (PR #670): it replaced the
+    // slot when k <= h->len, so removing the last element put x back
+    // into the live heap; the caller then freed it, leaving a dangling
+    // pointer. The strict k < h->len guard is load-bearing — removing
+    // the last element must leave the heap untouched.
     if (k < h->len) {
         h->data[k] = h->data[h->len];
         h->setpos(h->data[k], k);
@@ -143,6 +150,10 @@ heapremove(Heap *h, size_t k)
             siftup(h, k);
         }
     }
+    // Note: setpos() is only called for elements that remain in the
+    // heap. The removed element keeps its stale cached index — the
+    // caller owns x now and must invalidate its heap_index if it can
+    // be reused (job.c callers do this before reinserting).
     return x;
 }
 

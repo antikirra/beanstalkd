@@ -685,3 +685,201 @@ cttest_wal_v7_short_record_legit_still_replays()
     wal_ckline(fd, "abc\r\n");
     wal_killsrv();
 }
+
+
+// Hand-craft a v7 binlog.1 with TWO full records for job 1: the first
+// establishes a 5-byte allocation, the second re-states the same job
+// (as a v7-era compaction/migration would) with body_size =
+// second_body_size. v7 carries no CRC trailer, so the reader's own
+// full-record body_size cross-check is the only thing keeping a
+// mismatch out of j->r — where job_free would pool the small body slab
+// under the bogus larger size class and a later allocate_job of that
+// class would overflow it.
+static void
+wal_write_v7_full_record_fixture(int32 second_body_size)
+{
+    char *path = wal_binlog_path(1);
+    int bfd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    assertf(bfd >= 0, "create v7 fixture");
+
+    int ver7 = 7;
+    assertf(write(bfd, &ver7, sizeof ver7) == (ssize_t)sizeof ver7,
+            "write v7 header");
+
+    // Full record 1: establishes job 1 with a 5-byte body allocation.
+    int nl = 7;
+    Jobrec jr = {0};
+    jr.id = 1;
+    jr.pri = 0;
+    jr.delay = 0;
+    jr.ttr = 120000000000LL; // 120s in ns
+    jr.body_size = 5;        // "abc" + "\r\n"
+    jr.created_at = 1;
+    jr.state = Ready;
+    assertf(write(bfd, &nl, sizeof nl) == (ssize_t)sizeof nl, "full namelen");
+    assertf(write(bfd, "default", 7) == 7, "tube name");
+    assertf(write(bfd, &jr, sizeof jr) == (ssize_t)sizeof jr, "full jobrec");
+    assertf(write(bfd, "abc\r\n", 5) == 5, "full body");
+
+    // Full record 2: same job, same tube. The body is 'X'-padded with a
+    // \r\n trailer so any body_size >= 2 stays well-formed.
+    char body[64];
+    memset(body, 'X', sizeof body);
+    body[second_body_size-2] = '\r';
+    body[second_body_size-1] = '\n';
+    Jobrec jr2 = jr;
+    jr2.body_size = second_body_size;
+    assertf(write(bfd, &nl, sizeof nl) == (ssize_t)sizeof nl, "full2 namelen");
+    assertf(write(bfd, "default", 7) == 7, "tube name 2");
+    assertf(write(bfd, &jr2, sizeof jr2) == (ssize_t)sizeof jr2,
+            "full2 jobrec");
+    assertf(write(bfd, body, second_body_size) == (ssize_t)second_body_size,
+            "full2 body");
+
+    // Zero padding parses as namelen=0 + all-zero Jobrec -> jr.id==0
+    // -> clean EOF for readrec7.
+    char zeros[512] = {0};
+    assertf(write(bfd, zeros, sizeof zeros) == (ssize_t)sizeof zeros, "pad");
+    close(bfd);
+    free(path);
+}
+
+
+// v7 full records for an existing job used to run their "size changed"
+// check AFTER `j->r = jr`: a corrupt second full record with a larger
+// body_size was copied into the live job first, and the Error path then
+// freed the job by the bogus size, poisoning the size-class pool. The
+// check now fires BEFORE the assignment; the corrupt re-state takes the
+// job down (same contract as the v7 short-record corruption test).
+void
+cttest_wal_v7_full_record_body_size_corruption_rejected()
+{
+    wal_setup();
+    wal_write_v7_full_record_fixture(40); // full record 1 said 5
+
+    int port = wal_startsrv();
+    int fd = wal_dial(port);
+    wal_send(fd, "stats-job 1\r\n");
+    wal_ckline(fd, "NOT_FOUND\r\n");
+    wal_killsrv();
+}
+
+
+// Companion compatibility guard: a LEGIT repeated full record — same
+// body_size as the first, exactly what compaction/migration writes —
+// must still replay and overwrite the body. If the check ever rejects
+// equal sizes, migration replay breaks.
+void
+cttest_wal_v7_full_record_legit_still_replays()
+{
+    wal_setup();
+    wal_write_v7_full_record_fixture(5); // "XXX\r\n" net of trailer: "XXX"
+
+    int port = wal_startsrv();
+    int fd = wal_dial(port);
+    wal_send(fd, "peek 1\r\n");
+    wal_ckline(fd, "FOUND 1 3\r\n");
+    wal_ckline(fd, "XXX\r\n");
+    wal_killsrv();
+}
+
+
+// Write one v8 full record for job 1 into bfd with a VALID CRC32C
+// trailer. Used to drive the v8 full-record body_size cross-check,
+// which sits behind the CRC gate and can only be reached with a
+// well-formed (but semantically hostile) record.
+static void
+wal_write_v8_full_record(int bfd, int32 body_size, const char *body)
+{
+    int nl = 7;
+    Jobrec jr = {0};
+    jr.id = 1;
+    jr.pri = 0;
+    jr.delay = 0;
+    jr.ttr = 120000000000LL;
+    jr.body_size = body_size;
+    jr.created_at = 1;
+    jr.state = Ready;
+
+    uint32 crc = WAL_CRC32C_INIT;
+    crc = wal_crc32c(crc, &nl, sizeof nl);
+    crc = wal_crc32c(crc, "default", 7);
+    crc = wal_crc32c(crc, &jr, sizeof jr);
+    crc = wal_crc32c(crc, body, body_size);
+    crc ^= WAL_CRC32C_XOR;
+    unsigned char trailer[4] = {
+        (unsigned char)(crc      ),
+        (unsigned char)(crc >>  8),
+        (unsigned char)(crc >> 16),
+        (unsigned char)(crc >> 24),
+    };
+
+    assertf(write(bfd, &nl, sizeof nl) == (ssize_t)sizeof nl, "namelen");
+    assertf(write(bfd, "default", 7) == 7, "tube name");
+    assertf(write(bfd, &jr, sizeof jr) == (ssize_t)sizeof jr, "jobrec");
+    assertf(write(bfd, body, body_size) == (ssize_t)body_size, "body");
+    assertf(write(bfd, trailer, 4) == 4, "crc trailer");
+}
+
+
+// Hand-craft a v8 binlog.1: header + two full records for job 1 (first
+// body_size 5, second second_body_size), both with valid CRC trailers.
+static void
+wal_write_v8_full_record_fixture(int32 second_body_size)
+{
+    char *path = wal_binlog_path(1);
+    int bfd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    assertf(bfd >= 0, "create v8 fixture");
+
+    int ver8 = Walver;
+    assertf(write(bfd, &ver8, sizeof ver8) == (ssize_t)sizeof ver8,
+            "write v8 header");
+
+    wal_write_v8_full_record(bfd, 5, "abc\r\n");
+
+    char body[64];
+    memset(body, 'X', sizeof body);
+    body[second_body_size-2] = '\r';
+    body[second_body_size-1] = '\n';
+    wal_write_v8_full_record(bfd, second_body_size, body);
+
+    char zeros[512] = {0};
+    assertf(write(bfd, zeros, sizeof zeros) == (ssize_t)sizeof zeros, "pad");
+    close(bfd);
+    free(path);
+}
+
+
+// v8 full record with a valid CRC but a body_size that contradicts the
+// job's existing allocation. The CRC gate passes, so the semantic
+// cross-check (defense in depth against writer bugs) must reject the
+// record BEFORE `j->r = jr`, and the job must not survive replay.
+void
+cttest_wal_v8_full_record_body_size_mismatch_rejected()
+{
+    wal_setup();
+    wal_write_v8_full_record_fixture(40); // full record 1 said 5
+
+    int port = wal_startsrv();
+    int fd = wal_dial(port);
+    wal_send(fd, "stats-job 1\r\n");
+    wal_ckline(fd, "NOT_FOUND\r\n");
+    wal_killsrv();
+}
+
+
+// Legit v8 repeated full record (same body_size, valid CRC) must still
+// replay and overwrite the body — the migration-replay contract.
+void
+cttest_wal_v8_full_record_legit_still_replays()
+{
+    wal_setup();
+    wal_write_v8_full_record_fixture(5);
+
+    int port = wal_startsrv();
+    int fd = wal_dial(port);
+    wal_send(fd, "peek 1\r\n");
+    wal_ckline(fd, "FOUND 1 3\r\n");
+    wal_ckline(fd, "XXX\r\n");
+    wal_killsrv();
+}

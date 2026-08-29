@@ -2,16 +2,28 @@
 
 set -e
 
+NM=${NM:-nm}
+
 syms() {
     prefix=$1
     shift
     for f in "$@"
-    do nm $f
+    do $NM "$f"
     done | cut -d ' ' -f 3 | egrep ^$prefix | grep -v '\.'
 }
 
 ts=`syms cttest "$@" || true`
 bs=`syms ctbench "$@" || true`
+
+# Fail loudly if no tests were found: with LTO objects (slim LTO
+# bytecode) nm prints no symbols, which would otherwise generate an
+# empty test list and a falsely green `make check` run.
+if [ $# -gt 0 ] && [ -z "$ts" ] && [ -z "$bs" ]; then
+    echo "ct/gen: no cttest/ctbench symbols found in: $*" >&2
+    echo "ct/gen: check that the objects were built without LTO" >&2
+    echo "        (or set NM to a suitable nm, e.g. gcc-nm)" >&2
+    exit 1
+fi
 
 printf '#include <stdint.h>\n'
 printf '#include "internal.h"\n'
