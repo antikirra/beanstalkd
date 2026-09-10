@@ -255,3 +255,42 @@ cttest_heap_4ary_all_equal_keys()
     free(h.data);
     free(jobs);
 }
+
+
+// heapresift is handed an index a caller cached (Conn::tickpos,
+// Tube::delay_heap_index). A stale one — an element removed since, or a
+// heap that shrank — is out of range, and sifting from there reads
+// neighbours that are no longer part of the heap. The guard is the
+// bound, so it has to hold at exactly len, not just past it.
+void
+cttest_heap_resift_out_of_bounds_is_a_no_op(void)
+{
+    Heap h = {
+        .less = job_pri_less,
+        .setpos = job_setpos,
+    };
+
+    Job *a = make_job(5, 0, 1, 0, 0);
+    Job *b = make_job(9, 0, 1, 0, 0);
+    assertf(heapinsert(&h, a), "setup: insert a");
+    assertf(heapinsert(&h, b), "setup: insert b");
+    assertf(h.data[0] == a, "setup: the smaller priority must be at the root");
+
+    size_t len_before = h.len;
+    size_t pos_a = a->heap_index, pos_b = b->heap_index;
+
+    heapresift(&h, h.len);        // exactly one past the last element
+    heapresift(&h, h.len + 7);    // and further out
+
+    assertf(h.len == len_before,
+            "an out-of-range resift must not change the heap size "
+            "(%zu -> %zu)", len_before, h.len);
+    assertf(h.data[0] == a && h.data[1] == b,
+            "an out-of-range resift must not move anything");
+    assertf(a->heap_index == pos_a && b->heap_index == pos_b,
+            "an out-of-range resift must not rewrite recorded positions");
+
+    free(h.data);
+    job_free(a);
+    job_free(b);
+}

@@ -145,15 +145,33 @@ wal_crc32c(uint32 crc, const void *buf, size_t n)
 
 // Runtime dispatch needs the kernel-reported HWCAP, so this path is
 // Linux-only; other aarch64 targets keep the portable table path.
-#include <arm_acle.h>
 #include <sys/auxv.h>
 #include <asm/hwcap.h>
 
 // The target attribute compiles this one function for armv8-a+crc even
 // when the TU baseline is plain armv8.0, so the binary still runs on
 // chips without the extension — the dispatcher below never calls it
-// there. Without the attribute the ACLE intrinsics would not compile.
-__attribute__((hot, target("arch=armv8-a+crc")))
+// there. Without the attribute the CRC instructions would not compile.
+//
+// The spelling and the intrinsics differ per compiler. GCC takes the
+// arch= form and exposes the ACLE names from <arm_acle.h> under it;
+// clang takes a bare feature name and does NOT make the ACLE header
+// declare anything unless the whole translation unit is built for +crc
+// — which would let it emit CRC instructions in the dispatcher too, on
+// chips that do not have them. Its own builtins are available under the
+// attribute, so use those.
+#if defined(__clang__)
+#  define CRC_TARGET   target("crc")
+#  define CRC32C_D(c, v) __builtin_arm_crc32cd((c), (v))
+#  define CRC32C_B(c, v) __builtin_arm_crc32cb((c), (v))
+#else
+#  include <arm_acle.h>
+#  define CRC_TARGET   target("arch=armv8-a+crc")
+#  define CRC32C_D(c, v) __crc32cd((c), (v))
+#  define CRC32C_B(c, v) __crc32cb((c), (v))
+#endif
+
+__attribute__((hot, CRC_TARGET))
 static uint32
 wal_crc32c_hw(uint32 crc, const void *buf, size_t n)
 {
@@ -164,14 +182,14 @@ wal_crc32c_hw(uint32 crc, const void *buf, size_t n)
     while (n >= 8) {
         uint64_t v;
         __builtin_memcpy(&v, p, 8);
-        crc = __crc32cd(crc, v);
+        crc = CRC32C_D(crc, v);
         p += 8;
         n -= 8;
     }
 
     // Tail: up to 7 bytes.
     while (n--) {
-        crc = __crc32cb(crc, *p++);
+        crc = CRC32C_B(crc, *p++);
     }
 
     return crc;

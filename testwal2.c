@@ -73,6 +73,38 @@ cttest_crc32c_known_vectors()
             == 0x22620404u,
             "CRC32C(pangram): expected 0x22620404, got 0x%08x",
             crc("The quick brown fox jumps over the lazy dog", 43));
+
+    // RFC 3720 B.4 vectors. Every length above leaves a tail (0, 1, 1, 3
+    // bytes), so nothing yet exercises the u64 main loop alone: these are
+    // exactly 4 iterations with no tail at all. The all-zero and all-ones
+    // patterns are also the two that a wrong init or final XOR cannot
+    // hide behind.
+    char zeros[32];
+    memset(zeros, 0x00, sizeof zeros);
+    assertf(crc(zeros, sizeof zeros) == 0x8A9136AAu,
+            "CRC32C(32 zero bytes): expected 0x8A9136AA, got 0x%08x",
+            crc(zeros, sizeof zeros));
+
+    char ones[32];
+    memset(ones, 0xFF, sizeof ones);
+    assertf(crc(ones, sizeof ones) == 0x62A8AB43u,
+            "CRC32C(32 0xFF bytes): expected 0x62A8AB43, got 0x%08x",
+            crc(ones, sizeof ones));
+
+    // 0x00..0x1F and its reverse: same multiset of bytes, different
+    // order. A checksum that accumulates without regard to position
+    // (a sum, an xor) gives one answer for both.
+    char up[32], down[32];
+    for (int i = 0; i < 32; i++) {
+        up[i] = (char)i;
+        down[i] = (char)(31 - i);
+    }
+    assertf(crc(up, sizeof up) == 0x46DD794Eu,
+            "CRC32C(0x00..0x1F): expected 0x46DD794E, got 0x%08x",
+            crc(up, sizeof up));
+    assertf(crc(down, sizeof down) == 0x113FDB5Cu,
+            "CRC32C(0x1F..0x00): expected 0x113FDB5C, got 0x%08x",
+            crc(down, sizeof down));
 }
 
 
@@ -89,6 +121,26 @@ cttest_crc32c_chunked_equals_monolithic()
     uint32 mono = WAL_CRC32C_INIT;
     mono = wal_crc32c(mono, msg, n);
     mono ^= WAL_CRC32C_XOR;
+
+    // Anchor the reference. Comparing the implementation against itself
+    // is satisfied by any accumulator: swap the init/final constants or
+    // the polynomial and every chunking below moves with the monolith,
+    // still equal, still green.
+    assertf(mono == 0x22620404u,
+            "the reference CRC32C must be the standard value: expected "
+            "0x22620404, got 0x%08x", mono);
+
+    // Three calls, two state handoffs — the writer folds namelen, name,
+    // Jobrec and body in four. A handoff that only survives one boundary
+    // passes the two-call form below.
+    uint32 three = WAL_CRC32C_INIT;
+    three = wal_crc32c(three, msg, 7);
+    three = wal_crc32c(three, msg + 7, 13);
+    three = wal_crc32c(three, msg + 20, n - 20);
+    three ^= WAL_CRC32C_XOR;
+    assertf(three == mono,
+            "three-chunk CRC32C must equal the monolith: got 0x%08x, "
+            "want 0x%08x", three, mono);
 
     // Split at every boundary 0..n and verify all match.
     for (size_t split = 0; split <= n; split++) {
@@ -125,6 +177,17 @@ cttest_crc32c_64kb_body()
     uint32 baseline = WAL_CRC32C_INIT;
     baseline = wal_crc32c(baseline, buf, n);
     baseline ^= WAL_CRC32C_XOR;
+
+    // Known answer for this exact buffer, computed independently from
+    // the Castagnoli definition (reflected poly 0x82F63B78, init and
+    // final XOR 0xFFFFFFFF) rather than from this implementation.
+    // Without it, "the CRC changed when I flipped a bit" is satisfied by
+    // a byte sum or an Adler accumulator — every guarantee CRC32C was
+    // chosen for (burst-error detection, Hamming distance on 64 KiB)
+    // would be gone with the test still green.
+    assertf(baseline == 0x9864C70Du,
+            "CRC32C of the 64KiB LCG buffer: expected 0x9864C70D, got 0x%08x",
+            baseline);
 
     // Flip a single bit in three representative positions (head, body,
     // tail). CRC32C mathematically guarantees single-bit flip detection
@@ -190,6 +253,20 @@ wal_startsrv(void)
     if (walsrvpid > 0) {
         atexit(wal_killsrv);
         usleep(100000);
+        // The listening socket lives in the PARENT, so a child that died
+        // during replay still completes connect() and every later
+        // failure surfaces as an unexplained read timeout. Reap it here
+        // instead: a replay that abort()s or exit()s is a defect in its
+        // own right, and must never be mistaken for a record that was
+        // legitimately rejected.
+        int st = 0;
+        if (waitpid(walsrvpid, &st, WNOHANG) == walsrvpid) {
+            int code = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+            int sig = WIFSIGNALED(st) ? WTERMSIG(st) : 0;
+            walsrvpid = 0;
+            assertf(0, "server died during startup/replay: exit=%d signal=%d",
+                    code, sig);
+        }
         return port;
     }
 
@@ -423,6 +500,80 @@ cttest_wal_v8_crc_footer_flip()
 }
 
 
+// Delete every binlog.N in ctdir so a hand-built fixture is the only
+// file walscandir will find.
+static void
+wal_unlink_binlogs(void)
+{
+    DIR *d = opendir(ctdir());
+    assertf(d != NULL, "opendir %s: %s", ctdir(), strerror(errno));
+    struct dirent *e;
+    char path[512];
+    while ((e = readdir(d)) != NULL) {
+        int n;
+        if (sscanf(e->d_name, "binlog.%d", &n) == 1) {
+            snprintf(path, sizeof path, "%s/%s", ctdir(), e->d_name);
+            unlink(path);
+        }
+    }
+    closedir(d);
+}
+
+
+// Hand-craft binlog.1 holding ONE v8 full record whose bytes are
+// entirely self-consistent — a legal 6-byte tube name, a well-formed
+// Jobrec, a body of the size the Jobrec declares — but whose CRC trailer
+// was taken over a DIFFERENT namelen. Nothing about the record is
+// mis-shaped, so the parser sails through it; only a checksum that
+// actually covers namelen can tell it apart from a record a writer
+// produced.
+static void
+wal_write_v8_namelen_crc_fixture(void)
+{
+    char *path = wal_binlog_path(1);
+    int bfd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    assertf(bfd >= 0, "create v8 namelen fixture");
+
+    int ver8 = Walver;
+    assertf(write(bfd, &ver8, sizeof ver8) == (ssize_t)sizeof ver8,
+            "write v8 header");
+
+    int disk_namelen = 6;      // what the record on disk says: "defaul"
+    int crc_namelen = 7;       // what the checksum was taken over
+    Jobrec jr = {0};
+    jr.id = 1;
+    jr.ttr = 120000000000LL;
+    jr.body_size = 5;          // "abc" + "\r\n"
+    jr.created_at = 1;
+    jr.state = Ready;
+
+    uint32 c = WAL_CRC32C_INIT;
+    c = wal_crc32c(c, &crc_namelen, sizeof crc_namelen);
+    c = wal_crc32c(c, "defaul", 6);
+    c = wal_crc32c(c, &jr, sizeof jr);
+    c = wal_crc32c(c, "abc\r\n", 5);
+    c ^= WAL_CRC32C_XOR;
+    unsigned char trailer[4] = {
+        (unsigned char)(c      ),
+        (unsigned char)(c >>  8),
+        (unsigned char)(c >> 16),
+        (unsigned char)(c >> 24),
+    };
+
+    assertf(write(bfd, &disk_namelen, sizeof disk_namelen)
+            == (ssize_t)sizeof disk_namelen, "namelen");
+    assertf(write(bfd, "defaul", 6) == 6, "tube name");
+    assertf(write(bfd, &jr, sizeof jr) == (ssize_t)sizeof jr, "jobrec");
+    assertf(write(bfd, "abc\r\n", 5) == 5, "body");
+    assertf(write(bfd, trailer, 4) == 4, "crc trailer");
+
+    char zeros[512] = {0};
+    assertf(write(bfd, zeros, sizeof zeros) == (ssize_t)sizeof zeros, "pad");
+    close(bfd);
+    free(path);
+}
+
+
 // Flip a byte in namelen. Without CRC covering namelen, this would
 // mis-parse the record and likely corrupt recovery silently. With v8
 // CRC covering namelen, the record must be rejected.
@@ -446,6 +597,28 @@ cttest_wal_v8_namelen_flip()
     port = wal_startsrv();
     fd = wal_dial(port);
     wal_send(fd, "stats-job 1\r\n");
+    wal_ckline(fd, "NOT_FOUND\r\n");
+    wal_killsrv();
+
+    // The flip above desynchronises the parse by one byte, so job 1 is
+    // unreachable whether or not any checksum was consulted — the
+    // assertion is true by construction and cannot see the CRC at all.
+    // Ask the real question instead: a record that parses PERFECTLY,
+    // byte for byte what a writer would emit, except that its trailer
+    // was taken over a different namelen. It is accepted the moment
+    // namelen leaves the checksummed range, or the moment the
+    // comparison stops rejecting mismatches.
+    wal_unlink_binlogs();
+    wal_write_v8_namelen_crc_fixture();
+
+    port = wal_startsrv();
+    fd = wal_dial(port);
+    wal_send(fd, "stats-job 1\r\n");
+    wal_ckline(fd, "NOT_FOUND\r\n");
+
+    // ...and the reader must not have taken the record's word for its
+    // tube either: a rejected record leaves no trace in the namespace.
+    wal_send(fd, "stats-tube defaul\r\n");
     wal_ckline(fd, "NOT_FOUND\r\n");
     wal_killsrv();
 }
@@ -510,6 +683,27 @@ cttest_wal_v8_roundtrip_clean()
     wal_send(fd, "peek 1\r\n");
     wal_ckline(fd, "FOUND 1 11\r\n");
     wal_ckline(fd, "hello world\r\n");
+
+    // The id and the body are two fields out of a Jobrec of fourteen.
+    // Everything the put declared has to come back, or "recovered" means
+    // "the bytes are there and the job is a stranger": a wrong priority
+    // re-orders the ready queue, a wrong ttr changes when the job is
+    // released back, a wrong tube hands it to the wrong workers.
+    wal_send(fd, "stats-job 1\r\n");
+    char *ok = wal_readline(fd);
+    assertf(strncmp(ok, "OK ", 3) == 0,
+            "stats-job must answer OK after replay, got %s", ok);
+    char *yaml = wal_readline(fd);
+    assertf(strstr(yaml, "\npri: 42\n"),
+            "priority 42 must survive replay, got:\n%s", yaml);
+    assertf(strstr(yaml, "\nttr: 120\n"),
+            "ttr 120 must survive replay, got:\n%s", yaml);
+    assertf(strstr(yaml, "\ndelay: 0\n"),
+            "delay 0 must survive replay, got:\n%s", yaml);
+    assertf(strstr(yaml, "\nstate: ready\n"),
+            "a replayed ready job must come back ready, got:\n%s", yaml);
+    assertf(strstr(yaml, "\ntube: \"default\"\n"),
+            "the tube must survive replay, got:\n%s", yaml);
     wal_killsrv();
 }
 
@@ -524,14 +718,30 @@ cttest_wal_v7_header_dispatch()
 {
     wal_setup();
 
-    // Write binlog.1 with just the v7 header, rest is all zeros —
-    // readrec7 will read zeros as namelen=0 + all-zero Jobrec, see
-    // jr.id == 0, return 0 (EOF). No records, no errors.
+    // Write binlog.1 with the v7 header and ONE real v7 full record, then
+    // zeros. A header followed by nothing but padding is a file with
+    // deliberately zero records: "dispatch reached readrec7" would then
+    // be attested only by the server not crashing, and a readrec7 stubbed
+    // to `return 0` would pass. The record makes the dispatch prove
+    // itself — it has to come back out.
     char *path = wal_binlog_path(1);
     int bfd = open(path, O_WRONLY | O_CREAT, 0600);
     assertf(bfd >= 0, "create v7 fixture");
     int ver7 = 7;
     assertf(write(bfd, &ver7, sizeof ver7) == sizeof ver7, "write v7 header");
+
+    int nl = 7;
+    Jobrec jr = {0};
+    jr.id = 1;
+    jr.ttr = 120000000000LL; // 120s in ns
+    jr.body_size = 5;        // "leg" + "\r\n"
+    jr.created_at = 1;
+    jr.state = Ready;
+    assertf(write(bfd, &nl, sizeof nl) == (ssize_t)sizeof nl, "v7 namelen");
+    assertf(write(bfd, "default", 7) == 7, "v7 tube name");
+    assertf(write(bfd, &jr, sizeof jr) == (ssize_t)sizeof jr, "v7 jobrec");
+    assertf(write(bfd, "leg\r\n", 5) == 5, "v7 body");
+
     // Pad to a realistic filesize with zeros so walscandir sees it.
     char zeros[1024] = {0};
     assertf(write(bfd, zeros, sizeof zeros) == (ssize_t)sizeof zeros, "pad");
@@ -542,10 +752,18 @@ cttest_wal_v7_header_dispatch()
     int port = wal_startsrv();
     int fd = wal_dial(port);
 
-    // Server is up: can put and stats normally.
+    // The legacy record must have been PARSED, not merely skipped: the
+    // job, its body and its tube all come back.
+    wal_send(fd, "peek 1\r\n");
+    wal_ckline(fd, "FOUND 1 3\r\n");
+    wal_ckline(fd, "leg\r\n");
+
+    // Server is up: can put and stats normally. Job 1 came from the v7
+    // file, so the fresh job is number 2 — the id counter must have been
+    // advanced past the replayed record.
     wal_send(fd, "put 0 0 60 3\r\n");
     wal_send(fd, "hey\r\n");
-    wal_ckline(fd, "INSERTED 1\r\n");
+    wal_ckline(fd, "INSERTED 2\r\n");
     wal_killsrv();
 
     // A new binlog (binlog.2) must exist and carry v8 header.
@@ -586,6 +804,18 @@ cttest_wal_v8_header_byte()
     free(path);
 
     assertf(ver == 8, "binlog version header: expected 8, got %d", ver);
+
+    // The version byte only matters because it routes the reader. Pinning
+    // the constant while never asking the reader to parse what this
+    // writer just emitted leaves the writer/reader boundary — the thing
+    // the header exists to keep aligned — untested. Restart and require
+    // the record back.
+    port = wal_startsrv();
+    fd = wal_dial(port);
+    wal_send(fd, "peek 1\r\n");
+    wal_ckline(fd, "FOUND 1 1\r\n");
+    wal_ckline(fd, "x\r\n");
+    wal_killsrv();
 }
 
 

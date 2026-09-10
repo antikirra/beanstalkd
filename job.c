@@ -212,9 +212,21 @@ make_job_with_id(uint32 pri, int64 delay, int64 ttr,
 
     if (unlikely(id)) {
         j->r.id = id;
+        // id + 1 cannot wrap here: readrec refuses UINT64_MAX (and 0)
+        // on the way in, so the largest replayable id is UINT64_MAX-1.
         if (id >= next_id)
             next_id = id + 1;
     } else {
+        // Refuse rather than hand out 0: readrec reads a zero id as the
+        // start of the fallocate tail, so a job carrying it would end
+        // every later replay at its own record. Unreachable in practice
+        // (2^64 puts), kept because the cost of being wrong is silent
+        // data loss.
+        if (unlikely(!next_id)) {
+            twarnx("job id space exhausted");
+            job_free(j);
+            return (Job *) 0;
+        }
         j->r.id = next_id++;
     }
     j->r.pri = pri;
@@ -268,6 +280,18 @@ job_free(Job *j)
 
     int is_copy = (j->r.state == Copy);
 
+    // Note on j->walresv: reserved WAL bytes belong to the caller to
+    // give back — job_free has no Wal to return them to, and a job
+    // freed still holding some would inflate w->resv for the life of
+    // the process (ratio() reads it on every maintenance pass). Every
+    // path that frees a job with a live reservation returns it first;
+    // see the walresvreturn calls in prot.c.
+    //
+    // This cannot be asserted here. With the WAL off, walresvput and
+    // walresvupdate return the legacy success value 1 rather than a
+    // byte count (wal_disabled_result in walg.c), so a job that never
+    // touched a binlog still ends up with walresv == 1. The number is
+    // only bytes while w->use is set, and job_free has no way to know.
     TUBE_ASSIGN(j->tube, NULL);
     if (likely(!is_copy)) job_hash_free(j);
 

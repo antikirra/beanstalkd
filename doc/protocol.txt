@@ -10,6 +10,17 @@ were received and sends responses in the same order. All integers in the
 protocol are formatted in decimal and (unless otherwise indicated)
 nonnegative.
 
+A client may pipeline: send several commands without waiting for the replies
+in between. "Serially, in order" is what that costs and what it guarantees.
+It costs concurrency ON THAT CONNECTION: a command that blocks — a "reserve"
+with no job to give it — holds up everything sent behind it, because a reply
+sent early would arrive out of order. Use a second connection for work that
+must not wait behind a reserve. What it guarantees is that every command whose
+bytes the server has accepted is answered, exactly once and in place. A
+command queued behind a blocking reserve is answered as soon as that reserve
+is, whether the reserve ended in a job, a timeout or DEADLINE_SOON. Replies
+are never dropped, reordered, or coalesced away.
+
 Names, in this protocol, are ASCII strings. They may contain letters (A-Z and
 a-z), numerals (0-9), hyphen ("-"), plus ("+"), slash ("/"), semicolon (";"),
 dot ("."), dollar-sign ("$"), underscore ("_"), and parentheses ("(" and ")"),
@@ -228,12 +239,23 @@ During the TTR of a reserved job, the last second is kept by the server as a
 safety margin, during which the client will not be made to wait for another
 job. If the client issues a reserve command during the safety margin, or if
 the safety margin arrives while the client is waiting on a reserve command,
-the server will respond with:
+and no job is ready to be handed over immediately, the server will respond
+with:
 
     DEADLINE_SOON\r\n
 
 This gives the client a chance to delete or release its reserved job before
 the server automatically releases it.
+
+The "and no job is ready" clause is what the margin means in practice: it
+exists so the client is never left BLOCKED while its own reservation is
+running out, so a reserve that can be answered at once is answered at once,
+with RESERVED. Announcing DEADLINE_SOON while a job sits ready would deny
+the client work it could have taken without waiting a moment for it.
+
+DEADLINE_SOON is an answer to reserve alone. delete, release, bury and touch
+are the actions the margin exists to make room for, and they keep their own
+documented replies inside it.
 
     TIMED_OUT\r\n
 
@@ -287,9 +309,11 @@ The client then waits for one line of response, which may be:
 
  - "DELETED\r\n" to indicate success.
 
- - "NOT_FOUND\r\n" if the job does not exist or it cannot be deleted. To be
-   deleted it must be buried or reserved by the client. This could happen
-   if the job timed out before the client sent the delete command.
+ - "NOT_FOUND\r\n" if the job does not exist or it cannot be deleted. A job
+   can be deleted while it is ready, delayed or buried, or while it is
+   reserved BY THIS CLIENT; a job reserved by someone else is not this
+   client's to delete. This could happen if the job timed out and was
+   reserved by another worker before the client sent the delete command.
 
 The release command puts a reserved job back into the ready queue (and marks
 its state as "ready") to be run by any client. It is normally used when the job

@@ -3,7 +3,7 @@
 # Runs the SAME fixed sequence of beanstalkd commands against each role,
 # captures responses, normalizes time-dependent stats lines, diffs.
 #
-# Expected differences vs upstream (declared in README + CLAUDE.md):
+# Expected differences vs upstream (declared in README):
 #   - trailing-space variants: `stats \r\n` → UNKNOWN_COMMAND in fork, BAD_FORMAT upstream
 #   - `-H` HTTP responses (not exercised here)
 # This script labels those as EXPECTED-DIFF, everything else as UNEXPECTED.

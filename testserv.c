@@ -20,7 +20,17 @@
 #include <sys/wait.h>
 #include <errno.h>
 
+
 static int srvpid, size;
+static int srvport;   // last port SERVER() handed out; see nudge_srv
+// Read end of a pipe the forked server's SIGTERM handler writes one byte
+// to. It answers the only question /proc cannot: the kernel says the
+// signal is caught, unblocked and not pending, which means it was
+// delivered — but "delivered to the process" and "the handler ran" are
+// different things in an instrumented build, and only one of them means
+// the server was told to stop.
+static int srvsigfd = -1;
+static int srvsigwfd = -1;
 
 // Global timeout set for reading response in tests; 5sec.
 static int64 timeout = 5000000000LL;
@@ -41,15 +51,15 @@ exist(char *path)
 }
 
 static int
-wrapfalloc(int fd, int size)
+wrapfalloc(int fd, int len)
 {
     static size_t c = 0;
 
-    printf("\nwrapfalloc: fd=%d size=%d\n", fd, size);
+    printf("\nwrapfalloc: fd=%d size=%d\n", fd, len);
     if (c >= sizeof(fallocpat) || !fallocpat[c++]) {
         return ENOSPC;
     }
-    return rawfalloc(fd, size);
+    return rawfalloc(fd, len);
 }
 
 static int
@@ -112,11 +122,32 @@ mustdialunix(char *socket_file)
     return fd;
 }
 
+// SIGTERM in the forked test server. It used to call exit() straight
+// from the handler, which is not async-signal-safe: exit() runs atexit
+// handlers and flushes stdio, and under a sanitizer it also enters the
+// runtime's own teardown — while the interrupted thread may be holding
+// the very locks that needs. Under TSan that deadlocked about one run
+// in five, and the parent's waitpid then waited forever, so the whole
+// suite hung with no output rather than failing.
+//
+// Do what the real server does instead: set the flag, wake the loop
+// through the async-signal-safe eventfd, and let srvserve return so the
+// child exits from ordinary context. That also keeps the gcov flush at
+// exit that the old comment was protecting (issue #443) — it is exit()
+// that gcov needs, not exit() from a handler.
 static void
 exit_process(int signum)
 {
     UNUSED_PARAMETER(signum);
-    exit(0);
+    // First thing, before anything that could be deferred or blocked:
+    // leave proof that this handler ran at all. write() is
+    // async-signal-safe and the pipe has room for one byte.
+    if (srvsigwfd >= 0) {
+        ssize_t w = write(srvsigwfd, "1", 1);
+        (void)w;
+    }
+    atomic_store_explicit(&shutdown_requested, 1, memory_order_relaxed);
+    srv_wake();
 }
 
 static void
@@ -143,14 +174,143 @@ set_sig_handler()
 // Kill the srvpid (child process) with SIGTERM to give it a chance
 // to write gcov data to the filesystem before ct kills it with SIGKILL.
 // Do nothing in case of srvpid==0; child was already killed.
+// nudge_srv makes the server's epoll return, by connecting to it and
+// hanging up. Needed only under ThreadSanitizer, and the reason is
+// worth writing down: TSan defers a signal that arrives while the
+// thread sits inside an intercepted blocking call, and runs the handler
+// at the next safe point instead. An idle server's next safe point is
+// whenever its epoll park ends — up to 60s away, since the malloc_trim
+// cadence is what caps it. So SIGTERM alone can leave the process
+// asleep in do_epoll_wait for a minute. That is what /proc/<pid>/wchan
+// said on the timeout path below, after two wrong guesses (the signal
+// handler, then exit() in a forked sanitizer child) had already been
+// tried and disproved.
+//
+// Measured, over fifty runs: this takes the failure rate from about one
+// run in five to about one in twenty-five. Most of the window, not all
+// of it — a signal can also land somewhere the park ending does not
+// resolve — so the timeout path below still reports the signal masks
+// and whether the handler left its byte on the pipe. The nudge stays
+// because it costs nothing on the normal path and cannot weaken a
+// check (a server that truly ignored SIGTERM would still never exit),
+// but the timeout path below is where the answer will come from: it
+// reports the signal masks, which tell "blocked", "no handler yet" and
+// "pending" apart. The pure "SIGTERM while parked in epoll" property is
+// measured against the real binary, with no sanitizer in the way, by
+// bench/shutdown/run.sh.
+static void
+nudge_srv(void)
+{
+    if (srvport <= 0)
+        return;
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(srvport),
+    };
+    inet_aton("127.0.0.1", &addr.sin_addr);
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == -1)
+        return;
+    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) == 0) {
+        ssize_t w = write(fd, "quit\r\n", 6);
+        (void)w;
+    }
+    close(fd);
+}
+
 static void
 kill_srvpid(void)
 {
     if (!srvpid)
         return;
     kill(srvpid, SIGTERM);
+    // Bounded wait. A plain waitpid here turns any server that fails to
+    // stop into a suite that hangs with no output and no failing test
+    // name — the worst possible way to learn about it. Give it ten
+    // seconds, then SIGKILL and say so: a red test beats a wedged run.
+    for (int i = 0; i < 1000; i++) {
+        // Cheap for a server that is already on its way out (the first
+        // poll usually wins); decisive for one parked in epoll.
+        if (i == 2 || i == 20 || i == 200)
+            nudge_srv();
+        int st;
+        pid_t r = waitpid(srvpid, &st, WNOHANG);
+        if (r == srvpid) {
+            srvpid = 0;
+            srvport = 0;
+            if (srvsigfd >= 0) { close(srvsigfd); srvsigfd = -1; }
+            return;
+        }
+        if (r == -1 && errno != EINTR)
+            break;
+        usleep(10000);
+    }
+    // Say WHERE it is stuck, not just that it is. A server that ignores
+    // SIGTERM is worth a real diagnosis, and by the time the run is
+    // over the process is gone — so read it here, before the kill.
+    char state[64] = "?", wchan[128] = "?", path[64];
+    snprintf(path, sizeof path, "/proc/%d/wchan", (int)srvpid);
+    int df = open(path, O_RDONLY);
+    if (df >= 0) {
+        ssize_t n = read(df, wchan, sizeof wchan - 1);
+        wchan[n > 0 ? n : 0] = '\0';
+        close(df);
+    }
+    // Signal masks too: "stuck in epoll" and "never got the signal" look
+    // identical from wchan alone. SigBlk says whether SIGTERM is blocked,
+    // SigCgt whether a handler is installed at all, and SigPnd/ShdPnd
+    // whether it is sitting undelivered. SIGTERM is bit 14 (0x4000).
+    char sigs[256] = "";
+    snprintf(path, sizeof path, "/proc/%d/status", (int)srvpid);
+    df = open(path, O_RDONLY);
+    if (df >= 0) {
+        char buf[4096];
+        ssize_t n = read(df, buf, sizeof buf - 1);
+        buf[n > 0 ? n : 0] = '\0';
+        close(df);
+        size_t used = 0;
+        for (char *line = buf; line && *line; ) {
+            char *eol = strchr(line, '\n');
+            if (eol) *eol = '\0';
+            if (!strncmp(line, "Sig", 3) || !strncmp(line, "ShdPnd", 6)) {
+                int k = snprintf(sigs + used, sizeof sigs - used, "%s%s",
+                                 used ? " " : "", line);
+                if (k > 0 && used + (size_t)k < sizeof sigs)
+                    used += (size_t)k;
+                else
+                    break;
+            }
+            line = eol ? eol + 1 : NULL;
+        }
+    }
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)srvpid);
+    df = open(path, O_RDONLY);
+    if (df >= 0) {
+        char buf[512];
+        ssize_t n = read(df, buf, sizeof buf - 1);
+        buf[n > 0 ? n : 0] = '\0';
+        char *close_paren = strrchr(buf, ')');
+        if (close_paren && close_paren[1] && close_paren[2])
+            snprintf(state, sizeof state, "%c", close_paren[2]);
+        close(df);
+    }
+    // Did the handler run at all? One byte on the pipe says yes.
+    const char *ran = "unknown";
+    if (srvsigfd >= 0) {
+        char b;
+        int fl = fcntl(srvsigfd, F_GETFL);
+        fcntl(srvsigfd, F_SETFL, fl | O_NONBLOCK);
+        ssize_t n = read(srvsigfd, &b, 1);
+        ran = n == 1 ? "handler RAN" : "handler NEVER ran";
+    }
+    kill(srvpid, SIGKILL);
     waitpid(srvpid, 0, 0);
+    pid_t stuck = srvpid;
     srvpid = 0;
+    srvport = 0;
+    assertf(0, "the test server (pid %d) did not exit on SIGTERM within 10s;"
+               " it had to be killed (%s, proc state '%s', wchan '%s', %s)",
+            (int)stuck, ran, state, wchan, sigs);
 }
 
 #define SERVER() (progname=__func__, mustforksrv())
@@ -178,6 +338,30 @@ mustforksrv(void)
     }
 
     int port = ntohs(addr.sin_port);
+
+    // Ready pipe: the listening socket exists before the fork, so a
+    // connect() succeeds whether or not the child is serving yet.
+    // Without this the test races the child's startup — a SIGTERM sent
+    // "after" the fork could land before walinit had made a binlog.
+    // socketpair + send/recv, not pipe + write/read, and the reason is
+    // load-bearing: the fault injector wraps write(), so a ready byte
+    // sent with write() becomes the server's FIRST wrapped write and
+    // quietly eats any fault armed at skip 0. Three tests that arm
+    // "the first reply lands short" stopped exercising a short reply
+    // at all when this handshake was introduced, and nothing failed —
+    // coverage is what noticed, years of green runs later. send() is
+    // not wrapped, so skip counts mean what their comments say.
+    int ready[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, ready) != 0) {
+        twarn("socketpair");
+        exit(1);
+    }
+    int sigpipe[2];
+    if (pipe(sigpipe) != 0) {
+        twarn("pipe");
+        exit(1);
+    }
+
     srvpid = fork();
     if (srvpid < 0) {
         twarn("fork");
@@ -185,21 +369,71 @@ mustforksrv(void)
     }
 
     if (srvpid > 0) {
+        close(ready[1]);
+        close(sigpipe[1]);
+        if (srvsigfd >= 0)
+            close(srvsigfd);
+        srvsigfd = sigpipe[0];
         // On exit the parent (test) sends SIGTERM to the child.
         atexit(kill_srvpid);
+        char go;
+        ssize_t n = recv(ready[0], &go, 1, 0);
+        close(ready[0]);
+        assertf(n == 1, "setup: the server did not come up");
+        srvport = port;
         printf("start server port=%d pid=%d\n", port, srvpid);
         return port;
     }
 
     /* now in child */
 
+    close(ready[0]);
+    close(sigpipe[0]);
+    srvsigwfd = sigpipe[1];
+    // Before the handler: srv_wake() is a no-op while the eventfd does
+    // not exist, and then a SIGTERM arriving while srvserve is parked in
+    // epoll would sit on the flag until the next natural wake-up — up to
+    // an hour on an idle server.
+    if (srv_wake_init() == -1) {
+        twarn("srv_wake_init");
+        exit(111);
+    }
     set_sig_handler();
     prot_init();
 
     srv_acquire_wal(&srv);
 
-    srvserve(&srv); /* does not return */
-    exit(1); /* satisfy the compiler */
+    for (;;) {
+        ssize_t w = send(ready[1], "1", 1, 0);
+        if (w == 1)
+            break;
+        if (w == -1 && (errno == EINTR || errno == EAGAIN
+                        || errno == EWOULDBLOCK))
+            continue;
+        break;
+    }
+    close(ready[1]);
+
+    srvserve(&srv);
+    // exit(), not _exit(). exit() in a process forked out of a
+    // sanitizer-instrumented parent IS a real hazard — the child
+    // inherits the runtime's locks without the threads that would
+    // release them — and this was _exit for a while because of it. Two
+    // things settled it back:
+    //
+    //   the hazard is not what makes cttest_binlog_empty_exit time out
+    //   under TSan (switching to _exit did not move the rate), and
+    //
+    //   _exit costs the coverage of every forked server, which is most
+    //   of prot.c: 82.2% with exit(), 39.9% with _exit plus a
+    //   weakly-declared __gcov_dump. The weak declaration is why — a
+    //   weak REFERENCE does not pull the defining member out of
+    //   libgcov, so the pointer stays null and the dump is skipped in
+    //   silence. That is issue #443's reason for exit() being here.
+    //
+    // A speculative fix that missed its target and halved a measurement
+    // is not a fix.
+    exit(1);
 }
 
 static char *
@@ -236,15 +470,37 @@ mustforksrv_unix(void)
 
     srv_acquire_wal(&srv);
 
-    srvserve(&srv); /* does not return */
-    exit(1); /* satisfy the compiler */
+    srvserve(&srv);
+    // exit(), not _exit(). exit() in a process forked out of a
+    // sanitizer-instrumented parent IS a real hazard — the child
+    // inherits the runtime's locks without the threads that would
+    // release them — and this was _exit for a while because of it. Two
+    // things settled it back:
+    //
+    //   the hazard is not what makes cttest_binlog_empty_exit time out
+    //   under TSan (switching to _exit did not move the rate), and
+    //
+    //   _exit costs the coverage of every forked server, which is most
+    //   of prot.c: 82.2% with exit(), 39.9% with _exit plus a
+    //   weakly-declared __gcov_dump. The weak declaration is why — a
+    //   weak REFERENCE does not pull the defining member out of
+    //   libgcov, so the pointer stays null and the dump is skipped in
+    //   silence. That is issue #443's reason for exit() being here.
+    //
+    // A speculative fix that missed its target and halved a measurement
+    // is not a fix.
+    exit(1);
 }
 
 static char *
 readline(int fd)
 {
     char c = 0, p = 0;
-    static char buf[1024];
+    // Must exceed STATS_BUF_SIZE (4096): the global `stats` YAML block
+    // arrives as ONE line (it terminates with \r\n) and is well over
+    // 1KB, so the old 1024-byte buffer made bare `stats` untestable
+    // from this file at all.
+    static char buf[8192];
     fd_set rfd;
     struct timeval tv;
 
@@ -309,6 +565,50 @@ ckrespsub(int fd, char *sub)
     assertf(strstr(line, sub), "\"%s\" not in \"%s\"", sub, line);
 }
 
+// Asserts that `sub` is absent from the next reply line. Used where the
+// promise is that a field must NOT carry a particular value (e.g.
+// time-left on a job where the number is meaningful).
+static void
+cknotsub(int fd, char *sub)
+{
+    char *line = readline(fd);
+    assertf(!strstr(line, sub), "\"%s\" must NOT appear in \"%s\"", sub, line);
+}
+
+// Asserts the server closed the connection: readable, and the read
+// returns 0 bytes. A server that merely stops answering fails on the
+// select, one that keeps the socket open fails on the read.
+static void
+ckeof(int fd)
+{
+    char c;
+    fd_set rfd;
+    struct timeval tv;
+
+    FD_ZERO(&rfd);
+    FD_SET(fd, &rfd);
+    tv.tv_sec = timeout / 1000000000;
+    tv.tv_usec = (timeout / 1000) % 1000000;
+    int r = select(fd + 1, &rfd, NULL, NULL, &tv);
+    assertf(r == 1,
+            "server must close the connection, select returned %d", r);
+    r = (int)read(fd, &c, 1);
+    assertf(r == 0,
+            "server must send EOF, read returned %d (byte 0x%02x)",
+            r, (unsigned char)c);
+}
+
+// Sleeps until the absolute deadline (nanoseconds), so a probe lands at
+// a known offset from an event instead of drifting with the round trips
+// spent in between.
+static void
+sleep_until(int64 deadline)
+{
+    int64 d = deadline - nanoseconds();
+    if (d > 0)
+        usleep((useconds_t)(d / 1000));
+}
+
 static void
 writefull(int fd, char *s, int n)
 {
@@ -351,6 +651,31 @@ cttest_unknown_command()
     int fd = mustdiallocal(port);
     mustsend(fd, "nont10knowncommand\r\n");
     ckresp(fd, "UNKNOWN_COMMAND\r\n");
+
+    // 'n' is not even a case label in which_cmd, so the line above only
+    // ever reaches the final `return OP_UNKNOWN` — it cannot see any
+    // loosening of the dispatcher. The contract that can regress is the
+    // strict-prefix one (#723/#P1/#P2): a NEAR MISS of a real verb must
+    // not dispatch as that verb. Each impostor below enters a live case
+    // label and is stopped only by the guard named beside it.
+    mustsend(fd, "sleep\r\n");          // memcmp(cmd, "stats", 5) guard
+    ckresp(fd, "UNKNOWN_COMMAND\r\n");
+    mustsend(fd, "pexk 1\r\n");         // peek's cmd[2..4]=="ek " peek
+    ckresp(fd, "UNKNOWN_COMMAND\r\n");
+    mustsend(fd, "kxck 1\r\n");         // kick's cmd[1..4]=="ick " peek
+    ckresp(fd, "UNKNOWN_COMMAND\r\n");
+    mustsend(fd, "quitNOW\r\n");        // quit's exact cmd_len gate
+    ckresp(fd, "UNKNOWN_COMMAND\r\n");
+    mustsend(fd, "reserve-xyz 1\r\n");  // reserve-* full strncmp
+    ckresp(fd, "UNKNOWN_COMMAND\r\n");
+    mustsend(fd, "purge 1\r\n");        // 'p' branch, cmd[1] not u/e/a
+    ckresp(fd, "UNKNOWN_COMMAND\r\n");
+
+    // Every impostor left the connection usable: a `quitNOW` that had
+    // reached OP_QUIT would have closed it, and the next command would
+    // die on the read instead of answering.
+    mustsend(fd, "use survivor\r\n");
+    ckresp(fd, "USING survivor\r\n");
 }
 
 void
@@ -368,6 +693,30 @@ cttest_too_long_commandline()
     mustsend(fd, "put 0 0 1 1\r\n");
     mustsend(fd, "A\r\n");
     ckresp(fd, "INSERTED 1\r\n");
+
+    // 502 bytes says nothing about WHERE the cliff is. protocol.txt:45
+    // promises it at "224 bytes including \r\n", so pin both sides with
+    // lines that differ only in length. An off-by-one or a raised limit
+    // moves exactly one of these two replies.
+    char line[512];
+    memset(line, 'z', 222);
+    line[222] = '\r';
+    line[223] = '\n';
+    line[224] = '\0';
+    mustsend(fd, line);                 // 224 bytes: inside the limit
+    ckresp(fd, "UNKNOWN_COMMAND\r\n");  // ...so it is PARSED, then rejected
+
+    memset(line, 'z', 224);
+    line[224] = '\r';
+    line[225] = '\n';
+    line[226] = '\0';
+    mustsend(fd, line);                 // 226 bytes: over the limit
+    ckresp(fd, "BAD_FORMAT\r\n");
+
+    // ...and the stream is still in sync after the boundary case too.
+    mustsend(fd, "put 0 0 1 1\r\n");
+    mustsend(fd, "B\r\n");
+    ckresp(fd, "INSERTED 2\r\n");
 }
 
 void
@@ -430,9 +779,41 @@ void
 cttest_unix_auto_removal()
 {
     // Twice, to trigger autoremoval
-    SERVER_UNIX();
+    char *path = SERVER_UNIX();
+    struct stat before;
+    assertf(stat(path, &before) == 0,
+            "first server must bind a socket at %s", path);
+    assertf(S_ISSOCK(before.st_mode),
+            "%s must be a socket, got mode 0%o",
+            path, (unsigned)before.st_mode);
     kill_srvpid();
-    SERVER_UNIX();
+
+    // The socket file outlives the dead server; the next start must
+    // REMOVE it and bind a fresh one.
+    struct stat stale;
+    assertf(stat(path, &stale) == 0,
+            "the stale socket file must survive the killed server");
+
+    path = SERVER_UNIX();
+    struct stat after;
+    assertf(stat(path, &after) == 0,
+            "second server must leave a socket at %s", path);
+    assertf(after.st_ino != stale.st_ino || after.st_dev != stale.st_dev,
+            "stale socket was bound on top of, not removed: inode %llu "
+            "unchanged", (unsigned long long)after.st_ino);
+
+    // The body of this test used to be three calls and no assertion at
+    // all: a second server that accepted nothing would have passed.
+    // Dial the new socket and make it answer.
+    int fd = mustdialunix(path);
+    mustsend(fd, "put 0 0 1 1\r\n");
+    mustsend(fd, "a\r\n");
+    ckresp(fd, "INSERTED 1\r\n");
+    mustsend(fd, "peek 1\r\n");
+    ckresp(fd, "FOUND 1 1\r\n");
+    ckresp(fd, "a\r\n");
+
+    unlink(path);
 }
 
 void
@@ -646,6 +1027,27 @@ cttest_underscore()
     int fd = mustdiallocal(port);
     mustsend(fd, "use x_y\r\n");
     ckresp(fd, "USING x_y\r\n");
+
+    // The 'u' branch is a single TEST_CMD; replaced by an unconditional
+    // `return OP_USE` the line above still passes. A near miss must not.
+    mustsend(fd, "uXX x_y\r\n");
+    ckresp(fd, "UNKNOWN_COMMAND\r\n");
+
+    // The other half of the contract is the tube-name charset: one legal
+    // character proves nothing about the rejected ones. A name may not
+    // begin with '-', may not be empty, and may hold only the documented
+    // characters — trailing garbage after a valid run is not a name.
+    mustsend(fd, "use -lead\r\n");
+    ckresp(fd, "BAD_FORMAT\r\n");
+    mustsend(fd, "use a*b\r\n");
+    ckresp(fd, "BAD_FORMAT\r\n");
+    mustsend(fd, "use \r\n");
+    ckresp(fd, "BAD_FORMAT\r\n");
+
+    // ...while every documented punctuation character must be accepted,
+    // not just the underscore.
+    mustsend(fd, "use a+b/c;d.e$f_g()-2\r\n");
+    ckresp(fd, "USING a+b/c;d.e$f_g()-2\r\n");
 }
 
 void
@@ -656,6 +1058,26 @@ cttest_2cmdpacket()
     mustsend(fd, "use a\r\nuse b\r\n");
     ckresp(fd, "USING a\r\n");
     ckresp(fd, "USING b\r\n");
+
+    // The hostile half of the same code path: a command SPLIT across
+    // segments. scan_line_end resumes from prev_read-1 precisely so a
+    // boundary-straddling line still terminates; a single well-formed
+    // packet can never exercise that.
+    mustsend(fd, "use spl");
+    mustsend(fd, "it\r\n");
+    ckresp(fd, "USING split\r\n");
+
+    // Worst split of all: \r and \n in different segments.
+    mustsend(fd, "use halved\r");
+    mustsend(fd, "\n");
+    ckresp(fd, "USING halved\r\n");
+
+    // One segment, three DIFFERENT verbs: with only 'use' in the packet
+    // a which_cmd regression on any other branch stays invisible here.
+    mustsend(fd, "watch w1\r\nlist-tube-used\r\nuse w2\r\n");
+    ckresp(fd, "WATCHING 2\r\n");
+    ckresp(fd, "USING halved\r\n");
+    ckresp(fd, "USING w2\r\n");
 }
 
 void
@@ -780,6 +1202,54 @@ cttest_multi_tube()
     // First ready tube is abc (added first), so job 1 is reserved.
     mustsend(fd, "reserve\r\n");
     ckresp(fd, "RESERVED 1 0\r\n");
+    // The job body follows the RESERVED line — job 1 was put with a
+    // zero-length body, so a bare CRLF. Leaving it in the socket
+    // desynchronises every later exchange on this connection.
+    ckresp(fd, "\r\n");
+
+    // Two tubes holding one job each cannot exercise ordering WITHIN a
+    // tube, so a ready heap rebuilt as pure FIFO (priority ignored
+    // outright) leaves everything above green. protocol.txt:218-220:
+    // "beanstalkd will choose the one with the smallest priority value.
+    // Within each priority, it will choose the one that was received
+    // first." Put four jobs in one tube, out of priority order, and
+    // walk the whole promise: priority first, FIFO inside a priority.
+    mustsend(fd, "use ghi\r\n");
+    ckresp(fd, "USING ghi\r\n");
+    mustsend(fd, "put 700 0 100 1\r\n"); // id 3: lowest priority
+    mustsend(fd, "d\r\n");
+    ckresp(fd, "INSERTED 3\r\n");
+    mustsend(fd, "put 10 0 100 1\r\n");  // id 4: most urgent
+    mustsend(fd, "a\r\n");
+    ckresp(fd, "INSERTED 4\r\n");
+    mustsend(fd, "put 300 0 100 1\r\n"); // id 5: middle, arrived first
+    mustsend(fd, "b\r\n");
+    ckresp(fd, "INSERTED 5\r\n");
+    mustsend(fd, "put 300 0 100 1\r\n"); // id 6: same priority, later
+    mustsend(fd, "c\r\n");
+    ckresp(fd, "INSERTED 6\r\n");
+
+    mustsend(fd, "watch ghi\r\n");
+    ckresp(fd, "WATCHING 4\r\n");
+    mustsend(fd, "ignore abc\r\n");
+    ckresp(fd, "WATCHING 3\r\n");
+    mustsend(fd, "ignore def\r\n");
+    ckresp(fd, "WATCHING 2\r\n");
+    mustsend(fd, "ignore default\r\n");
+    ckresp(fd, "WATCHING 1\r\n");
+
+    mustsend(fd, "reserve\r\n");
+    ckresp(fd, "RESERVED 4 1\r\n");      // pri 10 beats every later put
+    ckresp(fd, "a\r\n");
+    mustsend(fd, "reserve\r\n");
+    ckresp(fd, "RESERVED 5 1\r\n");      // pri 300, the earlier of the pair
+    ckresp(fd, "b\r\n");
+    mustsend(fd, "reserve\r\n");
+    ckresp(fd, "RESERVED 6 1\r\n");      // pri 300, arrived second
+    ckresp(fd, "c\r\n");
+    mustsend(fd, "reserve\r\n");
+    ckresp(fd, "RESERVED 3 1\r\n");      // pri 700 last, though put first
+    ckresp(fd, "d\r\n");
 }
 
 void
@@ -844,6 +1314,30 @@ cttest_omit_time_left()
     mustsend(fd, "stats-job 1\r\n");
     ckrespsub(fd, "OK ");
     ckrespsub(fd, "\ntime-left: 0\n");
+
+    // protocol.txt:483-485 makes time-left meaningful for exactly two
+    // states — reserved and delayed — and this test reaches neither.
+    // Reporting 0 for a job that really is counting down is the
+    // regression the field can suffer; a ready job's 0 cannot see it.
+    mustsend(fd, "reserve\r\n");
+    ckresp(fd, "RESERVED 1 1\r\n");
+    ckresp(fd, "a\r\n");
+    mustsend(fd, "stats-job 1\r\n");
+    ckrespsub(fd, "OK ");
+    ckrespsub(fd, "\nstate: reserved\n");
+    mustsend(fd, "stats-job 1\r\n");
+    ckrespsub(fd, "OK ");
+    cknotsub(fd, "\ntime-left: 0\n");
+
+    mustsend(fd, "put 0 9 5 1\r\n");
+    mustsend(fd, "b\r\n");
+    ckresp(fd, "INSERTED 2\r\n");
+    mustsend(fd, "stats-job 2\r\n");
+    ckrespsub(fd, "OK ");
+    ckrespsub(fd, "\nstate: delayed\n");
+    mustsend(fd, "stats-job 2\r\n");
+    ckrespsub(fd, "OK ");
+    cknotsub(fd, "\ntime-left: 0\n");
 }
 
 void
@@ -861,6 +1355,7 @@ cttest_delayed_to_ready()
 {
     int port = SERVER();
     int fd = mustdiallocal(port);
+    int64 put_at = nanoseconds();
     mustsend(fd, "put 0 1 1 0\r\n");
     mustsend(fd, "\r\n");
     ckresp(fd, "INSERTED 1\r\n");
@@ -876,6 +1371,18 @@ cttest_delayed_to_ready()
     mustsend(fd, "stats-tube default\r\n");
     ckrespsub(fd, "OK ");
     ckrespsub(fd, "\ntotal-jobs: 1\n");
+
+    // Lower bound. "delay 1" promises the job is NOT ready before the
+    // second is up; the checks above run at t≈0 and the ones below at
+    // t≈1.01s, so promoting the job 100ms early is invisible to both.
+    // Probe at 0.93s measured from the put, not from here.
+    sleep_until(put_at + 930000000LL);
+    mustsend(fd, "stats-tube default\r\n");
+    ckrespsub(fd, "OK ");
+    ckrespsub(fd, "\ncurrent-jobs-delayed: 1\n");
+    mustsend(fd, "stats-tube default\r\n");
+    ckrespsub(fd, "OK ");
+    ckrespsub(fd, "\ncurrent-jobs-ready: 0\n");
 
     usleep(1010000); // 1.01 sec
 
@@ -1005,6 +1512,30 @@ cttest_stats_tube()
     mustsend(fd, "stats-tube default\r\n");
     ckrespsub(fd, "OK ");
     ckrespsub(fd, "\npause-time-left: 0\n");
+
+    // Bare "stats" is sent nowhere else in this file, so the exact
+    // cmd_len==7 gate that separates OP_STATS from "stats-job" /
+    // "stats-tube" has no guard here at all. These three fields exist
+    // ONLY in the global block: current-jobs-delayed is prot.c's
+    // delayed_ct, current-tubes is tubes.len.
+    mustsend(fd, "stats\r\n");
+    ckrespsub(fd, "OK ");
+    ckrespsub(fd, "\ncurrent-jobs-delayed: 0\n");
+    mustsend(fd, "stats\r\n");
+    ckrespsub(fd, "OK ");
+    ckrespsub(fd, "\ncmd-delete: 1\n");
+    mustsend(fd, "stats\r\n");
+    ckrespsub(fd, "OK ");
+    ckrespsub(fd, "\ncurrent-tubes: 2\n");
+
+    // Near-miss verbs on the same 's' branch. protocol.txt (fork note,
+    // "Wire-observable differences") promises that "command dispatch
+    // matches literal prefixes strictly"; the #P1 fix tightened only
+    // the leading "stats". A verb that is not the literal "stats-tube "
+    // must not reach the stats-tube handler and hand back a tube's
+    // stats block.
+    mustsend(fd, "stats-tuba tubea\r\n");
+    ckresp(fd, "UNKNOWN_COMMAND\r\n");
 }
 
 void
@@ -1091,11 +1622,20 @@ cttest_reserve_with_timeout_2conns()
     fd1 = mustdiallocal(port);
     mustsend(fd0, "watch foo\r\n");
     ckresp(fd0, "WATCHING 2\r\n");
+    int64 began = nanoseconds();
     mustsend(fd0, "reserve-with-timeout 1\r\n");
     mustsend(fd1, "watch foo\r\n");
     ckresp(fd1, "WATCHING 2\r\n");
     timeout = 1100000000; // 1.1s
     ckresp(fd0, "TIMED_OUT\r\n");
+    // The read timeout above is only an UPPER bound: firing the reserve
+    // timeout after 100ms also produces TIMED_OUT. protocol.txt:220-224
+    // promises the timeout LIMITS how long the client blocks, so a
+    // requested 1s must not expire before 1s has actually passed.
+    int64 waited = nanoseconds() - began;
+    assertf(waited >= 1000000000LL,
+            "reserve-with-timeout 1 fired after %lld ns, before the "
+            "requested 1s", (long long)waited);
 }
 
 void
@@ -1391,6 +1931,17 @@ cttest_quit_releases_job()
     ckrespsub(prod, "OK ");
     ckrespsub(prod, "\nstate: reserved\n");
 
+    // Everything up to here is what cttest_close_releases_job already
+    // gets from closing the socket. The part specific to `quit` is its
+    // exact-length gate: without it "quitXYZ\r\n" silently closes a live
+    // connection (#723). The impostor must be rejected AND leave the
+    // reservation standing.
+    mustsend(cons, "quitTHIS\r\n");
+    ckresp(cons, "UNKNOWN_COMMAND\r\n");
+    mustsend(prod, "stats-job 1\r\n");
+    ckrespsub(prod, "OK ");
+    ckrespsub(prod, "\nstate: reserved\n");
+
     // Quitting consumer should make the job ready sooner than ttr=100.
     mustsend(cons, "quit\r\n");
 
@@ -1399,6 +1950,11 @@ cttest_quit_releases_job()
     mustsend(prod, "reserve-with-timeout 1\r\n");
     ckresp(prod, "RESERVED 1 1\r\n");
     ckresp(prod, "a\r\n");
+
+    // ...and `quit` must actually CLOSE the connection, which nothing in
+    // this test observed: a quit that merely released the job and kept
+    // the socket open passed everything above.
+    ckeof(cons);
 }
 
 void
@@ -1469,6 +2025,22 @@ cttest_list_tube()
 
     mustsend(fd0, "ignore w\r\n");
     ckresp(fd0, "NOT_IGNORED\r\n");
+
+    // Every command above is a literal verb, so the 'l' branch's strict
+    // memcmp guard (#P2) is untouched: dropping it lets any 12-byte
+    // command with cmd[9]=='s' dispatch as list-tubes and dump the tube
+    // namespace this test has just built up.
+    mustsend(fd0, "lisT-tubes\r\n");    // 12 bytes, cmd[9]=='s'
+    ckresp(fd0, "UNKNOWN_COMMAND\r\n");
+    mustsend(fd0, "l-ist-ubes\r\n");    // 12 bytes, cmd[9]=='s'
+    ckresp(fd0, "UNKNOWN_COMMAND\r\n");
+    mustsend(fd0, "list-tubesX\r\n");   // right prefix, wrong length
+    ckresp(fd0, "UNKNOWN_COMMAND\r\n");
+
+    // Positive control on the same branch: the real verb still answers,
+    // so the guard rejects impostors without shadowing the command.
+    mustsend(fd0, "list-tube-used\r\n");
+    ckresp(fd0, "USING u\r\n");
 }
 
 #define STRING_LEN_200  \
@@ -1507,13 +2079,42 @@ cttest_binlog_empty_exit()
     job_data_size_limit = 10;
 
     int port = SERVER();
+    // SERVER() now returns only once the child is serving (mustforksrv's
+    // ready pipe), so the kill below cannot land before walinit has made
+    // the binlog this test is about.
     kill_srvpid();
+
+    // The name promises something about the binlog after a clean exit,
+    // and nothing about the binlog was ever looked at. A shutdown that
+    // unlinks or truncates binlog.1 still lets the next server accept a
+    // put — only a replay notices.
+    char *b1 = fmtalloc("%s/binlog.1", ctdir());
+    assertf(exist(b1),
+            "a clean exit with an empty queue must still leave %s", b1);
+    int hdr = filesize(b1);
+    assertf(hdr >= (int)sizeof(int),
+            "%s must carry at least the version header, got %d bytes",
+            b1, hdr);
 
     port = SERVER();
     int fd = mustdiallocal(port);
     mustsend(fd, "put 0 0 0 0\r\n");
     mustsend(fd, "\r\n");
     ckresp(fd, "INSERTED 1\r\n");
+
+    // The acked put must survive the SECOND clean exit: this is the
+    // whole reason the WAL file has to be there and intact.
+    kill_srvpid();
+    assertf(exist(b1), "%s must survive the second clean exit", b1);
+
+    port = SERVER();
+    fd = mustdiallocal(port);
+    mustsend(fd, "peek 1\r\n");
+    ckresp(fd, "FOUND 1 0\r\n");
+    ckresp(fd, "\r\n");
+    mustsend(fd, "delete 1\r\n");
+    ckresp(fd, "DELETED\r\n");
+    free(b1);
 }
 
 void
@@ -1713,6 +2314,30 @@ cttest_binlog_disk_full()
     mustsend(fd, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\n");
     ckresp(fd, "INSERTED 9\r\n");
 
+    // Everything so far is in-memory: a failed falloc that left a
+    // half-written record behind in binlog.1 replies exactly the same.
+    // Restart and replay — that is the only thing that reads the bytes
+    // the ENOSPC episode wrote. rawfalloc is restored first so the
+    // fresh server can open its own files.
+    falloc = rawfalloc;
+    // Replay reserves a delete record per surviving job; give the fresh
+    // server room to allocate for them instead of re-entering ENOSPC.
+    srv.wal.filesize = 32768;
+    kill_srvpid();
+    port = SERVER();
+    fd = mustdiallocal(port);
+
+    // Every acked job survived...
+    mustsend(fd, "peek 1\r\n");
+    ckresp(fd, "FOUND 1 50\r\n");
+    ckresp(fd, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\n");
+    mustsend(fd, "peek 9\r\n");
+    ckresp(fd, "FOUND 9 50\r\n");
+    ckresp(fd, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\n");
+    // ...and the put that answered OUT_OF_MEMORY left no ghost job.
+    mustsend(fd, "peek 5\r\n");
+    ckresp(fd, "NOT_FOUND\r\n");
+
     mustsend(fd, "delete 1\r\n");
     ckresp(fd, "DELETED\r\n");
     mustsend(fd, "delete 2\r\n");
@@ -1783,6 +2408,27 @@ cttest_binlog_disk_full_delete()
     assert(exist(b1));
     free(b1);
 
+    // "the file exists" is the weakest possible check on a WAL. Restart
+    // and replay it: a half-written record left by the failed falloc,
+    // or a ghost record for the put that answered OUT_OF_MEMORY, only
+    // shows on the way back in.
+    falloc = rawfalloc;
+    // Replay reserves a delete record per surviving job; give the fresh
+    // server room to allocate for them instead of re-entering ENOSPC.
+    srv.wal.filesize = 32768;
+    kill_srvpid();
+    port = SERVER();
+    fd = mustdiallocal(port);
+
+    mustsend(fd, "peek 1\r\n");
+    ckresp(fd, "FOUND 1 50\r\n");
+    ckresp(fd, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\n");
+    mustsend(fd, "peek 8\r\n");
+    ckresp(fd, "FOUND 8 50\r\n");
+    ckresp(fd, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\n");
+    mustsend(fd, "peek 9\r\n");
+    ckresp(fd, "NOT_FOUND\r\n");
+
     mustsend(fd, "delete 1\r\n");
     ckresp(fd, "DELETED\r\n");
     mustsend(fd, "delete 2\r\n");
@@ -1802,7 +2448,7 @@ cttest_binlog_disk_full_delete()
 }
 
 static void
-bench_put_delete_size(int n, int size, int walsize, int sync, int64 syncrate_ms)
+bench_put_delete_size(int n, int bodylen, int walsize, int sync, int64 syncrate_ms)
 {
     if (walsize > 0) {
         srv.wal.dir = ctdir();
@@ -1816,11 +2462,11 @@ bench_put_delete_size(int n, int size, int walsize, int sync, int64 syncrate_ms)
     int port = SERVER();
     int fd = mustdiallocal(port);
     char buf[50], put[50];
-    char body[size+1];
-    memset(body, 'a', size);
-    body[size] = 0;
-    ctsetbytes(size);
-    sprintf(put, "put 0 0 0 %d\r\n", size);
+    char body[bodylen+1];
+    memset(body, 'a', bodylen);
+    body[bodylen] = 0;
+    ctsetbytes(bodylen);
+    sprintf(put, "put 0 0 0 %d\r\n", bodylen);
     ctresettimer();
     int i;
     for (i = 0; i < n; i++) {

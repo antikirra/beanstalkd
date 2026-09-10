@@ -13,22 +13,40 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <fcntl.h>
 
 // Exposed from prot.c for hostile error-path testing.
-extern int kick_buried_job(Server *s, Job *j);
-extern int kick_delayed_job(Server *s, Job *j);
 extern int bury_job(Server *s, Job *j, char update_store);
 extern struct stats global_stat;
-extern void prot_init();
 
 static void
 setup(void)
 {
     fault_clear_all();
     progname = "testinject";
+}
+
+static int
+exist_file(const char *path)
+{
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+// Substring search over raw bytes (memmem is a _GNU_SOURCE extension and
+// this tree builds without it).
+static int
+bytes_contain(const char *hay, size_t hlen, const char *needle, size_t nlen)
+{
+    if (nlen > hlen)
+        return 0;
+    for (size_t i = 0; i + nlen <= hlen; i++)
+        if (memcmp(hay + i, needle, nlen) == 0)
+            return 1;
+    return 0;
 }
 
 
@@ -51,6 +69,11 @@ cttest_inject_job_copy_oom(void)
 {
     setup();
     Tube *t = make_tube("copysrc");
+    // make_tube hands back a tube with no reference of its own:
+    // the job's TUBE_ASSIGN below is the only holder, so freeing
+    // the job would free the tube under the tube_dref at the end
+    // of this test. Hold one for the duration.
+    tube_iref(t);
     assertf(t, "tube must allocate for test setup");
 
     Job *orig = make_job(10, 0, 1000000000LL, 8, t);
@@ -101,6 +124,12 @@ cttest_inject_heapinsert_oom(void)
     Job *j3 = allocate_job(0);
     assertf(j3, "j3 must allocate");
     j3->r.pri = 3; j3->r.id = 3;
+    // Sentinel: heapinsert must not have told the rejected element where
+    // it sits. A `set()` (or a bare data[len] store) hoisted above the
+    // realloc check leaves an element beyond len that later readers of
+    // cap would follow — invisible to len/cap/data[0] alone.
+    const size_t nowhere = (size_t)0xDEAD;
+    j3->heap_index = nowhere;
 
     fault_set(FAULT_REALLOC, 0, ENOMEM);
     int r = heapinsert(&h, j3);
@@ -108,6 +137,18 @@ cttest_inject_heapinsert_oom(void)
     assertf(h.len == 2, "heap len must stay 2 after OOM, got %zu", h.len);
     assertf(h.cap == 2, "heap cap must stay 2 after OOM, got %zu", h.cap);
     assertf(h.data[0] == j1, "heap root must still be j1 (pri=1)");
+    assertf(h.data[1] == j2, "surviving slot 1 must still hold j2");
+    assertf(j3->heap_index == nowhere,
+            "rejected element must not be positioned into the heap, "
+            "heap_index moved to %zu", j3->heap_index);
+
+    // ...and the heap is not merely intact-looking, it still works: both
+    // survivors come back out, in priority order, and nothing else does.
+    Job *out1 = heapremove(&h, 0);
+    Job *out2 = heapremove(&h, 0);
+    assertf(out1 == j1 && out2 == j2,
+            "post-OOM heap must drain j1 then j2 in priority order");
+    assertf(h.len == 0, "heap must be empty after draining, got %zu", h.len);
 
     free(h.data);
     job_free(j1);
@@ -198,18 +239,52 @@ cttest_inject_fileinit_oom(void)
     assertf(!f.path, "f.path must be NULL after fmtalloc failure");
 }
 
+// Returns the descriptor number the NEXT open() in this process will be
+// handed (open returns the lowest free fd). Probing it before arming a
+// fault lets the caller prove afterwards that the slot is still free —
+// i.e. that the failure path leaked nothing.
+static int
+probe_next_fd(void)
+{
+    int fd = open("/dev/null", O_RDONLY);
+    assertf(fd >= 0, "probe open must succeed");
+    close(fd);
+    return fd;
+}
+
 void
 cttest_inject_filewopen_open_fail(void)
 {
     setup();
+    char path[80];
+    snprintf(path, sizeof path,
+             "/tmp/testinject_open_fail_%d.wal", (int)getpid());
+    unlink(path);
+
     Wal w = {.filesize = 4096};
     File f = {.w = &w, .iswopen = 0, .fd = -1};
-    f.path = "/tmp/testinject_open_fail.wal";
+    f.path = path;
 
+    int slot = probe_next_fd();
     fault_set(FAULT_OPEN, 0, EMFILE);
     filewopen(&f);
     assertf(!f.iswopen,
             "filewopen must not set iswopen when open fails");
+    // iswopen was already 0 on the way in, so the assertion above is
+    // near-vacuous on its own. The contract that can actually break on
+    // the EMFILE path is resource hygiene: nothing half-opened is kept.
+    assertf(f.fd == -1,
+            "failed open must leave f.fd untouched, got %d", f.fd);
+    assertf(f.free == 0 && f.resv == 0,
+            "failed open must not publish space (free=%d resv=%d)",
+            f.free, f.resv);
+    assertf(fcntl(slot, F_GETFD) == -1,
+            "filewopen leaked descriptor %d on the open-failure path — "
+            "the exact exhaustion EMFILE models", slot);
+    assertf(!exist_file(path),
+            "a failed open must leave no file behind at %s", path);
+
+    unlink(path);
 }
 
 static int
@@ -223,19 +298,37 @@ void
 cttest_inject_filewopen_write_fail(void)
 {
     setup();
+    char path[80];
+    snprintf(path, sizeof path,
+             "/tmp/testinject_write_fail_%d.wal", (int)getpid());
+    unlink(path);
+
     Wal w = {.filesize = 64};
     File f = {.w = &w, .iswopen = 0, .fd = -1};
-    f.path = "/tmp/testinject_write_fail.wal";
+    f.path = path;
 
     FAlloc saved = falloc;
     falloc = noop_falloc;
 
+    int slot = probe_next_fd();
     fault_set(FAULT_WRITE, 0, EIO);
     filewopen(&f);
     assertf(!f.iswopen,
             "filewopen must not set iswopen when write fails");
+    // This path DID open (and create) the file before failing, so it is
+    // the one that can really leak: the descriptor must be closed and
+    // the half-born WAL file unlinked, or a restart replays a binlog
+    // holding only a version header and no records.
+    assertf(f.fd == -1,
+            "failed header write must leave f.fd untouched, got %d", f.fd);
+    assertf(fcntl(slot, F_GETFD) == -1,
+            "filewopen leaked descriptor %d on the write-failure path",
+            slot);
+    assertf(!exist_file(path),
+            "filewopen must unlink the half-created file at %s", path);
 
     falloc = saved;
+    unlink(path);
 }
 
 
@@ -282,6 +375,11 @@ cttest_inject_job_lifecycle_survives_oom(void)
 {
     setup();
     Tube *t = make_tube("lifecycle");
+    // make_tube hands back a tube with no reference of its own:
+    // the job's TUBE_ASSIGN below is the only holder, so freeing
+    // the job would free the tube under the tube_dref at the end
+    // of this test. Hold one for the duration.
+    tube_iref(t);
     assertf(t, "tube must allocate");
 
     Job *j = make_job(1, 0, 1000000000LL, 16, t);
@@ -675,6 +773,18 @@ cttest_inject_kick_buried_heapinsert_oom_walresv(void)
             "ready heap must be empty after rollback, got len=%zu",
             t->ready.len);
 
+    // state==Buried and a balanced counter are both true of a job that
+    // was dropped on the floor: the rollback's job is to put it back on
+    // the tube's buried CHAIN, which is what `peek-buried` and the next
+    // `kick` walk. Nothing above reads that chain.
+    assertf(!job_list_is_empty(&t->buried),
+            "rollback must re-link the job into the tube's buried list");
+    assertf(t->buried.next == j,
+            "the rolled-back job must be the head of the buried list");
+    assertf(j->reserver == NULL,
+            "a buried job must have no reserver, got %p",
+            (void *)j->reserver);
+
     // Cleanup.
     job_list_remove(j);
     global_stat.buried_ct--;
@@ -790,6 +900,18 @@ cttest_inject_kick_delayed_heapinsert_oom_walresv(void)
             t->delay.len);
     assertf(t->ready.len == 0,
             "ready heap must be empty, got len=%zu", t->ready.len);
+
+    // state==Delayed and delay.len==1 say the job is back on the TUBE's
+    // heap; they say nothing about the tube being back in the global
+    // delay_tube_heap. Drop delay_tube_update() from enqueue_job's delay
+    // branch and every assertion above still holds — while
+    // soonest_delayed_job never sees this tube again and every delayed
+    // job in it stops becoming ready, forever.
+    assertf(t->in_delay_heap == 1,
+            "the fallback enqueue must re-register the tube in the global "
+            "delay heap, got in_delay_heap=%d", t->in_delay_heap);
+    assertf(t->delay.data[0] == j,
+            "the fallback job must be the tube's soonest delayed job");
 
     // Cleanup for valgrind/ASan mode: fork isolation drops the rest.
     heapremove(&t->delay, 0);
@@ -921,7 +1043,17 @@ cttest_inject_durable_fdatasync_fires_once_on_success(void)
     f.jlist.fnext = &f.jlist;
     w.cur = &f;
     w.tail = &f;
-    w.head = &f;
+    // head deliberately points at a DIFFERENT file whose descriptor is
+    // invalid. A counter of fdatasync calls cannot tell "synced w->cur"
+    // from "synced w->head" or from a stale dup; syncing anything but
+    // w->cur here fails with EBADF and turns the assertions below red.
+    File fh = {0};
+    fh.w = &w;
+    fh.fd = -1;
+    fh.refs = 2;
+    fh.jlist.fprev = &fh.jlist;
+    fh.jlist.fnext = &fh.jlist;
+    w.head = &fh;
     w.resv = 300;
 
     Tube *t = make_tube("durableok");
@@ -958,6 +1090,17 @@ cttest_inject_durable_fdatasync_fires_once_on_success(void)
             "no fault was armed; unexpected hits: %d",
             fault_hits(FAULT_FDATASYNC));
 
+    // Disk truth. Everything above is inferred from counters the test
+    // harness itself maintains; nothing proved a byte of this job left
+    // the process. Read the file back and find the body.
+    char disk[4096];
+    ssize_t got = pread(fd, disk, sizeof disk, 0);
+    assertf(got > (ssize_t)sizeof(int),
+            "the staged record must be on disk, file holds %zd bytes", got);
+    assertf(bytes_contain(disk, (size_t)got, "DDDDDDDDDD", 10),
+            "the committed record must carry the job body; %zd bytes on "
+            "disk hold no copy of it", got);
+
     close(fd);
     unlink(tmppath);
     job_free(j);
@@ -979,6 +1122,11 @@ cttest_inject_walwrite_refuses_when_durable_and_wal_disabled(void)
     };
 
     Tube *t = make_tube("cdone");
+    // make_tube hands back a tube with no reference of its own:
+    // the job's TUBE_ASSIGN below is the only holder, so freeing
+    // the job would free the tube under the tube_dref at the end
+    // of this test. Hold one for the duration.
+    tube_iref(t);
     assertf(t, "tube must allocate");
 
     Job *j = allocate_job(4);
@@ -989,10 +1137,33 @@ cttest_inject_walwrite_refuses_when_durable_and_wal_disabled(void)
     j->r.id = 1;
     memcpy(j->body, "data", 4);
 
+    // A refusal must also be a NO-OP: snapshot everything the write path
+    // would otherwise touch, so a disabled-WAL path that still bumped
+    // per-job or per-wal accounting cannot hide behind the return code.
+    int64 pre_nrec    = w.nrec;
+    int64 pre_alive   = w.alive;
+    int64 pre_resv    = w.resv;
+    int64 pre_walused = j->walused;
+    int64 pre_walresv = j->walresv;
+    File *pre_file    = j->file;
+
     int r = walwrite(&w, j);
     assertf(r == 0,
             "walwrite under -D with w->use=0 must refuse (return 0), got %d", r);
     assertf(w.use == 0, "WAL must remain disabled, got use=%d", w.use);
+    assertf(w.nrec == pre_nrec,
+            "a refused walwrite must not count a record: %" PRId64 " -> %"
+            PRId64, pre_nrec, w.nrec);
+    assertf(w.alive == pre_alive && w.resv == pre_resv,
+            "a refused walwrite must not move wal accounting "
+            "(alive %" PRId64 "->%" PRId64 ", resv %" PRId64 "->%" PRId64 ")",
+            pre_alive, w.alive, pre_resv, w.resv);
+    assertf(j->walused == pre_walused && j->walresv == pre_walresv,
+            "a refused walwrite must not move per-job accounting "
+            "(walused %" PRId64 "->%" PRId64 ", walresv %" PRId64 "->%"
+            PRId64 ")", pre_walused, j->walused, pre_walresv, j->walresv);
+    assertf(j->file == pre_file,
+            "a refused walwrite must not bind the job to a file");
 
     // Non-durable control: same state, wantsync off, durable_sync off
     // — legacy pass-through must still return 1.
@@ -1001,6 +1172,15 @@ cttest_inject_walwrite_refuses_when_durable_and_wal_disabled(void)
     assertf(r2 == 1,
             "walwrite in non-durable mode with w->use=0 must keep the "
             "legacy pass-through (return 1), got %d", r2);
+    // The pass-through is a pass-through, not a write: same no-op
+    // requirement, and this half shares the job with the durable half
+    // above, so unwatched drift here would be masked by ordering.
+    assertf(w2.nrec == 0 && w2.alive == 0 && w2.resv == 0,
+            "the legacy pass-through must not touch wal accounting "
+            "(nrec %" PRId64 ", alive %" PRId64 ", resv %" PRId64 ")",
+            w2.nrec, w2.alive, w2.resv);
+    assertf(j->walused == pre_walused && j->file == pre_file,
+            "the legacy pass-through must not move per-job accounting");
 
     job_free(j);
     tube_dref(t);
@@ -1024,6 +1204,11 @@ cttest_inject_walresv_refuses_when_durable_and_wal_disabled(void)
     setup();
 
     Tube *t = make_tube("cresv");
+    // make_tube hands back a tube with no reference of its own:
+    // the job's TUBE_ASSIGN below is the only holder, so freeing
+    // the job would free the tube under the tube_dref at the end
+    // of this test. Hold one for the duration.
+    tube_iref(t);
     assertf(t, "tube must allocate");
 
     Job *j = allocate_job(4);
@@ -1049,10 +1234,50 @@ cttest_inject_walresv_refuses_when_durable_and_wal_disabled(void)
     int r2 = walresvput(&w2, j);
     assertf(r2 > 0,
             "walresvput non-durable with w->use=0 must pass through, got %d", r2);
+    // ">0" accepts any positive number. reserve()'s disabled path is
+    // documented to keep the legacy return value 1 (NOT n), so pin it:
+    // handing back a byte count for a WAL that will never be written is
+    // a different bug than passing through.
+    assertf(r2 == 1,
+            "the disabled-WAL pass-through must return the legacy 1, got %d",
+            r2);
 
     int ru2 = walresvupdate(&w2);
     assertf(ru2 > 0,
             "walresvupdate non-durable with w->use=0 must pass through, got %d", ru2);
+    assertf(ru2 == 1,
+            "the disabled-WAL pass-through must return the legacy 1, got %d",
+            ru2);
+
+    // ...and on a LIVE wal the reservation must still cover both records
+    // a put eventually needs: its own full record AND the delete record
+    // that retires it. Dropping the delete-record allowance halves the
+    // reservation and wedges the WAL at delete time, which no ">0"
+    // assertion above can see.
+    Wal w3 = { .use = 1, .filesize = 100000 };
+    File f3 = {0};
+    f3.w = &w3;
+    f3.fd = -1;
+    f3.free = 100000;
+    f3.refs = 2;
+    f3.jlist.fprev = &f3.jlist;
+    f3.jlist.fnext = &f3.jlist;
+    w3.cur = &f3;
+    w3.tail = &f3;
+    w3.head = &f3;
+
+    int rp = walresvput(&w3, j);
+    int ru3 = walresvupdate(&w3);
+    assertf(rp > 0 && ru3 > 0,
+            "a live wal must reserve for both calls (put %d, update %d)",
+            rp, ru3);
+    assertf(rp == 2 * ru3 + (int)j->tube->name_len + j->r.body_size,
+            "a put must reserve one delete record MORE than an update "
+            "(want %d, got %d)",
+            2 * ru3 + (int)j->tube->name_len + j->r.body_size, rp);
+    assertf(w3.resv == (int64)(rp + ru3),
+            "every reserved byte must be accounted on the wal: want %d, "
+            "got %" PRId64, rp + ru3, w3.resv);
 
     job_free(j);
     tube_dref(t);
@@ -1083,6 +1308,20 @@ wait_for_sync_accept(Wal *w, int max_iterations)
     return 0;
 }
 
+// Spin until the wrapped fdatasync has been invoked at least `min`
+// times OR timeout. Proves the thread did the work, not just the
+// handshake: fault_calls counts every invocation, fault or not.
+static int
+wait_for_sync_calls(int min, int max_iterations)
+{
+    for (int i = 0; i < max_iterations; i++) {
+        if (fault_calls(FAULT_FDATASYNC) >= min)
+            return 1;
+        usleep(10000);
+    }
+    return 0;
+}
+
 // Spin until the atomic error slot is non-zero OR timeout.
 static int
 wait_for_sync_err(Wal *w, int max_iterations)
@@ -1103,6 +1342,10 @@ void
 cttest_inject_kick_buried_job_refuses_when_durable_and_wal_disabled(void)
 {
     setup();
+    // setup() never sets the process-wide clock, so the delayed fixture
+    // below used to inherit whatever the forked parent last left in
+    // `now` — its deadline meant nothing. Anchor it.
+    now = nanoseconds();
 
     // Minimal server shell with a disabled durable WAL.
     Server s = {0};
@@ -1110,6 +1353,11 @@ cttest_inject_kick_buried_job_refuses_when_durable_and_wal_disabled(void)
     s.wal.durable_sync = 1;
 
     Tube *t = make_tube("cdkick");
+    // make_tube hands back a tube with no reference of its own:
+    // the job's TUBE_ASSIGN below is the only holder, so freeing
+    // the job would free the tube under the tube_dref at the end
+    // of this test. Hold one for the duration.
+    tube_iref(t);
     assertf(t, "tube must allocate");
 
     // Buried setup: build a job, bury it by hand (we bypass the
@@ -1121,12 +1369,31 @@ cttest_inject_kick_buried_job_refuses_when_durable_and_wal_disabled(void)
     job_list_insert(&t->buried, j);
     t->stat.buried_ct = 1;
 
+    uint64 pre_global_buried = global_stat.buried_ct;
+    uint64 pre_tube_buried   = t->stat.buried_ct;
+    uint32 pre_kicks         = j->r.kick_ct;
+
     int r = kick_buried_job(&s, j);
     assertf(r == 0,
             "kick_buried_job under -D with w->use=0 must refuse, got %d", r);
     assertf(j->r.state == Buried,
             "job state must remain Buried after refused kick, got %d",
             j->r.state);
+    // j->r.state is the only thing the refusal used to be held to, so a
+    // counter that drifts on every refused kick in -D mode was free to
+    // go negative unobserved. A refusal is a no-op: every buries/kicks
+    // number a client can read must be exactly where it started.
+    assertf(global_stat.buried_ct == pre_global_buried,
+            "a refused kick must not move global buried_ct: %" PRIu64
+            " -> %" PRIu64, pre_global_buried, global_stat.buried_ct);
+    assertf(t->stat.buried_ct == pre_tube_buried,
+            "a refused kick must not move the tube's buried_ct: %" PRIu64
+            " -> %" PRIu64, pre_tube_buried, t->stat.buried_ct);
+    assertf(j->r.kick_ct == pre_kicks,
+            "a refused kick must not count as a kick: %u -> %u",
+            pre_kicks, j->r.kick_ct);
+    assertf(t->buried.next == j,
+            "a refused kick must leave the job on the buried chain");
 
     // Delayed branch: same gate, distinct code path.
     Job *jd = make_job(6, 0, 1000000000LL, 4, t);
@@ -1136,11 +1403,26 @@ cttest_inject_kick_buried_job_refuses_when_durable_and_wal_disabled(void)
     jd->r.deadline_at = now + 1000000000LL;
     assertf(heapinsert(&t->delay, jd) == 1, "delay heap insert");
 
+    int64  pre_deadline   = jd->r.deadline_at;
+    size_t pre_delay_len  = t->delay.len;
+    uint32 pre_kicks_d    = jd->r.kick_ct;
+
     int rd = kick_delayed_job(&s, jd);
     assertf(rd == 0,
             "kick_delayed_job under -D with w->use=0 must refuse, got %d", rd);
     assertf(jd->r.state == Delayed,
             "delayed job state must remain Delayed, got %d", jd->r.state);
+    // A refusal that restarts the delay clock, drops the job off the
+    // heap, or counts a kick is not a refusal.
+    assertf(jd->r.deadline_at == pre_deadline,
+            "a refused kick must not move the delay deadline: %" PRId64
+            " -> %" PRId64, pre_deadline, jd->r.deadline_at);
+    assertf(t->delay.len == pre_delay_len && t->delay.data[0] == jd,
+            "a refused kick must leave the job on the tube's delay heap "
+            "(len %zu -> %zu)", pre_delay_len, t->delay.len);
+    assertf(jd->r.kick_ct == pre_kicks_d,
+            "a refused kick must not count as a kick: %u -> %u",
+            pre_kicks_d, jd->r.kick_ct);
 
     // Cleanup.
     job_list_remove(j);
@@ -1185,6 +1467,14 @@ cttest_walsync_thread_roundtrip(void)
     int err = atomic_load_explicit(&w.sync_err, memory_order_relaxed);
     assertf(err == 0,
             "no fsync error expected on roundtrip, got errno=%d", err);
+
+    // Accepting the handoff and reporting no error is exactly what a
+    // thread that sets sync_fd = -1 and never calls fdatasync does. The
+    // work itself has to be counted: the wrapped syscall must have run.
+    assertf(wait_for_sync_calls(1, 200),
+            "sync thread must actually reach fdatasync within 2s "
+            "(calls=%d) — accepting the fd is not doing the work",
+            fault_calls(FAULT_FDATASYNC));
 
     walsyncstop(&w);
     assertf(w.sync_on == 0,
@@ -1308,7 +1598,45 @@ cttest_inject_make_server_socket_stat_happy_path_untouched(void)
             "no fault armed → no hits expected, got %d",
             fault_hits(FAULT_STAT));
 
-    if (fd >= 0) close(fd);
+    // "fd >= 0" and a call count say nothing about the branch the stat()
+    // exists to drive. The success direction has two obligations: leave
+    // a real, LISTENING socket at the path, and — on the second call —
+    // recognise the stale socket left by the first and remove it, or
+    // bind() comes back EADDRINUSE.
+    // lstat, not stat: stat() is the wrapped symbol whose call count is
+    // asserted here and below, so the test must not add to it.
+    struct stat st;
+    assertf(lstat(path + 5, &st) == 0,
+            "make_server_socket must leave a node at %s", path + 5);
+    assertf(S_ISSOCK(st.st_mode),
+            "%s must be a socket, got mode 0%o",
+            path + 5, (unsigned)st.st_mode);
+
+    struct sockaddr_un sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sun_family = AF_UNIX;
+    snprintf(sa.sun_path, sizeof sa.sun_path, "%s", path + 5);
+    int probe = socket(AF_UNIX, SOCK_STREAM, 0);
+    assertf(probe >= 0, "probe socket must be created");
+    assertf(connect(probe, (struct sockaddr *)&sa, sizeof sa) == 0,
+            "the returned fd must be a LISTENING socket: connect to %s "
+            "failed (errno=%d)", path + 5, errno);
+    close(probe);
+    close(fd);
+
+    // The stale socket file survives the close; the next bind must be
+    // driven by the stat() result to unlink it first.
+    assertf(lstat(path + 5, &st) == 0,
+            "the stale socket must survive close()");
+    int fd2 = make_server_socket(path, NULL);
+    assertf(fd2 >= 0,
+            "make_server_socket must remove the stale socket and re-bind, "
+            "got fd=%d (errno=%d)", fd2, errno);
+    assertf(fault_calls(FAULT_STAT) == 2,
+            "the second bind must stat the path too, got %d calls",
+            fault_calls(FAULT_STAT));
+
+    if (fd2 >= 0) close(fd2);
     unlink(path + 5);
 }
 
@@ -2465,9 +2793,10 @@ cttest_dur_reply_buf_no_stale_leak_after_conn_reuse(void)
 
     dur_enqueue(c1);
     const char *poison = "INSERTED 666\r\n";
-    int plen = (int)strlen(poison);
+    size_t plen = strlen(poison);
+    assertf(plen < sizeof c1->dur_reply_buf, "setup: the poison must fit");
     memcpy(c1->dur_reply_buf, poison, plen);
-    c1->dur_reply_len = plen;
+    c1->dur_reply_len = (int)plen;
 
     connclose(c1); // dur_remove + close(fd) + push onto the conn pool
     close(cfd1);
@@ -2769,6 +3098,149 @@ cttest_dur_flush_all_eagain_parks_full_reply_for_retry(void)
 }
 
 
+// A short write while flushing a durable batch. The kernel takes what
+// fits in the socket buffer and reports it; the remainder is the
+// server's problem. Contract: every buffered ack reaches the client
+// exactly once and in order, so the flush must hand the UNSENT tail to
+// the SEND_WORD FSM (reply_sent marking what already left) and re-arm
+// 'w'. Resending from offset 0 would duplicate acks the client has;
+// dropping the tail would leave durable commands unanswered on a live
+// connection.
+void
+cttest_dur_flush_short_write_hands_the_tail_to_the_fsm(void)
+{
+    setup();
+    int saved = srv.wal.durable_sync;
+    srv.wal.durable_sync = 1;
+    assertf(sockinit() == 0, "sockinit must succeed");
+
+    static Conn c;
+    memset(&c, 0, sizeof c);
+    c.srv = &srv;
+    c.pending_timeout = -1;
+    c.state = STATE_WANT_COMMAND;
+    job_list_reset(&c.reserved_jobs);
+    int cfd;
+    open_pair_nb_server(&c.sock.fd, &cfd);
+
+    dur_enqueue(&c);
+    static const char acks[] = "INSERTED 1\r\nINSERTED 2\r\nDELETED\r\n";
+    int alen = (int)sizeof acks - 1;
+    memcpy(c.dur_reply_buf, acks, alen);
+    c.dur_reply_len = alen;
+
+    // Let exactly 4 bytes through: "INSE".
+    fault_clear_all();
+    fault_set_short(FAULT_WRITE, 0, 4);
+    dur_flush_all(1);
+
+    assertf(fault_hits(FAULT_WRITE) == 1,
+            "setup: the short write must have fired (hits=%d calls=%d)",
+            fault_hits(FAULT_WRITE), fault_calls(FAULT_WRITE));
+    fault_clear_all();
+    assertf(c.state == STATE_SEND_WORD,
+            "an unsent tail must be handed to the SEND_WORD FSM, state=%d",
+            c.state);
+    assertf(c.reply == c.dur_reply_buf && c.reply_len == alen
+            && c.reply_sent == 4,
+            "the FSM must resume at the byte after the ones that left: "
+            "reply_len=%d reply_sent=%d (want %d and 4)",
+            c.reply_len, c.reply_sent, alen);
+    assertf(c.rw == 'w',
+            "the conn must be armed for write, or the tail never goes "
+            "out and the client waits forever (rw=%d)", c.rw);
+    assertf(c.dur_reply_len == 0,
+            "the batch must not also own these bytes (dur_reply_len=%d)",
+            c.dur_reply_len);
+
+    // Drain the tail the way the FSM does, then check the wire.
+    while (c.reply_sent < c.reply_len) {
+        ssize_t w = write(c.sock.fd, c.reply + c.reply_sent,
+                          (size_t)(c.reply_len - c.reply_sent));
+        assertf(w > 0, "FSM write must progress, errno=%d", errno);
+        c.reply_sent += (int)w;
+    }
+
+    char out[128];
+    ssize_t got = read(cfd, out, sizeof out);
+    assertf(got == alen && memcmp(out, acks, alen) == 0,
+            "the client must see every ack once, in order: got %zd bytes "
+            "of %d", got, alen);
+
+    close(c.sock.fd); close(cfd);
+    srv.wal.durable_sync = saved;
+}
+
+
+// The same short write, but caught mid-command. c->reply and c->state
+// belong to the PUT that is still reading its body, so the flush cannot
+// hand the tail to the SEND_WORD FSM the way it does between commands.
+// Contract: shift the unsent bytes to the front of the buffer and keep
+// the conn in the batch, so the next tick's flush retries — dropping
+// them would leave the acks of already-durable commands unsent on a
+// live connection, and overwriting c->reply would derail the PUT.
+void
+cttest_dur_flush_short_write_mid_command_carries_the_tail(void)
+{
+    setup();
+    int saved = srv.wal.durable_sync;
+    srv.wal.durable_sync = 1;
+    assertf(sockinit() == 0, "sockinit must succeed");
+
+    static Conn c;
+    memset(&c, 0, sizeof c);
+    c.srv = &srv;
+    c.pending_timeout = -1;
+    c.state = STATE_WANT_DATA;          // mid-PUT: reading the body
+    c.reply = (char *)"PUT-IN-FLIGHT";
+    c.reply_len = 13;
+    c.reply_sent = 4;
+    job_list_reset(&c.reserved_jobs);
+    int cfd;
+    open_pair_nb_server(&c.sock.fd, &cfd);
+
+    dur_enqueue(&c);
+    static const char acks[] = "INSERTED 1\r\nINSERTED 2\r\n";
+    int alen = (int)sizeof acks - 1;
+    memcpy(c.dur_reply_buf, acks, alen);
+    c.dur_reply_len = alen;
+
+    fault_clear_all();
+    fault_set_short(FAULT_WRITE, 0, 6);   // "INSERT" leaves, the rest stays
+    dur_flush_all(1);
+    assertf(fault_hits(FAULT_WRITE) == 1,
+            "setup: the short write must have fired (hits=%d)",
+            fault_hits(FAULT_WRITE));
+    fault_clear_all();
+
+    assertf(c.state == STATE_WANT_DATA,
+            "the in-flight PUT must keep its state, got %d", c.state);
+    assertf(c.reply_len == 13 && c.reply_sent == 4,
+            "the in-flight command's reply fields must be untouched "
+            "(reply_len=%d reply_sent=%d)", c.reply_len, c.reply_sent);
+    assertf(c.in_dur_batch,
+            "the conn must stay in the batch so the next tick retries");
+    assertf(c.dur_reply_len == alen - 6,
+            "the unsent tail must be carried, want %d bytes, got %d",
+            alen - 6, c.dur_reply_len);
+    assertf(memcmp(c.dur_reply_buf, acks + 6, (size_t)(alen - 6)) == 0,
+            "the carried bytes must be the ones that did NOT leave");
+    assertf(dur_batch_pending(),
+            "a carried remainder must be visible to the main loop, or the "
+            "retry waits for an epoll event this conn will never produce");
+
+    // What actually reached the peer is the prefix, once.
+    char out[64];
+    ssize_t got = read(cfd, out, sizeof out);
+    assertf(got == 6 && memcmp(out, acks, 6) == 0,
+            "the peer must have exactly the bytes the kernel took, got %zd",
+            got);
+
+    close(c.sock.fd); close(cfd);
+    srv.wal.durable_sync = saved;
+}
+
+
 // Deferred STATE_SEND_JOB reply (reply() hook, invariant #16): a
 // pipelined "delete N\r\nreserve\r\n" parks the conn in STATE_SEND_JOB
 // with acks+header primed on dur_reply_buf, the body in out_job, and
@@ -2795,6 +3267,11 @@ cttest_dur_flush_deferred_job_reply_arms_fsm_no_early_write(void)
     assertf(sockinit() == 0, "sockinit must succeed");
 
     Tube *t = make_tube("durdefer");
+    // make_tube hands back a tube with no reference of its own:
+    // the job's TUBE_ASSIGN below is the only holder, so freeing
+    // the job would free the tube under the tube_dref at the end
+    // of this test. Hold one for the duration.
+    tube_iref(t);
     assertf(t, "tube must allocate");
     Job *j = allocate_job(7);
     assertf(j, "job must allocate");
@@ -2905,6 +3382,11 @@ cttest_dur_flush_deferred_job_reply_commit_fail_rearms_h(void)
     assertf(sockinit() == 0, "sockinit must succeed");
 
     Tube *t = make_tube("durdeferfail");
+    // make_tube hands back a tube with no reference of its own:
+    // the job's TUBE_ASSIGN below is the only holder, so freeing
+    // the job would free the tube under the tube_dref at the end
+    // of this test. Hold one for the duration.
+    tube_iref(t);
     assertf(t, "tube must allocate");
     Job *j = allocate_job(3);
     assertf(j, "job must allocate");
@@ -3186,16 +3668,18 @@ epollrace_fork_server(int fire_in_window, void *(*thread_fn)(void *))
 // Waits up to 5s for the forked server; on timeout SIGKILLs it and
 // reports the hang through the two asserts.
 static void
-epollrace_expect_clean_exit(pid_t pid, const char *verdict)
+epollrace_expect_clean_exit(pid_t pid, int64 max_ns, const char *verdict)
 {
     int st = 0;
     int reaped = 0;
+    int64 began = nanoseconds();
     for (int i = 0; i < 200 && !reaped; i++) { // 200 * 25ms = 5s budget
         if (waitpid(pid, &st, WNOHANG) == pid)
             reaped = 1;
         else
             usleep(25 * 1000);
     }
+    int64 took = nanoseconds() - began;
     if (!reaped) {
         kill(pid, SIGKILL);
         waitpid(pid, 0, 0);
@@ -3203,6 +3687,14 @@ epollrace_expect_clean_exit(pid_t pid, const char *verdict)
     assertf(reaped, "%s", verdict);
     assertf(WIFEXITED(st) && WEXITSTATUS(st) == 0,
             "server must exit(0) via graceful shutdown, got status 0x%x", st);
+    // The 5s budget only separates "woke" from "hung". The contract is
+    // that the wake is IMMEDIATE — signal turned into fd readiness — so
+    // a shutdown that limps out on some slower fallback poll must not
+    // read as success.
+    assertf(took <= max_ns,
+            "shutdown took %" PRId64 "ms, over the %" PRId64 "ms the "
+            "eventfd wake is supposed to need: %s",
+            took / 1000000, max_ns / 1000000, verdict);
 }
 
 void
@@ -3215,7 +3707,7 @@ cttest_inject_sigterm_in_epoll_block_window(void)
 
     // The fixed server exits 0 within milliseconds; a broken one is
     // parked in epoll for the full 1h idle prottick period.
-    epollrace_expect_clean_exit(pid,
+    epollrace_expect_clean_exit(pid, 1500000000LL,
             "server hung: SIGTERM landed in the check-then-block window "
             "and epoll parked for the full timeout "
             "(srv_wake eventfd self-pipe fix regressed)");
@@ -3253,7 +3745,8 @@ cttest_inject_sigterm_on_other_thread_wakes_parked_main_loop(void)
     pid_t pid = epollrace_fork_server(0, epollrace_fire_sigterm_on_this_thread);
     assertf(pid >= 0, "fork failed: %s", strerror(errno));
 
-    epollrace_expect_clean_exit(pid,
+    // The helper thread deliberately sleeps 150ms before signalling.
+    epollrace_expect_clean_exit(pid, 2000000000LL,
             "server hung: SIGTERM handler ran on a helper thread but the "
             "main epoll loop never woke (srv_wake eventfd must wake the "
             "main thread regardless of which thread runs the handler)");
@@ -3458,6 +3951,59 @@ cttest_inject_waitpos_enqueue_oom_rollback_keeps_hints(void)
                 "hint %zu must be exact after retry (tube %s)", i, t->name);
     }
     remove_waiting_conn(c);
+
+    // This is the only test in the file that builds waiting connections,
+    // and it never checks that a job ever REACHES one. Drop
+    // `if (!delay && j->tube->waiting_conns.len) process_tube(j->tube);`
+    // from enqueue_job and everything above still passes, while the
+    // server queues jobs and never hands them to reserving clients.
+    // kick_buried_job is the public door into enqueue_job's ready
+    // branch; the wal is disabled and non-durable, so it passes through.
+    Server disp;
+    memset(&disp, 0, sizeof disp);
+    disp.conns.less = conn_less;
+    disp.conns.setpos = conn_setpos;
+    disp.sock.fd = -1;
+    disp.sock.added = 1;
+    c->srv = &disp;
+
+    assertf(enqueue_waiting_conn(c) == 1, "conn must re-enter the wait");
+    assertf(t1->waiting_conns.len == 1,
+            "precondition: t1 must hold the waiting conn");
+
+    Job *served = make_job(1, 0, 1000000000LL, 4, t1);
+    assertf(served, "job must allocate");
+    memcpy(served->body, "disp", 4);
+    served->r.state = Buried;
+    job_list_insert(&t1->buried, served);
+    global_stat.buried_ct++;
+    t1->stat.buried_ct++;
+
+    assertf(kick_buried_job(&disp, served) == 1,
+            "kick into a tube with a waiting conn must succeed");
+    assertf(served->r.state == Reserved,
+            "the enqueued job must be dispatched to the waiting conn, "
+            "got state=%d (it is parked in the ready heap instead)",
+            served->r.state);
+    assertf(served->reserver == c,
+            "the job must be reserved BY the waiting conn");
+    assertf(!conn_waiting(c),
+            "a served conn must stop waiting");
+    assertf(t1->waiting_conns.len == 0 && t2->waiting_conns.len == 0
+            && t3->waiting_conns.len == 0,
+            "dispatch must clear the conn from every watched tube "
+            "(%zu/%zu/%zu)", t1->waiting_conns.len, t2->waiting_conns.len,
+            t3->waiting_conns.len);
+    assertf(t1->ready.len == 0,
+            "a dispatched job must not also sit in the ready heap");
+
+    job_list_remove(served);
+    served->reserver = NULL;
+    served->r.state = Ready;
+    global_stat.reserved_ct--;
+    c->out_job = NULL;
+    TUBE_ASSIGN(served->tube, NULL);
+    job_free(served);
 
     connclose(c);
     tube_dref(t1);
@@ -3671,4 +4217,207 @@ cttest_inject_walscandir_ignores_garbage_suffixes(void)
         unlink(p);
     }
     rmdir(dir);
+}
+
+
+// srv_wake runs inside a signal handler, and its write is the only
+// thing that gets the main loop out of a park that can last an hour.
+// A write interrupted by another signal returns EINTR, and giving up
+// there loses the wake-up entirely: shutdown_requested would be set
+// with nobody awake to act on it. The retry is the contract.
+void
+cttest_srv_wake_survives_an_interrupted_write(void)
+{
+    setup();
+    assertf(srv_wake_init() == 0, "setup: the wake eventfd must open");
+
+    fault_clear_all();
+    fault_set(FAULT_WRITE, 0, EINTR);   // the first write is interrupted
+    srv_wake();
+    assertf(fault_hits(FAULT_WRITE) == 1,
+            "setup: the interruption must have fired (hits=%d)",
+            fault_hits(FAULT_WRITE));
+    fault_clear_all();
+
+    // The counter must still have been raised: drain it and see.
+    int fd = srv_wake_fd();
+    assertf(fd >= 0, "setup: the wake fd must be available");
+    uint64_t v = 0;
+    ssize_t n = read(fd, &v, sizeof v);
+    assertf(n == (ssize_t)sizeof v,
+            "the wake-up must have reached the eventfd: read returned %zd "
+            "(errno %d)", n, errno);
+    assertf(v >= 1,
+            "the eventfd counter must have been raised, got %llu",
+            (unsigned long long)v);
+}
+
+// A conn CARRIED back into the batch by the inline drain (its socket
+// took only part of the remainder) is already registered. Registering
+// it again — the very next WAL-dirty command on it does exactly that —
+// puts two array slots on one conn with one dur_batch_idx between them:
+// the flush writes its buffer twice and dur_remove unlinks only one of
+// the slots, leaving the other pointing at a conn that believes it left.
+void
+cttest_dur_enqueue_does_not_register_a_carried_conn_twice(void)
+{
+    setup();
+    int saved = srv.wal.durable_sync;
+    int saved_use = srv.wal.use;
+    int saved_cf = srv.wal.commit_failed;
+    srv.wal.durable_sync = 1;
+    srv.wal.use = 0;            // walcommit: nothing staged -> success
+    srv.wal.commit_failed = 0;
+
+    static Conn batch[DUR_BATCH_MAX];
+    int cfd = -1;
+    for (int i = 0; i < DUR_BATCH_MAX; i++) {
+        memset(&batch[i], 0, sizeof batch[i]);
+        batch[i].srv = &srv;
+        batch[i].rw = 'r';
+        batch[i].sock.fd = -1;
+        assertf(dur_enqueue(&batch[i]) == 1, "setup: conn %d must register", i);
+    }
+    // Conn 0 is the one that will be carried: a real socket, a staged
+    // ack, and MID-COMMAND state so the SEND_WORD FSM cannot take the
+    // remainder off it.
+    open_pair_nb_server(&batch[0].sock.fd, &cfd);
+    batch[0].state = STATE_WANT_DATA;
+    memcpy(batch[0].dur_reply_buf, "DELETED\r\n", 9);
+    batch[0].dur_reply_len = 9;
+    fault_set_short(FAULT_WRITE, 0, 3);   // the drain's write is short
+
+    static Conn extra;
+    memset(&extra, 0, sizeof extra);
+    extra.sock.fd = -1;
+    assertf(dur_enqueue(&extra) == 1, "setup: the overflow conn must register");
+    assertf(batch[0].in_dur_batch == 1,
+            "setup: the short write must have carried conn 0 back into the"
+            " batch; in_dur_batch=%d len=%d",
+            batch[0].in_dur_batch, batch[0].dur_reply_len);
+
+    // The next WAL-dirty command on the carried conn.
+    assertf(dur_enqueue(&batch[0]) == 1,
+            "a carried conn must still be considered registered");
+
+    // Exactly two conns are in the batch: the carry and the overflow.
+    dur_remove(&batch[0]);
+    dur_remove(&extra);
+    assertf(dur_batch_pending() == 0,
+            "the carried conn must occupy exactly ONE slot; removing every"
+            " conn left the batch non-empty, so one was registered twice");
+
+    fault_clear_all();
+    close(batch[0].sock.fd); close(cfd);
+    srv.wal.durable_sync = saved;
+    srv.wal.use = saved_use;
+    srv.wal.commit_failed = saved_cf;
+}
+
+
+// Same inline drain, but the conn holding the staged acks is the one
+// being dispatched RIGHT NOW. Its state reads STATE_WANT_COMMAND —
+// the previous reply of the burst put it back there — yet its current
+// command has not answered yet. Handing dur_reply_buf to the SEND_WORD
+// FSM on a short write would have that answer memcpy'd straight over
+// the bytes the FSM still owes the client.
+void
+cttest_dur_drain_does_not_park_the_conn_being_dispatched(void)
+{
+    setup();
+    int saved = srv.wal.durable_sync;
+    int saved_use = srv.wal.use;
+    int saved_cf = srv.wal.commit_failed;
+    srv.wal.durable_sync = 1;
+    srv.wal.use = 0;
+    srv.wal.commit_failed = 0;
+
+    static Conn batch[DUR_BATCH_MAX];
+    int cfd = -1;
+    for (int i = 0; i < DUR_BATCH_MAX; i++) {
+        memset(&batch[i], 0, sizeof batch[i]);
+        batch[i].srv = &srv;
+        batch[i].rw = 'r';
+        batch[i].sock.fd = -1;
+        assertf(dur_enqueue(&batch[i]) == 1, "setup: conn %d must register", i);
+    }
+    open_pair_nb_server(&batch[0].sock.fd, &cfd);
+    batch[0].state = STATE_WANT_COMMAND;   // between REPLIES, not between commands
+    memcpy(batch[0].dur_reply_buf, "DELETED\r\n", 9);
+    batch[0].dur_reply_len = 9;
+    fault_set_short(FAULT_WRITE, 0, 3);
+
+    dur_test_set_dispatch_conn(&batch[0]);
+    static Conn extra;
+    memset(&extra, 0, sizeof extra);
+    extra.sock.fd = -1;
+    assertf(dur_enqueue(&extra) == 1, "setup: the overflow conn must register");
+    dur_test_set_dispatch_conn(NULL);
+
+    assertf(batch[0].state == STATE_WANT_COMMAND,
+            "the dispatched conn must not be parked in the SEND_WORD FSM;"
+            " state is %d", batch[0].state);
+    assertf(batch[0].dur_reply_len == 6 && batch[0].in_dur_batch == 1,
+            "the unsent tail must stay in the buffer, so the answer still"
+            " being produced lands BEHIND it; len=%d in_batch=%d",
+            batch[0].dur_reply_len, batch[0].in_dur_batch);
+    assertf(memcmp(batch[0].dur_reply_buf, "ETED\r\n", 6) == 0,
+            "the tail must be the bytes the socket did not take");
+
+    fault_clear_all();
+    dur_remove(&batch[0]); dur_remove(&extra);
+    close(batch[0].sock.fd); close(cfd);
+    srv.wal.durable_sync = saved;
+    srv.wal.use = saved_use;
+    srv.wal.commit_failed = saved_cf;
+}
+
+// A GENUINE socket error while flushing staged acks (not EAGAIN, not a
+// short write) must end the connection, not carry it. Carrying it puts
+// a dead conn back in the batch, where every following tick retries a
+// write that can only fail again — and serv.c caps the epoll park while
+// anything is carried, so the server spins at the retry cadence for as
+// long as the conn is open. Mutation found this: turning the EAGAIN
+// test into its opposite left the whole suite green.
+void
+cttest_dur_flush_closes_the_conn_on_a_real_socket_error(void)
+{
+    setup();
+    int saved = srv.wal.durable_sync;
+    int saved_use = srv.wal.use;
+    int saved_cf = srv.wal.commit_failed;
+    srv.wal.durable_sync = 1;
+    srv.wal.use = 0;            // walcommit: nothing staged -> success
+    srv.wal.commit_failed = 0;
+
+    static Conn c;
+    int cfd = -1;
+    memset(&c, 0, sizeof c);
+    c.srv = &srv;
+    c.rw = 'r';
+    open_pair_nb_server(&c.sock.fd, &cfd);
+    c.state = STATE_WANT_COMMAND;
+    assertf(dur_enqueue(&c) == 1, "setup: the conn must register");
+    memcpy(c.dur_reply_buf, "DELETED\r\n", 9);
+    c.dur_reply_len = 9;
+
+    fault_set(FAULT_WRITE, 0, EPIPE);   // the peer is gone for good
+    dur_flush_all(1);
+
+    assertf(c.state == STATE_CLOSE,
+            "a write error the socket will never recover from must close"
+            " the conn; state is %d", c.state);
+    assertf(c.dur_reply_len == 0,
+            "acks that can never be delivered must not be kept, got %d bytes",
+            c.dur_reply_len);
+    assertf(dur_batch_pending() == 0,
+            "a conn closing on a socket error must not be carried: every"
+            " later tick would retry a write that cannot succeed, and the"
+            " main loop shortens its epoll park for as long as it is there");
+
+    fault_clear_all();
+    close(c.sock.fd); close(cfd);
+    srv.wal.durable_sync = saved;
+    srv.wal.use = saved_use;
+    srv.wal.commit_failed = saved_cf;
 }

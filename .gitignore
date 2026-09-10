@@ -1,11 +1,14 @@
+# Build output — the same set `make clean` removes. The generated test
+# harness is covered by ct/.gitignore, which is vendored with it.
 *.o
 *.gcda
 *.gcno
+*.gcov
 /beanstalkd
 /vers.c
-ct/_ctcheck
-ct/_ctcheck.c
-ct/_ctcheck.o
-ct/*.o
-bench/results/
 .cflags-stamp
+
+# bench/ leavings: run output, and the caches Python drops beside the
+# scripts one bench imports from another.
+bench/results/
+__pycache__/

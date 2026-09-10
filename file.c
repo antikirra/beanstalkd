@@ -28,18 +28,23 @@ __attribute__((format(printf, 3, 4)));
 // any nonzero byte this was not a tail, so say so. This is a bounded,
 // best-effort diagnostic — data still in the kernel beyond the current
 // buffer is not scanned, and the stop-at-zero semantics are unchanged.
-static void
+// Returns 1 when the zero region was positively shown NOT to be a
+// fallocate tail — live record bytes follow it inside the buffer just
+// read. That is detected corruption: replay stops here either way, so
+// the verdict is the only thing that reaches the operator.
+static int
 warn_if_not_tail(File *f)
 {
     ReadBuf *rb = f->rbuf;
-    if (!rb) return;
+    if (!rb) return 0;
     for (int i = rb->pos; i < rb->filled; i++) {
         if (rb->buf[i]) {
             warnpos(f, 0, "zero record with nonzero data beyond it; "
                     "not a fallocate tail — ignoring the rest of the file");
-            return;
+            return 1;
         }
     }
+    return 0;
 }
 
 FAlloc falloc = rawfalloc;
@@ -96,6 +101,16 @@ void
 filedecref(File *f)
 {
     if (!f) return;
+    // refs is unsigned: one release too many turns 0 into UINT_MAX,
+    // `refs < 1` stops holding, and the binlog is pinned out of walgc's
+    // reach for the life of the process, with every later binlog queued
+    // up behind it. Treat the over-release as the zero it meant.
+    if (f->refs == 0) {
+        twarnx("filedecref: refcount underflow on %s",
+               f->path ? f->path : "(unnamed binlog)");
+        walgc(f->w);
+        return;
+    }
     f->refs--;
     if (f->refs < 1) {
         walgc(f->w);
@@ -119,6 +134,24 @@ fileaddjob(File *f, Job *j)
 }
 
 
+// Sum of the wal bytes every job still on a file accounts for. Walked
+// only on the repair path in filermjob, where the alternative is
+// discarding the total outright.
+static int64
+alive_bytes(Wal *w)
+{
+    int64 total = 0;
+
+    for (File *f = w->head; f; f = f->next) {
+        Job *h = &f->jlist;
+        if (!h->fnext) continue;   // list never initialised
+        for (Job *k = h->fnext; k != h; k = k->fnext)
+            total += k->walused;
+    }
+    return total;
+}
+
+
 void
 filermjob(File *f, Job *j)
 {
@@ -132,8 +165,12 @@ filermjob(File *f, Job *j)
     if (j->walused <= f->w->alive) {
         f->w->alive -= j->walused;
     } else {
+        // The two counts have drifted. Zeroing the total would throw
+        // away the live bytes every OTHER file still holds, so rebuild
+        // it from what the files actually carry — j is already off its
+        // list, so it is not counted.
         twarnx("filermjob: walused %"PRId64" > alive %"PRId64, j->walused, f->w->alive);
-        f->w->alive = 0;
+        f->w->alive = alive_bytes(f->w);
     }
     j->walused = 0;
     filedecref(f);
@@ -142,6 +179,19 @@ filermjob(File *f, Job *j)
 
 // Fileread reads jobs from f->path into list.
 // It returns 0 on success, or 1 if any errors occurred.
+// Releases the reference fileread took for the duration of the replay.
+// Deliberately not filedecref: a binlog whose jobs were all deleted ends
+// the replay at zero references, and filedecref would hand it to walgc,
+// which frees the very struct fileread still has to write through and
+// that its caller is still holding in w->head. The file stays
+// registered; the next filedecref anywhere collects it normally.
+static void
+fileread_release(File *f)
+{
+    if (f->refs) f->refs--;
+}
+
+
 int
 fileread(File *f, Job *list)
 {
@@ -157,14 +207,14 @@ fileread(File *f, Job *list)
     case Walver:
         fileincref(f);
         while (readrec(f, list, &err));
-        filedecref(f);
-        f->rbuf = NULL;
+        f->rbuf = NULL;          // rb is this frame's; never outlive it
+        fileread_release(f);
         return err;
     case Walver7:
         fileincref(f);
         while (readrec7(f, list, &err));
-        filedecref(f);
         f->rbuf = NULL;
+        fileread_release(f);
         return err;
     }
 
@@ -224,6 +274,17 @@ readrec(File *f, Job *l, int *err)
     }
     tubename[namelen] = '\0';
 
+    // A name off disk must clear the same bar as one off the wire: a
+    // tube whose name carries CRLF or a colon turns every stats and
+    // list reply that prints it into YAML the client reads as extra
+    // fields. Reject the record; anything an earlier valid record
+    // recovered stays untouched.
+    if (namelen && !is_valid_tube(tubename, MAX_TUBE_NAME_LEN - 1)) {
+        warnpos(f, -sz, "record names an unusable tube (%d bytes)", namelen);
+        *err = 1;
+        return 0;
+    }
+
     r = readfull(f, &jr, sizeof(Jobrec), err, "job struct");
     if (!r) {
         return 0;
@@ -231,10 +292,24 @@ readrec(File *f, Job *l, int *err)
     sz += r;
     crc = wal_crc32c(crc, &jr, sizeof(Jobrec));
 
+    // UINT64_MAX is not a usable id: make_job_with_id would advance the
+    // counter past it to 0, and 0 is the value that marks the fallocate
+    // tail — the next job written would end every later replay at its
+    // own record. Refuse the record; whatever an earlier valid record
+    // recovered stays untouched.
+    if (unlikely(jr.id == UINT64_MAX)) {
+        warnpos(f, -sz, "job id %" PRIu64 " is out of range", jr.id);
+        *err = 1;
+        return 0;
+    }
+
     // Are we reading trailing zeroes? (fallocate zero-fills unused tail;
     // a genuine record always has jr.id > 0.)
     if (!jr.id) {
-        warn_if_not_tail(f);
+        // Corruption that was positively identified must reach the exit
+        // code too: "no errors" on a binlog whose tail was just
+        // discarded is a failure wearing a legitimate mask.
+        if (warn_if_not_tail(f)) *err = 1;
         return 0;
     }
 
@@ -267,7 +342,11 @@ readrec(File *f, Job *l, int *err)
     // We cannot read directly into j->body yet because CRC verification must
     // pass BEFORE any existing job state is mutated. This preserves the
     // invariant that corrupted data never overwrites valid in-memory state.
-    if (namelen) {
+    // body_size 0 is legal for a legacy truncate marker, and readfull
+    // returns 0 for a zero-byte read — which every caller reads as
+    // end-of-file. Skip the read instead of ending replay on a record
+    // the file still has data behind (#714 sibling).
+    if (namelen && jr.body_size > 0) {
         body_buf = malloc(jr.body_size);
         if (!body_buf) {
             warnpos(f, -sz, "OOM body_buf");
@@ -418,7 +497,13 @@ readrec(File *f, Job *l, int *err)
         return 1;
     default:
         warnpos(f, -sz, "unknown job state: %d", jr.state);
-        goto Error;
+        // Nothing of this record has been applied yet, so j (if there is
+        // one) still holds exactly what an earlier, valid record
+        // recovered. Falling into Error would turn one unreplayable
+        // record into the loss of a live job.
+        *err = 1;
+        free(body_buf);
+        return 0;
     }
 
 Error:
@@ -471,15 +556,33 @@ readrec7(File *f, Job *l, int *err)
     }
     tubename[namelen] = '\0';
 
+    // Same rule as the v8 reader above: a tube name off disk must be
+    // one this server would have accepted on the wire.
+    if (namelen && !is_valid_tube(tubename, MAX_TUBE_NAME_LEN - 1)) {
+        warnpos(f, -sz, "record names an unusable tube (%d bytes)", namelen);
+        *err = 1;
+        return 0;
+    }
+
     r = readfull(f, &jr, sizeof(Jobrec), err, "job struct");
     if (!r) {
         return 0;
     }
     sz += r;
 
+    // Same id bound as the v8 reader above.
+    if (unlikely(jr.id == UINT64_MAX)) {
+        warnpos(f, -sz, "job id %" PRIu64 " is out of range", jr.id);
+        *err = 1;
+        return 0;
+    }
+
     // are we reading trailing zeroes?
     if (!jr.id) {
-        warn_if_not_tail(f);
+        // Corruption that was positively identified must reach the exit
+        // code too: "no errors" on a binlog whose tail was just
+        // discarded is a failure wearing a legitimate mask.
+        if (warn_if_not_tail(f)) *err = 1;
         return 0;
     }
 
@@ -609,7 +712,11 @@ readrec7(File *f, Job *l, int *err)
             if (jr.body_size < 0 || jr.body_size > 64) {
                 warnpos(f, -sz, "v7 marker body_size %d out of expected range",
                         jr.body_size);
-                goto Error;
+                // A marker carries a cutoff, never a job: the job whose
+                // id it happens to collide with was recovered by its own
+                // full record and must survive this one being garbage.
+                *err = 1;
+                return 0;
             }
             char mbody[64];
             if (jr.body_size > 0) {
@@ -628,7 +735,10 @@ readrec7(File *f, Job *l, int *err)
         return 1;
     default:
         warnpos(f, -r, "unknown job state: %d", jr.state);
-        goto Error;
+        // As in readrec: the record is rejected, but the job an earlier
+        // record recovered is not this record's to destroy.
+        *err = 1;
+        return 0;
     }
 
 Error:
@@ -649,39 +759,29 @@ readfull(File *f, void *c, int n, int *err, char *desc)
     char *dst = (char *)c;
     int got = 0;
 
+    // Every reader reaches this through fileread, which owns the buffer
+    // for the length of the replay. There used to be an unbuffered
+    // fallback here for the rb == NULL case; nothing could reach it, so
+    // it was never exercised — an untested read path in the WAL reader
+    // is worse than an explicit refusal.
+    if (unlikely(!rb)) {
+        warnpos(f, 0, "internal: read of %s outside a replay", desc);
+        *err = 1;
+        return 0;
+    }
+
     while (got < n) {
-        // Use buffered path if available.
-        if (rb) {
-            if (rb->pos < rb->filled) {
-                int avail = rb->filled - rb->pos;
-                int chunk = (n - got < avail) ? n - got : avail;
-                memcpy(dst + got, rb->buf + rb->pos, chunk);
-                rb->pos += chunk;
-                got += chunk;
-                continue;
-            }
-            // Refill buffer.
-            int r = read(f->fd, rb->buf, sizeof(rb->buf));
-            if (r == -1) {
-                if (errno == EINTR) continue;
-                twarn("read");
-                warnpos(f, 0, "error reading %s", desc);
-                *err = 1;
-                return 0;
-            }
-            if (r == 0) {
-                if (got == 0) return 0; // expected EOF
-                warnpos(f, -got, "unexpected EOF reading %d bytes (got %d): %s", n, got, desc);
-                *err = 1;
-                return 0;
-            }
-            rb->pos = 0;
-            rb->filled = r;
+        if (rb->pos < rb->filled) {
+            int avail = rb->filled - rb->pos;
+            int chunk = (n - got < avail) ? n - got : avail;
+            memcpy(dst + got, rb->buf + rb->pos, chunk);
+            rb->pos += chunk;
+            got += chunk;
             continue;
         }
 
-        // Unbuffered fallback.
-        int r = read(f->fd, dst + got, n - got);
+        // Refill.
+        int r = read(f->fd, rb->buf, sizeof(rb->buf));
         if (r == -1) {
             if (errno == EINTR) continue;
             twarn("read");
@@ -690,11 +790,13 @@ readfull(File *f, void *c, int n, int *err, char *desc)
             return 0;
         }
         if (r == 0) {
+            if (got == 0) return 0; // expected EOF
             warnpos(f, -got, "unexpected EOF reading %d bytes (got %d): %s", n, got, desc);
             *err = 1;
             return 0;
         }
-        got += r;
+        rb->pos = 0;
+        rb->filled = r;
     }
     return got;
 }
@@ -727,7 +829,21 @@ filewopen(File *f)
     int n;
     int ver = Walver;
 
-    fd = open(f->path, O_WRONLY|O_CREAT|O_CLOEXEC, 0400);
+    // A binlog too small for its own header would publish a negative
+    // f->free, and that feeds both the reservation arithmetic and the
+    // closing truncate: "drop the unused tail" becomes "extend the
+    // file". -s accepts any size from 1 byte up, so this is reachable.
+    if (f->w->filesize < (int)sizeof(int)) {
+        twarnx("binlog size %d is too small for the version header",
+               f->w->filesize);
+        return;
+    }
+
+    // O_TRUNC: a file of this name left behind by an earlier life of
+    // the server keeps its old records past the freshly written header
+    // otherwise, and replay brings those jobs back from a binlog this
+    // writer never wrote.
+    fd = open(f->path, O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC, 0400);
     if (fd < 0) {
         twarn("open %s", f->path);
         return;
@@ -746,7 +862,10 @@ filewopen(File *f)
         return;
     }
 
-    n = write(fd, &ver, sizeof(int));
+    // rawfalloc's fallback (filesystems without fallocate) writes the
+    // zeroes itself and leaves the offset at the end of them, so a bare
+    // write() would stamp the header past the data instead of at 0.
+    n = lseek(fd, 0, SEEK_SET) == 0 ? write(fd, &ver, sizeof(int)) : -1;
     if (n < 0 || (size_t)n < sizeof(int)) {
         twarn("write %s", f->path);
         if (close(fd) == -1)
@@ -756,6 +875,8 @@ filewopen(File *f)
     }
 
     f->fd = fd;
+    f->woff = (off_t)n;      // the header is all that is written so far
+    f->woff_valid = 1;
     f->iswopen = 1;
     fileincref(f);
     f->free = f->w->filesize - n;
@@ -770,13 +891,24 @@ filewopen(File *f)
 // dropping every record that followed in the same binlog (#700).
 // Returns 1 on success, 0 on failure (file rolled back when possible).
 static int
-writev_all(int fd, struct iovec *iov, int iovcnt, int total)
+writev_all(File *f, struct iovec *iov, int iovcnt, int total)
 {
-    off_t before = lseek(fd, 0, SEEK_CUR);
-    if (unlikely(before < 0)) { twarn("lseek before writev"); return 0; }
+    int fd = f->fd;
+
+    // The rollback below needs the offset this record started at. Ask
+    // the kernel only once per fd: from then on every writer here keeps
+    // f->woff in step, which takes one syscall per staged record out of
+    // the durable hot path.
+    if (unlikely(!f->woff_valid)) {
+        off_t cur = lseek(fd, 0, SEEK_CUR);
+        if (unlikely(cur < 0)) { twarn("lseek before writev"); return 0; }
+        f->woff = cur;
+        f->woff_valid = 1;
+    }
+    off_t before = f->woff;
 
     ssize_t r = writev(fd, iov, iovcnt);
-    if (likely(r == total)) return 1;
+    if (likely(r == total)) { f->woff = before + total; return 1; }
 
     int written;
     if (r == -1) {
@@ -808,6 +940,7 @@ writev_all(int fd, struct iovec *iov, int iovcnt, int total)
             iov[0].iov_len -= r;
         }
     }
+    f->woff = before + total;
     return 1;
 
 rollback:
@@ -818,8 +951,12 @@ rollback:
     // tail, which stops at the first bad record rather than propagating.
     if (ftruncate(fd, before) == -1) {
         twarn("ftruncate rollback after writev fail");
+        f->woff_valid = 0;   // the file is not where either side thinks
     } else if (lseek(fd, before, SEEK_SET) < 0) {
         twarn("lseek after writev rollback");
+        f->woff_valid = 0;
+    } else {
+        f->woff = before;
     }
     return 0;
 }
@@ -856,7 +993,19 @@ filewrite_commit_durable(File *f, int total)
     // at the tail (partial record). Both paths are safer than leaving
     // the server's memory claiming "write failed" while disk says
     // "write succeeded", which is the bug this path closes.
-    off_t cur = lseek(f->fd, 0, SEEK_CUR);
+    off_t cur;
+    if (likely(f->woff_valid)) {
+        cur = f->woff;
+    } else {
+        cur = lseek(f->fd, 0, SEEK_CUR);
+        if (cur < 0) { twarn("lseek before durable rollback"); return 0; }
+    }
+    if (total < 0) {
+        // A rollback of a negative staged count would ftruncate the file
+        // LONGER than it is, appending a hole that replays as a tail.
+        twarnx("durable rollback: negative staged count %d", total);
+        return 0;
+    }
     if (cur < (off_t)total) {
         twarnx("durable rollback: unexpected offset %lld < total %d",
                (long long)cur, total);
@@ -865,10 +1014,14 @@ filewrite_commit_durable(File *f, int total)
     off_t before = cur - (off_t)total;
     if (ftruncate(f->fd, before) == -1) {
         twarn("ftruncate rollback after durable fdatasync");
+        f->woff_valid = 0;
         return 0;
     }
+    f->woff = before;
+    f->woff_valid = 1;
     if (lseek(f->fd, before, SEEK_SET) < 0) {
         twarn("lseek after durable rollback");
+        f->woff_valid = 0;
         // Offset is unknown now, but we still removed the bytes. The
         // caller will filewclose + w->use=0, making further writes
         // impossible, so the misaligned offset is harmless.
@@ -916,7 +1069,7 @@ filewritev(File *f, Job *j, struct iovec *iov, int iovcnt)
     for (int i = 0; i < iovcnt; i++)
         total += iov[i].iov_len;
 
-    if (!writev_all(f->fd, iov, iovcnt, total)) return 0;
+    if (!writev_all(f, iov, iovcnt, total)) return 0;
 
     file_stage_account(f, total);
     j->walresv -= total;
@@ -1026,7 +1179,18 @@ filewrjobshort(File *f, Job *j)
     f->uncommitted_alive -= total;
 
     if (j->r.state == Invalid) {
-        filermjob(j->file, j);
+        if (j->file) {
+            filermjob(j->file, j);
+        } else if (j->walused > 0) {
+            // The binlog that held the full record is already gone, so
+            // there is no file to unregister from — but the bytes it
+            // accounted for are dead space all the same, and leaving
+            // them on the books suppresses the compaction ratio for the
+            // rest of the process's life.
+            int64 n = j->walused < f->w->alive ? j->walused : f->w->alive;
+            f->w->alive -= n;
+            j->walused = 0;
+        }
     }
 
     return r;
@@ -1055,6 +1219,15 @@ filewrjobfull(File *f, Job *j)
         { .iov_base = crc_bytes,     .iov_len = sizeof crc_bytes },
     };
 
+    // A full record moves the job to this binlog, so let go of the one
+    // it was on — before the write, because filermjob zeroes j->walused
+    // and filewritev is about to set it for the new file. Without this
+    // the old file keeps a reference it never gets back and walgc can
+    // never reap it. (readrec does the same when a full record replays
+    // onto a job that already lives on another file.)
+    if (j->file && j->file != f)
+        filermjob(j->file, j);
+
     int r = filewritev(f, j, iov, 5);
     if (r)
         fileaddjob(f, j);
@@ -1067,11 +1240,18 @@ filewclose(File *f)
 {
     if (!f) return;
     if (!f->iswopen) return;
-    if (f->free) {
+    // Only ever shorten. A negative free count (an over-committed
+    // reservation) would turn "drop the unused tail" into "extend the
+    // file with a hole", and the zeroes that hole reads back as look
+    // exactly like a fallocate tail to the next replay.
+    if (f->free > 0) {
         errno = 0;
         if (ftruncate(f->fd, f->w->filesize - f->free) != 0) {
             twarn("ftruncate");
         }
+    } else if (f->free < 0) {
+        twarnx("refusing to grow %s on close: free is %d",
+               f->path ? f->path : "(unnamed binlog)", f->free);
     }
     // Flush before close when running non-durable: close() drops the
     // last fd for this binlog (rotation in usenext closes the old file
@@ -1099,6 +1279,13 @@ filewclose(File *f)
 int
 fileinit(File *f, Wal *w, int n)
 {
+    // walscandir only ever rediscovers a name whose suffix is a
+    // positive decimal, so a sequence outside that range would name a
+    // binlog the writer fills and the reader can never find again.
+    if (n < 1) {
+        twarnx("refusing to name a binlog with sequence %d", n);
+        return 0;
+    }
     f->w = w;
     f->seq = n;
     f->path = fmtalloc("%s/binlog.%d", w->dir, n);
@@ -1111,6 +1298,11 @@ fileinit(File *f, Wal *w, int n)
 Wal*
 fileadd(File *f, Wal *w)
 {
+    // The node being appended is the end of the list. A stale ->next
+    // left over from a previous life would otherwise be spliced in
+    // whole, making the list reach files nfile never counted and walgc
+    // free files the Wal never adopted.
+    f->next = NULL;
     if (w->tail) {
         w->tail->next = f;
     }

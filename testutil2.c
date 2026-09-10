@@ -7,7 +7,42 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
+
+// ct gives every test its own forked process whose stdout carries the
+// failure log, so stderr can be redirected to a file and read back
+// without losing a single assertion message.
+static void
+capture_stderr_to(const char *path)
+{
+    fflush(stderr);
+    if (!freopen(path, "w+", stderr)) {
+        assertf(0, "freopen stderr: %s", strerror(errno));
+    }
+}
+
+static size_t
+read_file(const char *path, char *buf, size_t buflen)
+{
+    FILE *f = fopen(path, "r");
+    assertf(f != NULL, "fopen %s: %s", path, strerror(errno));
+    size_t n = fread(buf, 1, buflen - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    return n;
+}
+
+// Returns the first needle absent from hay, or NULL when all are present:
+// one assertion can then name exactly which one went missing.
+static const char *
+first_missing(const char *hay, const char *const *needles)
+{
+    for (int i = 0; needles[i]; i++) {
+        if (!strstr(hay, needles[i])) return needles[i];
+    }
+    return NULL;
+}
 
 void
 cttest_optz_zero_uses_default()
@@ -31,20 +66,47 @@ cttest_opts_zero_uses_default()
 void
 cttest_optf_huge_capped()
 {
+    int64 cap_ms = 1000000000;
+    // Sentinels: wantsync is 1 in the srv initializer, so without these
+    // the test cannot tell "case f set it" from "nobody touched it".
+    srv.wal.wantsync = 0;
+    srv.wal.syncrate = -1;
     char *args[] = { "-f9999999999", NULL };
     optparse(&srv, args);
-    assertf(srv.wal.syncrate <= (int64)1000000000 * 1000000,
-        "f overflow must be capped");
+    assertf(srv.wal.syncrate == cap_ms * 1000000,
+        "-f9999999999 must be reduced to exactly %lldms (%lldns), got %lldns",
+        (long long)cap_ms, (long long)(cap_ms * 1000000),
+        (long long)srv.wal.syncrate);
     assertf(srv.wal.wantsync == 1, "wantsync must be set");
 }
 
 void
 cttest_optz_exact_max()
 {
+    char path[256];
+    snprintf(path, sizeof path, "%s/warn.txt", ctdir());
+    progname = "beanstalkd";
+    log_json = 0;
+    job_data_size_limit = 7; // sentinel: the flag must do the writing
+
     char *args[] = { "-z1073741824", NULL };
+    capture_stderr_to(path);
     optparse(&srv, args);
+    fflush(stderr);
+
+    char buf[2048];
+    size_t n = read_file(path, buf, sizeof buf);
+
     assertf(job_data_size_limit == JOB_DATA_SIZE_LIMIT_MAX,
         "z=max must be accepted exactly, got %zu", job_data_size_limit);
+    // "accepted at the boundary" and "clamped down to the boundary" leave
+    // the same number behind; only the operator's console tells them
+    // apart. usage() calls this value allowed, so taking it must be
+    // silent — an off-by-one in the clamp test would report the operator's
+    // own documented maximum back to them as a correction.
+    assertf(n == 0,
+        "the documented maximum must be accepted without a diagnostic, got [%s]",
+        buf);
 }
 
 void
@@ -132,12 +194,18 @@ cttest_optf_does_not_override_prior_D()
 // "no surprise on upgrade" contract. Parsing must reject malformed input
 // without silently swallowing it.
 
+// The shipped default is whatever the `struct Server srv` initializer
+// says, so these tests must READ it. Writing the expected value into srv
+// first destroys the only thing they exist to guard, and an argv of just
+// {NULL} never even enters optparse's loop — so each parses one unrelated
+// flag and checks that the parser ran without disturbing the default.
 void
 cttest_optc_default_off()
 {
-    srv.maxconn = 0;
-    char *args[] = { NULL };
+    char *args[] = { "-V", NULL };
     optparse(&srv, args);
+    assertf(verbose == 1,
+        "optparse must actually parse argv, got verbose=%d", verbose);
     assertf(srv.maxconn == 0,
         "default must be unlimited (0), got %u", srv.maxconn);
 }
@@ -176,9 +244,10 @@ cttest_optc_one()
 void
 cttest_optI_default_off()
 {
-    srv.idle_timeout = 0;
-    char *args[] = { NULL };
+    char *args[] = { "-V", NULL };
     optparse(&srv, args);
+    assertf(verbose == 1,
+        "optparse must actually parse argv, got verbose=%d", verbose);
     assertf(srv.idle_timeout == 0,
         "default must be disabled (0), got %lld",
         (long long)srv.idle_timeout);
@@ -234,9 +303,10 @@ cttest_optI_one_second()
 void
 cttest_optH_default_off()
 {
-    srv.http_health = 0;
-    char *args[] = { NULL };
+    char *args[] = { "-V", NULL };
     optparse(&srv, args);
+    assertf(verbose == 1,
+        "optparse must actually parse argv, got verbose=%d", verbose);
     assertf(srv.http_health == 0,
         "default must be off, got %d", srv.http_health);
 }
@@ -344,16 +414,27 @@ cttest_json_escape_truncation_safe()
 {
     // Buffer barely fits "ab\\\"" (4 chars + NUL). The next escape
     // would overflow — must stop cleanly and NUL-terminate.
-    char out[6];
+    // The array is deliberately larger than the size handed to
+    // json_escape: the bytes past dst_size are guards, so "never writes
+    // past dst_size" is a thing this test can actually observe.
+    char out[16];
+    size_t dst_size = 6;
     memset(out, 'X', sizeof out);
-    json_escape(out, sizeof out, "ab\"\"\"\"\"");
+    size_t n = json_escape(out, dst_size, "ab\"\"\"\"\"");
     // out must be NUL-terminated within bounds, no buffer overrun.
     int found_nul = 0;
-    for (size_t i = 0; i < sizeof out; i++) {
+    for (size_t i = 0; i < dst_size; i++) {
         if (out[i] == 0) { found_nul = 1; break; }
     }
     assertf(found_nul, "must NUL-terminate within buffer");
-    assertf(strlen(out) < sizeof out, "strlen must be < dst_size");
+    assertf(strlen(out) < dst_size, "strlen must be < dst_size");
+    assertf(out[dst_size] == 'X' && out[sizeof out - 1] == 'X',
+        "must not write a byte past dst_size=%zu", dst_size);
+    // Truncation keeps what fits. Dropping the whole record instead is
+    // also NUL-terminated and also within bounds — and loses the message.
+    assertf(strcmp(out, "ab\\\"") == 0,
+        "truncation must keep the bytes that fit: got [%s]", out);
+    assertf(n == 4, "must return the number of bytes written, got %zu", n);
 }
 
 void
@@ -361,12 +442,22 @@ cttest_json_escape_truncation_mid_escape()
 {
     // Hostile: only 2 bytes left, escape needs 2 bytes for \" — fits
     // exactly only if NUL also fits. Must not write partial escape.
-    char out[3]; // "a" + NUL leaves 1 byte; "\" alone needs 2 → overflow
-    json_escape(out, sizeof out, "a\"more");
+    char out[8]; // "a" + NUL leaves 1 byte; "\" alone needs 2 → overflow
+    size_t dst_size = 3;
+    memset(out, 'X', sizeof out);
+    size_t n = json_escape(out, dst_size, "a\"more");
     assertf(out[2] == 0 || out[1] == 0,
         "must NUL-terminate, got [%02x %02x %02x]",
         (unsigned char)out[0], (unsigned char)out[1], (unsigned char)out[2]);
-    assertf(strlen(out) < sizeof out, "no overrun");
+    assertf(strlen(out) < dst_size, "no overrun");
+    assertf(out[dst_size] == 'X' && out[sizeof out - 1] == 'X',
+        "must not write a byte past dst_size=%zu", dst_size);
+    // Exactly one outcome is right: the 'a' that fits is kept and the
+    // escape that does not fit is not started. Emptying the buffer also
+    // satisfies "NUL-terminated within bounds".
+    assertf(strcmp(out, "a") == 0,
+        "the byte that fit must survive the truncation: got [%s]", out);
+    assertf(n == 1, "must return the number of bytes written, got %zu", n);
 }
 
 // --- Flag parsing for --log-json (long-form flag). Order-independence
@@ -385,9 +476,10 @@ cttest_opt_log_json_long_flag()
 void
 cttest_opt_log_json_default_off()
 {
-    log_json = 0;
-    char *args[] = { NULL };
+    char *args[] = { "-V", NULL };
     optparse(&srv, args);
+    assertf(verbose == 1,
+        "optparse must actually parse argv, got verbose=%d", verbose);
     assertf(log_json == 0,
         "default must be 0 (no flag, no JSON), got %d", log_json);
 }
@@ -419,26 +511,6 @@ cttest_opt_log_json_after_short_flag()
 // --- End-to-end: capture stderr, parse the JSON line. This catches
 // any regression in field order, comma placement, or missing braces.
 
-static void
-capture_stderr_to(const char *path)
-{
-    fflush(stderr);
-    if (!freopen(path, "w+", stderr)) {
-        assertf(0, "freopen stderr: %s", strerror(errno));
-    }
-}
-
-static size_t
-read_file(const char *path, char *buf, size_t buflen)
-{
-    FILE *f = fopen(path, "r");
-    assertf(f != NULL, "fopen %s: %s", path, strerror(errno));
-    size_t n = fread(buf, 1, buflen - 1, f);
-    fclose(f);
-    buf[n] = 0;
-    return n;
-}
-
 void
 cttest_log_json_warnx_emits_warn_level()
 {
@@ -446,9 +518,12 @@ cttest_log_json_warnx_emits_warn_level()
     snprintf(path, sizeof path, "%s/log.txt", ctdir());
     log_json = 1;
     progname = "beanstalkd";
+    struct timespec before, after;
+    clock_gettime(CLOCK_REALTIME, &before);
     capture_stderr_to(path);
     warnx("hello world %d", 42);
     fflush(stderr);
+    clock_gettime(CLOCK_REALTIME, &after);
 
     char buf[1024];
     read_file(path, buf, sizeof buf);
@@ -464,6 +539,27 @@ cttest_log_json_warnx_emits_warn_level()
     size_t len = strlen(buf);
     assertf(len > 0 && buf[len - 1] == '\n',
         "must end with newline: got [%s]", buf);
+
+    // A present ts field is not a useful ts field: log shippers sort on
+    // it. Parse the value and hold it to the shape README documents —
+    // seconds with exactly three fractional digits — and to the clock the
+    // record was written by.
+    const char *ts = strstr(buf, "\"ts\":");
+    long long ts_sec = -1;
+    char ts_ms[8] = { 0 };
+    char sep = 0;
+    int fields = sscanf(ts ? ts + 5 : "", "%lld.%3[0-9]%c", &ts_sec, ts_ms, &sep);
+    assertf(fields == 3 && strlen(ts_ms) == 3 && sep == ',',
+        "ts must render as <sec>.<exactly 3 ms digits> before the next field: got [%s]",
+        buf);
+    assertf(ts_sec >= (long long)before.tv_sec && ts_sec <= (long long)after.tv_sec,
+        "ts must be the clock the record was written by (%lld..%lld), got %lld: [%s]",
+        (long long)before.tv_sec, (long long)after.tv_sec, ts_sec, buf);
+
+    // One record, one line: a warning racing in from the fsync thread
+    // must never be able to split this object across two lines.
+    assertf(strchr(buf, '\n') == buf + len - 1,
+        "a record must contain exactly one newline, at its end: got [%s]", buf);
 }
 
 void
@@ -473,8 +569,8 @@ cttest_log_json_warn_emits_error_level_and_errno()
     snprintf(path, sizeof path, "%s/log.txt", ctdir());
     log_json = 1;
     progname = "beanstalkd";
-    errno = ENOENT; // a real strerror exists
     capture_stderr_to(path);
+    errno = ENOENT; // a real strerror exists; set after freopen touches errno
     warn("open failed");
     fflush(stderr);
 
@@ -487,6 +583,14 @@ cttest_log_json_warn_emits_error_level_and_errno()
         "msg must be the format result: got [%s]", buf);
     assertf(strstr(buf, "\"errno\":\"") != NULL,
         "errno field must be present for warn(): got [%s]", buf);
+    // An errno field that is present but empty, stale, or built from
+    // some other errno is worse than none: it is the only part of the
+    // record that says WHY the operation failed. It must carry this
+    // caller's errno, rendered the same way text mode renders it.
+    char want[512];
+    snprintf(want, sizeof want, "\"errno\":\"%s\"", strerror(ENOENT));
+    assertf(strstr(buf, want) != NULL,
+        "errno field must carry the caller's errno (%s): got [%s]", want, buf);
 }
 
 // Hostile message content: quotes and backslashes inside the format
@@ -515,6 +619,12 @@ cttest_log_json_escapes_msg_content()
     // escape failed and the string was prematurely terminated.
     assertf(strstr(buf, "\"/etc/passwd\"") == NULL,
         "raw quotes must not appear in msg payload: got [%s]", buf);
+    // The whole field, byte for byte: escaping too much mangles the
+    // operator's message just as surely as escaping too little breaks
+    // the parser.
+    assertf(strstr(buf, "\"msg\":\"path=\\\"/etc/passwd\\\" \\\\ end\"") != NULL,
+        "msg must be the exact escaped rendering of the format result: got [%s]",
+        buf);
 }
 
 // JSON mode must NOT prepend the human-readable "<progname>: " prefix.
@@ -525,8 +635,14 @@ cttest_log_json_no_progname_prefix()
 {
     char path[256];
     snprintf(path, sizeof path, "%s/log.txt", ctdir());
-    log_json = 1;
     progname = "beanstalkd";
+    // Drive the flag the way an operator does. Setting log_json by hand
+    // would leave the wiring untested: a --log-json that set some other
+    // variable would still satisfy every other test in this file.
+    char *args[] = { "--log-json", NULL };
+    optparse(&srv, args);
+    assertf(log_json == 1,
+        "--log-json must be what turns JSON output on, got %d", log_json);
     capture_stderr_to(path);
     warnx("clean message");
     fflush(stderr);
@@ -538,6 +654,12 @@ cttest_log_json_no_progname_prefix()
         "first byte must be '{', got [%c] in [%s]", buf[0], buf);
     assertf(strstr(buf, "beanstalkd:") == NULL,
         "JSON mode must not emit progname prefix: got [%s]", buf);
+    size_t len = strlen(buf);
+    assertf(len > 2 && buf[len - 2] == '}' && buf[len - 1] == '\n',
+        "the record must be one complete object per line: got [%s]", buf);
+    assertf(strstr(buf, "\"msg\":\"clean message\"") != NULL,
+        "the message asked for on the command line must reach stderr: got [%s]",
+        buf);
 }
 
 // Default text mode regression: log_json=0 must keep the historical
@@ -563,6 +685,10 @@ cttest_log_text_mode_unchanged()
         "text mode must contain the message: got [%s]", buf);
     assertf(buf[0] != '{',
         "text mode must not look like JSON: got [%s]", buf);
+    // The historical line, whole: existing log-parsing scripts match on
+    // it, so nothing may be added around the message either.
+    assertf(strcmp(buf, "beanstalkd: text mode line\n") == 0,
+        "text mode must emit exactly \"<progname>: <msg>\\n\": got [%s]", buf);
 }
 
 // usage() must describe actual -s behavior. Upstream's help promises
@@ -609,4 +735,113 @@ cttest_usage_s_text_matches_exact_allocation()
     assertf(strstr(buf, range) != NULL,
         "usage must state the real -s range \"%s\" (args in sync): [%s]",
         range, buf);
+
+    // Every flag optparse accepts must appear in the help. An undocumented
+    // flag is a feature only its author can use, and a deleted help block
+    // is invisible to a test that reads one line.
+    static const char *const documented[] = {
+        "-b ", "-f ", "-F ", "-D ", "-l ", "-p ", "-u ", "-z ", "-s ",
+        "-m ", "-t ", "-c ", "-I ", "-H ", "-v ", "-V ", "-h ",
+        "--log-json ", NULL
+    };
+    const char *missing = first_missing(buf, documented);
+    assertf(missing == NULL,
+        "usage must document every accepted flag; \"%s\" is missing: [%s]",
+        missing ? missing : "", buf);
+
+    // The -z block prints two numbers from one fprintf argument list:
+    // the default first, then the maximum. Swapping them tells the
+    // operator the maximum is the default and vice versa, which no
+    // single-substring check would notice.
+    char zdefault[32], zmax[32];
+    snprintf(zdefault, sizeof zdefault, "%d", JOB_DATA_SIZE_LIMIT_DEFAULT);
+    snprintf(zmax, sizeof zmax, "%d", JOB_DATA_SIZE_LIMIT_MAX);
+    const char *zline = strstr(buf, "-z BYTES");
+    const char *at_default = zline ? strstr(zline, zdefault) : NULL;
+    const char *at_max = zline ? strstr(zline, zmax) : NULL;
+    assertf(at_default != NULL && at_max != NULL && at_default < at_max,
+        "the -z help must print the default (%s) before the maximum (%s): [%s]",
+        zdefault, zmax, buf);
+
+    // Same hazard on the -s block: its default must precede its range.
+    char sdefault[32];
+    snprintf(sdefault, sizeof sdefault, "%d", Filesizedef);
+    const char *sline = strstr(buf, "-s BYTES");
+    const char *at_sdefault = sline ? strstr(sline, sdefault) : NULL;
+    const char *at_range = sline ? strstr(sline, range) : NULL;
+    assertf(at_sdefault != NULL && at_range != NULL && at_sdefault < at_range,
+        "the -s help must print the default (%s) before the range (%s): [%s]",
+        sdefault, range, buf);
+}
+
+
+// -m takes seconds and the server keeps it in nanoseconds, so the
+// operator value is multiplied by 1e9: anything above 1e9 seconds
+// overflows int64. The documented behaviour is to warn and cap rather
+// than to wrap into a negative period, which would make the periodic
+// trim either fire every tick or never again.
+void
+cttest_optm_above_the_cap_is_clamped_not_wrapped()
+{
+    char *args[] = { "-m", "2000000000", NULL };   // 2e9 seconds
+    mem_trim_rate = 0;
+    optparse(&srv, args);
+    assertf(mem_trim_rate > 0,
+            "a capped -m must stay positive, got %lld",
+            (long long)mem_trim_rate);
+    assertf(mem_trim_rate == 1000000000LL * 1000000000LL,
+            "-m must clamp at 1e9 seconds expressed in ns, got %lld",
+            (long long)mem_trim_rate);
+}
+
+
+// The same value one step below the cap goes through untouched: the
+// clamp must not round down anything an operator can legitimately ask
+// for.
+void
+cttest_optm_at_the_cap_is_kept_exactly()
+{
+    char *args[] = { "-m", "1000000000", NULL };
+    mem_trim_rate = 0;
+    optparse(&srv, args);
+    assertf(mem_trim_rate == 1000000000LL * 1000000000LL,
+            "-m 1e9 is exactly the cap and must be kept, got %lld",
+            (long long)mem_trim_rate);
+}
+
+
+// -c is stored as a uint, so an operator value above UINT_MAX would
+// truncate — and a truncated cap is worse than no cap: `-c 4294967297`
+// would silently become 1 and refuse every connection but the first.
+// The documented behaviour is to warn and clamp.
+void
+cttest_optc_above_uint_max_is_clamped_not_truncated()
+{
+    char *args[] = { "-c", "4294967297", NULL };   // UINT_MAX + 2
+    srv.maxconn = 0;
+    optparse(&srv, args);
+    assertf(srv.maxconn == UINT_MAX,
+            "-c above UINT_MAX must clamp, not truncate: got %u",
+            srv.maxconn);
+}
+
+
+// -I takes seconds and is kept in nanoseconds, the same multiplication
+// hazard as -m. 0 is not a small timeout, it is "off", and must stay
+// distinguishable from one.
+void
+cttest_optI_zero_disables_and_a_value_converts_to_nanoseconds()
+{
+    char *off[] = { "-I", "0", NULL };
+    srv.idle_timeout = 12345;
+    optparse(&srv, off);
+    assertf(srv.idle_timeout == 0,
+            "-I 0 must disable the idle timeout, got %lld",
+            (long long)srv.idle_timeout);
+
+    char *on[] = { "-I", "7", NULL };
+    optparse(&srv, on);
+    assertf(srv.idle_timeout == 7LL * 1000000000LL,
+            "-I 7 must be seven seconds in ns, got %lld",
+            (long long)srv.idle_timeout);
 }

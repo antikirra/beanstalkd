@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include <sys/types.h>   // off_t (File::woff)
 #include <stdlib.h>
 #include <stdatomic.h>
 #include <signal.h>
@@ -42,6 +43,31 @@ typedef int(*FAlloc)(int, int);
 // or reply line ("USING a{200}\r\n").
 #define LINE_BUF_SIZE (11 + MAX_TUBE_NAME_LEN + 12)
 
+// Size of the per-conn command INPUT buffer. Deliberately larger than
+// one command line: a pipelined client sends a whole burst in one
+// segment, and the buffer is what decides how much of it a single
+// read() can take. At depth 32 of the put/reserve/delete loop, sizing
+// it at one line costs one read per ~10 commands; 1024 bytes takes the
+// whole burst in one read and drops the syscall bill from 0.31 to 0.11
+// per command (counted under strace, which is what strace is for;
+// timed with no tracer attached, because a traced syscall costs about
+// a hundred times what a real one does and flatters every count you
+// remove. Measured — 2048 and 4096 gain nothing further; they
+// measure slightly WORSE, which is the tell: fill_extra_data memmoves
+// the unconsumed tail to the front after every command, so the copying
+// grows with the square of how much of a burst the buffer holds while
+// the syscalls saved flatten out. 1024 is where the two cross, so this
+// is a knee and not a round number).
+//
+// It does NOT relax the protocol: a single command line longer than
+// LINE_BUF_SIZE is still BAD_FORMAT. The check is "no line end found
+// within the first LINE_BUF_SIZE bytes", which is the same rule stated
+// against the line rather than against the buffer.
+#define CMD_BUF_SIZE 1024
+#if CMD_BUF_SIZE < LINE_BUF_SIZE
+#error "CMD_BUF_SIZE must hold at least one full command line"
+#endif
+
 #define min(a,b) ((a)<(b)?(a):(b))
 
 // Jobs with priority less than URGENT_THRESHOLD are counted as urgent.
@@ -78,7 +104,13 @@ extern int verbose;
 extern int log_json;
 
 extern struct Server srv;
-extern volatile sig_atomic_t shutdown_requested;
+// Written by a signal handler, read by the main loop — and the handler
+// may run on ANY thread of the process, including the fsync thread.
+// volatile sig_atomic_t only orders things within one thread, so the
+// flag is a lock-free atomic: C11 allows a signal handler to touch
+// one, and relaxed order is all a "have we been asked to stop" flag
+// needs (the eventfd write in the handler is what wakes the loop).
+extern _Atomic sig_atomic_t shutdown_requested;
 
 // Replaced by tests to simulate failures.
 extern FAlloc falloc;
@@ -340,7 +372,11 @@ void warnx(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 // Exposed for testing the escape table.
 size_t json_escape(char *dst, size_t dst_size, const char *src);
 char* fmtalloc(char *fmt, ...) __attribute__((format(printf, 1, 2)));
-void* zalloc(size_t n);
+// malloc/alloc_size let the optimiser know the returned block is a
+// fresh, non-aliasing object of exactly n bytes. Without them GCC
+// loses the size and -Warray-bounds misjudges writes into the tail of
+// a heap-allocated struct.
+void* zalloc(size_t n) __attribute__((malloc, alloc_size(1)));
 #define new(T) zalloc(sizeof(T))
 void optparse(Server*, char**);
 
@@ -415,6 +451,9 @@ Tube *tube_find(Ms *tubeset, const char *name);
 Tube *tube_find_name(const char *name, size_t len);
 uint  tube_name_hash(const char *name);
 uint  tube_name_hash_n(const char *name, size_t len);
+// Length of name when it is one this server would accept on the wire,
+// 0 otherwise. The WAL reader applies it to names read off disk.
+size_t is_valid_tube(const char *name, size_t max);
 Tube *tube_find_or_make(const char *name);
 Tube *tube_find_or_make_n(const char *name, size_t len);
 #define TUBE_ASSIGN(a,b) do { \
@@ -471,6 +510,12 @@ int conn_waitpos_reserve(Conn *c, size_t n);
 void on_waiting_conn_remove(Ms *a, void *item, size_t i);
 
 void enqueue_reserved_jobs(Conn *c);
+// Not static: testinject2 drives these error paths directly, and the
+// WAL reader is called from walg.c. Declared here so the definitions
+// are checked against a prototype (-Wmissing-prototypes).
+int  kick_buried_job(Server *s, Job *j);
+int  kick_delayed_job(Server *s, Job *j);
+void walread(Wal *w, Job *list, int min);
 
 void enter_drain_mode(int sig);
 void h_accept(const int fd, const short which, Server *s);
@@ -563,20 +608,44 @@ struct Conn {
     // completes (or sends INTERNAL_ERROR if the commit failed).
     // dur_batch_idx is the position in the global batch array, used by
     // connclose() for O(1) swap-remove.
-    // These three scalars MUST stay before cmd[]: the pool-reuse memset
+    //
+    // in_pipe_batch = 1 iff h_conn's dispatch loop is coalescing a
+    // pipelined burst: the same buffer collects every ack of the burst
+    // and ONE write pushes them out when the loop ends. This is the
+    // second, independent hold on dur_reply_buf — durability says "not
+    // before fdatasync", pipelining says "not before the burst ends" —
+    // so reply() buffers while EITHER is set and only the last one to
+    // let go writes (h_conn defers to dur_flush_all when both are on).
+    //
+    // out_carry = 1 marks a conn parked in dur_batch_arr purely to
+    // retry an unsent ack remainder, with no WAL record of its own
+    // behind it: a commit failure elsewhere must not turn its acks into
+    // INTERNAL_ERROR (it was promised nothing about durability).
+    //
+    // These five scalars MUST stay before cmd[]: the pool-reuse memset
     // in make_conn re-zeroes them. A stale in_dur_batch on a recycled
     // conn would make reply() buffer acks into a conn that is absent
     // from dur_batch_arr, hanging the client. The buffer itself lives
     // in the large-buffer section below; its bytes are meaningful only
     // up to dur_reply_len, so it needs no zeroing on reuse.
     int    in_dur_batch;
+    int    in_pipe_batch;
+    int    out_carry;
     int    dur_batch_idx;
     int    dur_reply_len;
+
+    // Run queue (prot.c): whole commands can sit in cmd[] with no
+    // socket event left to announce them — a command pipelined behind a
+    // blocking reserve is unblocked by prottick or by another conn's
+    // put, and the client is meanwhile blocked reading, so nothing new
+    // ever arrives on the socket. in_runq guards against double-insert.
+    int    in_runq;
+    Conn   *runq_next;
 
     // --- large buffers at end to avoid cache pollution; NOT zeroed on
     // pool reuse (memset stops at cmd[]) — contents are valid only up to
     // cmd_len / reply_len / dur_reply_len respectively ---
-    char   cmd[LINE_BUF_SIZE];     // this string is NOT NUL-terminated
+    char   cmd[CMD_BUF_SIZE];      // this string is NOT NUL-terminated
     char   reply_buf[LINE_BUF_SIZE]; // this string IS NUL-terminated
     char   dur_reply_buf[DUR_REPLY_SOFT_MAX + LINE_BUF_SIZE];
 };
@@ -632,9 +701,17 @@ void dur_remove(Conn *c);
 void dur_flush_all(int ok);
 int  dur_batch_pending(void);
 
+// runq_run dispatches commands that became runnable during this tick
+// without a socket event of their own (see Conn.in_runq). Called by the
+// main loop after the event drain; a no-op when the queue is empty.
+void runq_run(void);
+void runq_remove(Conn *c);
+int  runq_pending(void);
+
 // Test-only hooks into prot.c's epollq (testprot2.c): build/drain the
 // pending sockwant list on fake conns (sock.fd == -1) to check the
 // in_epollq double-insert guard without a network race.
+void  dur_test_set_dispatch_conn(Conn *c);
 void  epollq_test_add(Conn *c, char rw);
 void  epollq_test_apply(void);
 Conn *epollq_test_head(void);
@@ -717,6 +794,14 @@ struct File {
     uint refs;
     int  seq;
     int  iswopen; // is open for writing
+
+    // Write offset, tracked so the hot path does not pay an lseek per
+    // record just to learn where a rollback would have to truncate
+    // back to. woff_valid is 0 until the first write on this fd
+    // establishes it (a File may be handed an fd that was not opened by
+    // filewopen), after which every writer keeps it in step.
+    off_t woff;
+    int   woff_valid;
     int  fd;
     int  free;
     int  resv;
@@ -807,4 +892,5 @@ void srvserve(Server *s);
 // the server parked for the full timeout. No-op if never initialized.
 int  srv_wake_init(void);
 void srv_wake(void);
+int  srv_wake_fd(void);
 void srvaccept(Server *s, int ev);

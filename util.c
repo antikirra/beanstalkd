@@ -106,12 +106,27 @@ vwarnx(const char *err, const char *fmt, va_list args)
         vlog_json(err, fmt, args);
         return;
     }
-    fprintf(stderr, "%s: ", progname);
-    if (fmt) {
-        vfprintf(stderr, fmt, args);
-        if (err) fprintf(stderr, ": %s", err);
-    }
-    fputc('\n', stderr);
+
+    // Render the whole line first and emit it with one fputs, for the
+    // same reason vlog_json does: four separate stdio calls give the
+    // fsync thread three places to land a warning of its own inside
+    // this one. It is also three fewer trips through the FILE lock.
+    char msg[2048];
+    char line[4096];
+
+    if (fmt)
+        vsnprintf(msg, sizeof msg, fmt, args);
+    else
+        msg[0] = 0;
+
+    if (fmt && err)
+        snprintf(line, sizeof line, "%s: %s: %s\n", progname, msg, err);
+    else if (fmt)
+        snprintf(line, sizeof line, "%s: %s\n", progname, msg);
+    else
+        snprintf(line, sizeof line, "%s: \n", progname);
+
+    fputs(line, stderr);
 }
 
 void

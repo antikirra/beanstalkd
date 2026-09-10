@@ -96,6 +96,12 @@ conn_defer_free_begin(void)
 void
 conn_defer_free_end(void)
 {
+    // The counter needs a floor. A stray end — one more than there were
+    // begins — would drive it negative, and the next begin only brings
+    // it back to zero: the window that follows would protect nothing,
+    // and a conn closed inside it could be recycled mid-drain.
+    if (conn_free_defer == 0)
+        return;
     if (--conn_free_defer > 0)
         return;
     Conn *c = conn_deferred;
@@ -152,6 +158,11 @@ conn_waitpos_reserve(Conn *c, size_t n)
     size_t ncap = c->waitpos_cap ? c->waitpos_cap << 1 : 8;
     if (ncap < n)
         ncap = n;
+    // ncap * sizeof(*p) wraps for a slot count this large, and realloc
+    // would then hand back a small block that the caller believes holds
+    // ncap hints.
+    if (ncap > SIZE_MAX / sizeof(size_t))
+        return 0;
     size_t *p = realloc(c->waitpos, ncap * sizeof(*p));
     if (!p)
         return 0;
@@ -333,7 +344,14 @@ conntickat(Conn *c)
         int64 idle_d = c->last_activity_at + srv.idle_timeout - now;
         t = min(t, idle_d);
     }
-    return now + t;
+
+    // 0 is connsched's "nothing to wake for" sentinel, so a genuine
+    // wake-up that lands exactly on it would evict the conn from the
+    // tick heap and lose its reservation. Report the earliest instant
+    // that is not the sentinel instead: it is already in the past, so
+    // prottick handles it on the very next pass.
+    int64 at = now + t;
+    return at ? at : 1;
 }
 
 
@@ -423,7 +441,12 @@ conn_reserve_job(Conn *c, Job *j)
     j->tube->stat.reserved_ct++;
     j->r.reserve_ct++;
 
-    j->r.deadline_at = now + j->r.ttr;
+    // The protocol caps ttr at UINT32_MAX seconds, but a ttr replayed
+    // from a binlog carries whatever that file held: now + ttr then
+    // overflows, and a wrapped deadline is already in the past, so the
+    // job is timed out the instant it is handed to a worker.
+    j->r.deadline_at = j->r.ttr > INT64_MAX - now ? INT64_MAX
+                                                  : now + j->r.ttr;
     j->r.state = Reserved;
     job_list_insert(&c->reserved_jobs, j);
     j->reserver = c;
@@ -489,14 +512,26 @@ connclose(Conn *c)
 
     // Detach from durable-commit batch if pending; must happen before
     // the pool slot could be reused, otherwise dur_flush_all() would
-    // write buffered acks to a recycled conn's fd.
+    // write buffered acks to a recycled conn's fd. Drop the pipeline
+    // hold in the same breath: h_conn releases it on the way out, but a
+    // conn closed from anywhere else (idle reaper, epollq_apply) would
+    // otherwise carry a stale hold into its next life and buffer acks
+    // nobody is going to flush.
     dur_remove(c);
+    c->in_pipe_batch = 0;
+    runq_remove(c);
 
-    job_free(c->in_job);
+    // in_job and out_job may name the same object; decide that before
+    // anything is released, so the Copy check below cannot free a job
+    // this line already gave back.
+    Job *in = c->in_job;
+    Job *out = c->out_job == in ? NULL : c->out_job;
+
+    job_free(in);
 
     /* was this a peek or stats command? */
-    if (c->out_job && c->out_job->r.state == Copy)
-        job_free(c->out_job);
+    if (out && out->r.state == Copy)
+        job_free(out);
 
     c->in_job = c->out_job = NULL;
     c->in_job_read = 0;

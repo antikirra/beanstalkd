@@ -8,6 +8,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 /* Defined in prot.c, exposed here for hostile unit tests that need to
  * observe or seed the global stats counters directly. */
@@ -28,6 +31,65 @@ extern struct stats global_stat;
 /* Access to prot.c internals needed for testing.
  * These are extern or accessible via dat.h. */
 
+/* The period prottick returns when it has found no work at all. */
+#define PROTTICK_IDLE_PERIOD 0x34630B8A000LL
+
+/* Registers delayed jobs the way a live `put <pri> <delay> ...` does.
+ * prot_replay is the only entry point outside prot.c that reaches
+ * enqueue_job's delayed branch, so it is also the only way a test can
+ * move delayed_ct, the per-tube delay heap AND the global
+ * delay_tube_heap together. A hand-rolled heapinsert moves the first
+ * two and silently skips the third — which is exactly why every delay
+ * test below used to be blind to delay_tube_update. */
+static void
+replay_delayed(Server *s, Job **jobs, int n)
+{
+    Job list;
+    job_list_reset(&list);
+    for (int i = 0; i < n; i++) {
+        jobs[i]->r.state = Delayed;
+        job_list_insert(&list, jobs[i]);
+    }
+    assertf(prot_replay(s, &list) == 1,
+            "prot_replay must accept %d delayed jobs", n);
+}
+
+/* prottick's return value is the only public window onto
+ * soonest_delayed_job(): it must name the earliest deadline registered
+ * anywhere. Bracketed by clock samples taken around the call, so the
+ * check carries no slack beyond the measurement itself. */
+static void
+assert_tick_wakes_at(Server *s, int64 deadline, const char *ctx)
+{
+    int64 t0 = nanoseconds();
+    int64 p = prottick(s);
+    int64 t1 = nanoseconds();
+    assertf(p <= deadline - t0 && p >= deadline - t1,
+            "%s: prottick must wake for the soonest delayed job "
+            "(deadline %" PRId64 "); period %" PRId64
+            " is outside [%" PRId64 ", %" PRId64 "]",
+            ctx, deadline, p, deadline - t1, deadline - t0);
+}
+
+/* Number of distinct hashes over n names sharing `prefix`. A hash that
+ * stops reading after the first 8 or 16 bytes collapses them all. */
+static int
+distinct_tail_hashes(const char *prefix, int n)
+{
+    uint seen[128];
+    int distinct = 0;
+    for (int i = 0; i < n && i < 128; i++) {
+        char name[80];
+        snprintf(name, sizeof name, "%s%03d", prefix, i);
+        seen[i] = tube_name_hash(name);
+        int dup = 0;
+        for (int k = 0; k < i; k++)
+            dup |= (seen[k] == seen[i]);
+        distinct += !dup;
+    }
+    return distinct;
+}
+
 /* --- delayed_ct counter correctness --- */
 
 void
@@ -44,6 +106,23 @@ cttest_delayed_ct_starts_zero()
 
     assertf(t->delay.len == 0, "fresh tube must have no delayed jobs");
 
+    /* The only public window on the counter: with nothing delayed
+     * anywhere, prottick must find no delayed work and park for its
+     * full idle period. A tube pre-registered in the global delay heap
+     * by prot_init, or a residual delayed job, shortens it. */
+    Tube *fresh = tube_find_or_make("delay-test-fresh");
+    tube_iref(fresh);
+    assertf(fresh->in_delay_heap == 0,
+            "a tube with no delayed job must not sit in the global delay heap");
+
+    mem_trim_rate = 0;
+    Server s = {0};
+    int64 idle = prottick(&s);
+    assertf(idle == PROTTICK_IDLE_PERIOD,
+            "with nothing delayed prottick must park for the full idle "
+            "period, got %" PRId64, idle);
+
+    tube_dref(fresh);
     tube_dref(t);
 }
 
@@ -83,6 +162,30 @@ cttest_delayed_ct_enqueue_and_remove()
     assertf(t->delay.len == 0,
             "tube must have 0 delayed jobs after removal, got %zu", t->delay.len);
 
+    /* Everything above moves heap.c's bookkeeping only. Re-run the same
+     * tube through the production writer so delayed_ct and the global
+     * delay_tube_heap actually move: enqueue_job must register the tube
+     * (delay_tube_update) or the job is invisible to prottick forever. */
+    mem_trim_rate = 0;
+    Server s = {0};
+    Job *live[3];
+    int64 base = nanoseconds();
+    for (i = 0; i < 3; i++) {
+        live[i] = make_job(1, 30000000000LL, 1000000000, 0, t);
+        assertf(live[i], "live job %d must allocate", i);
+        live[i]->r.deadline_at = base + (int64)(30 + i * 10) * 1000000000LL;
+    }
+    replay_delayed(&s, live, 3);
+
+    assertf(t->in_delay_heap == 1,
+            "enqueue_job must register the tube in the global delay heap");
+    assert_tick_wakes_at(&s, live[0]->r.deadline_at, "delayed enqueue");
+
+    for (i = 0; i < 3; i++) {
+        heapremove(&t->delay, live[i]->heap_index);
+        job_free(live[i]);
+    }
+
     for (i = 0; i < N; i++)
         job_free(jobs[i]);
 
@@ -117,6 +220,28 @@ cttest_delay_tube_heap_single_tube()
      * is consistent by checking the tube's delay heap. */
 
     assertf(t->delay.len == 1, "tube must have 1 delayed job");
+
+    /* The promise this test's name makes, finally checked: once a tube
+     * holds a delayed job it must be VISIBLE in the global delay heap,
+     * or soonest_delayed_job never sees it and prottick sleeps straight
+     * past the deadline. Registration lives inside enqueue_job, so it
+     * has to be driven through prot_replay, not a hand heapinsert. */
+    mem_trim_rate = 0;
+    Server s = {0};
+    Tube *live = tube_find_or_make("dth-single-live");
+    tube_iref(live);
+    Job *lj = make_job(1, 30000000000LL, 1000000000, 0, live);
+    assertf(lj, "live delayed job must allocate");
+    lj->r.deadline_at = nanoseconds() + 30000000000LL;
+    replay_delayed(&s, &lj, 1);
+
+    assertf(live->in_delay_heap == 1,
+            "a tube holding a delayed job must be in the global delay heap");
+    assert_tick_wakes_at(&s, lj->r.deadline_at, "single tube");
+
+    heapremove(&live->delay, lj->heap_index);
+    job_free(lj);
+    tube_dref(live);
 
     /* Clean up */
     heapremove(&t->delay, j->heap_index);
@@ -160,6 +285,45 @@ cttest_delay_tube_heap_ordering_multi_tube()
     assertf(t3->delay.len == 1 && t3->delay.data[0] == j3,
             "t3 must have j3 at top");
 
+    /* CROSS-tube ordering — the thing this test is named for, and the
+     * thing the three per-tube checks above cannot see. Three tubes
+     * registered through the production path with soonest deadlines of
+     * 50s, 30s and 10s, handed over latest-first so the global heap has
+     * to sift. prottick must wake for the 10s tube; inverting
+     * tube_delay_less parks it on the 50s one instead. */
+    mem_trim_rate = 0;
+    Server s = {0};
+    Tube *g1 = tube_find_or_make("dth-g-late");
+    Tube *g2 = tube_find_or_make("dth-g-mid");
+    Tube *g3 = tube_find_or_make("dth-g-early");
+    assertf(g1 && g2 && g3, "cross-tube tubes must allocate");
+    tube_iref(g1);
+    tube_iref(g2);
+    tube_iref(g3);
+
+    int64 base = nanoseconds();
+    Job *gj[3];
+    gj[0] = make_job(1, 50000000000LL, 1000000000, 0, g1);
+    gj[1] = make_job(1, 30000000000LL, 1000000000, 0, g2);
+    gj[2] = make_job(1, 10000000000LL, 1000000000, 0, g3);
+    assertf(gj[0] && gj[1] && gj[2], "cross-tube jobs must allocate");
+    gj[0]->r.deadline_at = base + 50000000000LL;
+    gj[1]->r.deadline_at = base + 30000000000LL;
+    gj[2]->r.deadline_at = base + 10000000000LL;
+    replay_delayed(&s, gj, 3);
+
+    assert_tick_wakes_at(&s, gj[2]->r.deadline_at, "cross-tube ordering");
+
+    heapremove(&g1->delay, gj[0]->heap_index);
+    heapremove(&g2->delay, gj[1]->heap_index);
+    heapremove(&g3->delay, gj[2]->heap_index);
+    job_free(gj[0]);
+    job_free(gj[1]);
+    job_free(gj[2]);
+    tube_dref(g1);
+    tube_dref(g2);
+    tube_dref(g3);
+
     /* Clean up */
     heapremove(&t1->delay, j1->heap_index);
     heapremove(&t2->delay, j2->heap_index);
@@ -186,6 +350,18 @@ cttest_now_cache_used_by_allocate_job()
             "created_at must use cached now=42s, got %lld",
             (long long)j->r.created_at);
 
+    /* A single fixed 42s probe cannot separate "reads the cache" from
+     * "returns 42s" or from "now + K": take a second sample at a
+     * different cached value. */
+    int64 second = 7000000000LL; /* 7 seconds */
+    now = second;
+    Job *j2 = allocate_job(10);
+    assertf(j2, "second job must allocate");
+    assertf(j2->r.created_at == second,
+            "created_at must track the cache on every call, want %lld "
+            "got %lld", (long long)second, (long long)j2->r.created_at);
+    free(j2);
+
     free(j);
 }
 
@@ -193,13 +369,22 @@ void
 cttest_now_cache_fallback_when_zero()
 {
     /* When now=0 (before prot_init), must fall back to nanoseconds() */
+    int64 before = nanoseconds();
     now = 0;
 
     Job *j = allocate_job(10);
+    int64 after = nanoseconds();
     assertf(j, "must allocate");
     assertf(j->r.created_at > 0,
             "created_at must be > 0 even when now=0 (fallback), got %lld",
             (long long)j->r.created_at);
+    /* ">0" is satisfied by created_at=1 or by any constant. The promise
+     * is a REAL wall-clock stamp, so bracket it with the clock samples
+     * taken either side of the call. */
+    assertf(j->r.created_at >= before && j->r.created_at <= after,
+            "the now=0 fallback must stamp the live clock, not a sentinel: "
+            "created_at %lld outside [%lld, %lld]",
+            (long long)j->r.created_at, (long long)before, (long long)after);
 
     /* Restore now for other tests */
     now = nanoseconds();
@@ -217,6 +402,46 @@ cttest_tube_delay_heap_flag_init()
             "fresh tube: in_delay_heap must be 0, got %d", t->in_delay_heap);
     assertf(t->delay_heap_index == 0,
             "fresh tube: delay_heap_index must be 0");
+
+    /* Both fields above are zero because Tube comes from zalloc, so the
+     * flag was never shown to TRACK anything. Register a tube for real,
+     * kick its only delayed job (delay_tube_update's removal branch),
+     * and require the flag back down — a stale 1 sends the tube's NEXT
+     * delayed job through the in-place resift branch at an index it no
+     * longer occupies, and the tube stops being visible to
+     * soonest_delayed_job for good. */
+    now = nanoseconds();
+    prot_init();
+    mem_trim_rate = 0;
+    Server s = {0};
+
+    Tube *lt = tube_find_or_make("flag-live");
+    tube_iref(lt);
+    Job *j1 = make_job(1, 20000000000LL, 1000000000, 0, lt);
+    assertf(j1, "first delayed job must allocate");
+    j1->r.deadline_at = nanoseconds() + 20000000000LL;
+    replay_delayed(&s, &j1, 1);
+    assertf(lt->in_delay_heap == 1,
+            "tube must enter the delay heap when it gains a delayed job");
+
+    assertf(kick_delayed_job(&s, j1) == 1,
+            "kick must promote the tube's only delayed job");
+    assertf(lt->in_delay_heap == 0,
+            "tube must leave the delay heap when its last delayed job goes, "
+            "got in_delay_heap=%d", lt->in_delay_heap);
+
+    Job *j2 = make_job(1, 15000000000LL, 1000000000, 0, lt);
+    assertf(j2, "second delayed job must allocate");
+    j2->r.deadline_at = nanoseconds() + 15000000000LL;
+    replay_delayed(&s, &j2, 1);
+    assert_tick_wakes_at(&s, j2->r.deadline_at, "re-registration after kick");
+
+    heapremove(&lt->ready, j1->heap_index);
+    heapremove(&lt->delay, j2->heap_index);
+    job_free(j1);
+    job_free(j2);
+    tube_dref(lt);
+
     tube_dref(t);
 }
 
@@ -287,6 +512,32 @@ cttest_delay_tubes_stress_100()
                 i, tbs[i]->delay.len);
     }
 
+    /* The linear scan above was an oracle nobody consulted. Register the
+     * same 100 tubes through the production writer and hold
+     * soonest_delayed_job to that oracle: returning NULL, or the LATEST
+     * tube instead of the earliest, must show up in prottick's period. */
+    mem_trim_rate = 0;
+    Server s = {0};
+    Job *live[100];
+    int64 base = nanoseconds();
+    int64 live_min = INT64_MAX;
+    srand(7);
+    for (i = 0; i < N; i++) {
+        live[i] = make_job(1, 10000000000LL, 1000000000, 0, tbs[i]);
+        assertf(live[i], "live job %d must allocate", i);
+        live[i]->r.deadline_at =
+            base + (int64)(rand() % 100 + 10) * 1000000000LL;
+        if (live[i]->r.deadline_at < live_min)
+            live_min = live[i]->r.deadline_at;
+    }
+    replay_delayed(&s, live, N);
+    assert_tick_wakes_at(&s, live_min, "100-tube soonest");
+
+    for (i = 0; i < N; i++) {
+        heapremove(&tbs[i]->delay, live[i]->heap_index);
+        job_free(live[i]);
+    }
+
     /* Clean up */
     for (i = 0; i < N; i++) {
         job_free(jbs[i]);
@@ -318,6 +569,23 @@ cttest_job_delay_less_ordering()
     assertf(job_delay_less(early, late) == 1,
             "same deadline, smaller id must be less");
 
+    /* The "smaller id wins" claim rested on make_job's allocation order;
+     * say it out loud so the tie assertions mean what they read. */
+    assertf(early->r.id < late->r.id,
+            "fixture: `early` must own the smaller id (%llu vs %llu)",
+            (unsigned long long)early->r.id, (unsigned long long)late->r.id);
+
+    /* Both halves of the tie contract. `<=` on the id tie-break passes
+     * the assertion above and still corrupts every heap it drives,
+     * because a job would then sort before itself. */
+    assertf(job_delay_less(late, early) == 0,
+            "same deadline, larger id must not be less");
+    assertf(job_delay_less(early, early) == 0,
+            "a job must never sort before itself (comparator must be "
+            "irreflexive or siftdown never terminates)");
+    assertf(job_delay_less(late, late) == 0,
+            "self-compare must be false for the larger id too");
+
     job_free(early);
     job_free(late);
     tube_dref(t);
@@ -331,6 +599,19 @@ cttest_delay_heap_insert_remove_cycle()
     now = nanoseconds();
     Tube *t = make_tube("cycle");
     tube_iref(t);
+
+    /* The two assignments below re-install wiring make_tube already owns
+     * — dead setup that would MASK a regression in make_tube. Pin the
+     * wiring first so dropping it from make_tube reddens here instead of
+     * being silently repaired by the test itself. */
+    assertf(t->delay.less == job_delay_less,
+            "make_tube must wire delay.less to job_delay_less");
+    assertf(t->delay.setpos == job_setpos,
+            "make_tube must wire delay.setpos to job_setpos");
+    assertf(t->ready.less == job_pri_less,
+            "make_tube must wire ready.less to job_pri_less");
+    assertf(t->ready.setpos == job_setpos,
+            "make_tube must wire ready.setpos to job_setpos");
 
     t->delay.less = job_delay_less;
     t->delay.setpos = job_setpos;
@@ -387,6 +668,44 @@ cttest_prot_remove_tube_cleans_pause()
      * prot_remove_tube sees t->pause > 0 and must clean up the
      * pause-heap state. Must not crash, must not leave stale state. */
     tube_dref(t);
+
+    /* Nothing was read after the free above, so "must not leave stale
+     * state" was never checked — and t->in_pause_heap was never set, so
+     * the guarded branch was never even entered. Here is the delay-heap
+     * half with the branch actually taken: a tube freed while still
+     * REGISTERED must be unlinked from delay_tube_heap, or
+     * soonest_delayed_job keeps dereferencing freed memory at the heap
+     * root. `doomed` owns the earlier deadline, so it IS the root; a
+     * live second tube keeps delayed_ct positive so prottick really
+     * consults it. */
+    mem_trim_rate = 0;
+    Server s = {0};
+
+    Tube *doomed = tube_find_or_make("delayfree-doomed");
+    Tube *keeper = tube_find_or_make("delayfree-keeper");
+    assertf(doomed && keeper, "tubes must allocate");
+    tube_iref(doomed);
+    tube_iref(keeper);
+
+    int64 base = nanoseconds();
+    Job *dj = make_job(1, 10000000000LL, 1000000000, 0, doomed);
+    Job *kj = make_job(1, 40000000000LL, 1000000000, 0, keeper);
+    assertf(dj && kj, "delay-heap jobs must allocate");
+    dj->r.deadline_at = base + 10000000000LL;
+    kj->r.deadline_at = base + 40000000000LL;
+    Job *both[2] = {dj, kj};
+    replay_delayed(&s, both, 2);
+    assertf(doomed->in_delay_heap == 1 && keeper->in_delay_heap == 1,
+            "both tubes must be registered before the free");
+
+    job_free(dj);      /* drops the doomed tube's last outside reference */
+    tube_dref(doomed); /* refs 1 -> 0  =>  tube_free -> prot_remove_tube */
+
+    assert_tick_wakes_at(&s, kj->r.deadline_at, "after freeing the root tube");
+
+    heapremove(&keeper->delay, kj->heap_index);
+    job_free(kj);
+    tube_dref(keeper);
 }
 
 void
@@ -403,6 +722,31 @@ cttest_prot_remove_tube_no_crash_unpaused()
     assertf(t->in_delay_heap == 0, "fresh tube must not be in delay heap");
 
     tube_dref(t); /* → tube_free → prot_remove_tube (all zero, no-op) */
+
+    /* Both assertions above are preconditions on a zalloc'd struct;
+     * nothing at all was read AFTER the free, which is where a "no-op"
+     * that is not a no-op would show. Read the global timer state now:
+     * it must report no work, and it must still be able to take a new
+     * registration and surface it through prottick. */
+    mem_trim_rate = 0;
+    Server s = {0};
+    int64 idle = prottick(&s);
+    assertf(idle == PROTTICK_IDLE_PERIOD,
+            "freeing an unregistered tube must leave no phantom timer, "
+            "got period %" PRId64, idle);
+
+    Tube *after = tube_find_or_make("clean-free-after");
+    assertf(after, "tube must allocate");
+    tube_iref(after);
+    Job *aj = make_job(1, 25000000000LL, 1000000000, 0, after);
+    assertf(aj, "job must allocate");
+    aj->r.deadline_at = nanoseconds() + 25000000000LL;
+    replay_delayed(&s, &aj, 1);
+    assert_tick_wakes_at(&s, aj->r.deadline_at, "delay heap after tube free");
+
+    heapremove(&after->delay, aj->heap_index);
+    job_free(aj);
+    tube_dref(after);
 }
 
 /* --- ms_remove_at: O(1) hinted removal --- */
@@ -447,6 +791,17 @@ cttest_ms_remove_at_stale_hint()
     assertf(r == 1, "ms_remove_at with stale hint must still succeed via fallback");
     assertf(a.len == 2, "len must be 2");
     assertf(!ms_contains(&a, &z), "z must be gone");
+
+    /* Out-of-range hint — the third class of stale hint, and the only
+     * one that is a straight overread if the fast path is not bounds
+     * gated. It must fall back to the scan and take the right element. */
+    int r2 = ms_remove_at(&a, 99, &y);
+    assertf(r2 == 1,
+            "ms_remove_at with an out-of-range hint must still succeed "
+            "via the scan, got %d", r2);
+    assertf(a.len == 1 && ms_contains(&a, &x) && !ms_contains(&a, &y),
+            "the out-of-range removal must take y and spare x (len %zu)",
+            a.len);
 
     ms_clear(&a);
 }
@@ -642,8 +997,19 @@ cttest_job_hash_no_downscale_at_initial()
         jobs[i] = make_job(1, 0, 1, 0, t);
         assertf(jobs[i], "alloc %d", i);
     }
+    uint64 churned = jobs[0]->r.id;
     for (i = 0; i < N; i++)
         job_free(jobs[i]);
+
+    /* The churn itself was never verified: a job_free that leaves the
+     * id in the table, or a downscale that drops live entries, both
+     * pass a bare "a fresh job is findable" probe. */
+    assertf(get_all_jobs_used() == 0,
+            "the churn must drain the id table, got %zu still used",
+            get_all_jobs_used());
+    assertf(job_find(churned) == NULL,
+            "a freed job must leave no stale hash entry, id=%llu",
+            (unsigned long long)churned);
 
     /* Hash table should still be functional */
     Job *j = make_job(1, 0, 1, 0, t);
@@ -673,6 +1039,19 @@ cttest_tube_name_hash_deterministic()
     uint h5 = tube_name_hash("");
     assertf(h4 == h5, "empty hash must be deterministic");
     assertf(h4 != h1, "empty must differ from email");
+
+    /* "email" vs "video" differ in byte 0, so a hash that stops reading
+     * after the first 8 (or 16) bytes still separates them. Feed a
+     * family that differs ONLY in the tail: 64 names sharing a 24-byte
+     * prefix must produce 64 distinct values. A truncating hash yields
+     * 1. (A genuine 32-bit collision inside 64 keys has probability
+     * ~5e-7, so this is a real signal, not a lottery.) */
+    const char *prefix = "billing-eu-west-shard-00"; /* 24 bytes */
+    int distinct = distinct_tail_hashes(prefix, 64);
+    assertf(distinct == 64,
+            "hash ignores the tail: only %d distinct values across 64 names "
+            "sharing the %zu-byte prefix '%s'",
+            distinct, strlen(prefix), prefix);
 }
 
 // ─── Hash distribution fairness ────────────────────────────
@@ -1105,6 +1484,14 @@ cttest_conn_pool_drain_balances_counter()
     // The pool must keep working after a drain: take/put re-pools.
     Conn *c = make_conn(dup(2), 0, t, t);
     assertf(c, "make_conn after drain must succeed");
+    // The counter alone cannot tell "freed the structs" from "zeroed the
+    // count and kept them": a pool take bumps gen, a fresh zalloc leaves
+    // it at 0. The three conns drained above had each been pooled once,
+    // so a retained struct comes back with gen >= 1.
+    assertf(c->gen == 0,
+            "drain must actually release the pooled structs: post-drain "
+            "make_conn handed back a recycled conn (gen=%" PRIu64 ")",
+            c->gen);
     connclose(c);
     get_conn_pool_stats(&count);
     assertf(count == 1, "post-drain close must re-pool, got %d", count);
@@ -1503,6 +1890,15 @@ cttest_connsched_oom_recovery_reinserts_conn()
     assertf(c->tickat > now - 1000000000LL && c->tickat <= want,
             "tickat must be rebuilt from pending_timeout, got %" PRId64,
             c->tickat);
+    /* The window above also accepts a deadline a full second in the
+     * PAST, i.e. a conn that wakes prottick on every tick after any OOM
+     * episode. `now` does not move inside conn_sched_recover, so the
+     * promised value is exact: pending_timeout seconds from the cached
+     * clock, nothing rebuilt from a zero/stale base. */
+    assertf(c->tickat == want,
+            "recovery must rebuild tickat exactly from pending_timeout: "
+            "want %" PRId64 ", got %" PRId64 " (delta %" PRId64 "ns)",
+            want, c->tickat, c->tickat - want);
 
     /* The recovered entry is fully functional: connsched's remove path
      * (tickpos from conn_setpos during recovery) must unlink it. */
@@ -1520,4 +1916,139 @@ cttest_connsched_oom_recovery_reinserts_conn()
 
     free(s.conns.data);
     tube_dref(t);
+}
+
+
+/* ============================================================
+ * ANGRY TESTS — epollq_add / dur_remove / dur_batch_pending.
+ * These are prot.c internals whose only public surface is the
+ * test hook (epollq_test_*) or the exported dur_* API, so they are
+ * driven directly instead of over the wire.
+ * ============================================================ */
+
+/* epollq_add's contract is "the single apply always uses the freshest
+ * rw". The interest byte 0 means "park this fd out of epoll", which is
+ * exactly what reply() does when it defers a job reply under -D; the
+ * re-arm that follows must win. A membership guard placed before the
+ * `c->rw = rw` store would let the stale 0 stand and leave the socket
+ * out of epoll for good — the connection then never wakes again.
+ * (The sibling test above covers the 'h' -> 'r' order; this one covers
+ * the parked -> writable order, which is the one -D depends on.) */
+void
+cttest_epollq_add_zero_then_write_applies_the_freshest_interest()
+{
+    prot_init();
+
+    static Conn parked;
+    memset(&parked, 0, sizeof parked);
+    parked.srv = &srv;
+    parked.pending_timeout = -1;
+    parked.sock.fd = -1;
+    job_list_reset(&parked.reserved_jobs);
+
+    epollq_test_add(&parked, 0);
+    epollq_test_add(&parked, 'w');
+
+    int queued = 0;
+    for (Conn *c = epollq_test_head(); c; c = c->next) {
+        assertf(++queued <= 1, "epollq must not cycle on a repeated add");
+    }
+    char applied = parked.rw;
+    epollq_test_apply();
+
+    assertf(queued == 1 && applied == 'w' && epollq_test_head() == NULL
+            && !parked.in_epollq,
+            "a conn parked out of epoll and re-armed for write in the same"
+            " tick must be queued once and apply 'w'; queued=%d rw='%c'",
+            queued, applied ? applied : '0');
+}
+
+/* dur_remove is documented as safe to call for a conn that is not in
+ * the batch — connclose() calls it unconditionally. A version that
+ * skipped the in_dur_batch guard would decrement dur_batch_n below zero
+ * and hand the next flush a pointer out of an empty array. */
+void
+cttest_dur_remove_of_an_unregistered_conn_leaves_the_batch_empty()
+{
+    prot_init();
+
+    static Conn stranger;
+    memset(&stranger, 0, sizeof stranger);
+    stranger.srv = &srv;
+    stranger.sock.fd = -1;
+    stranger.dur_batch_idx = 7;   // stale index from an earlier batch
+
+    dur_remove(&stranger);
+
+    assertf(dur_batch_pending() == 0 && stranger.in_dur_batch == 0
+            && stranger.dur_reply_len == 0,
+            "removing a conn that was never registered must leave the"
+            " batch empty and the conn unflagged; pending=%d flag=%d"
+            " len=%d", dur_batch_pending(), (int)stranger.in_dur_batch,
+            (int)stranger.dur_reply_len);
+}
+
+/* dur_batch_pending's whole promise is the boolean: false when the
+ * batch holds nothing, so the event loop parks normally instead of
+ * spinning. A `>= 0` comparison would make every idle tick claim work. */
+void
+cttest_dur_batch_pending_is_false_when_nothing_is_deferred()
+{
+    prot_init();
+
+    int pending = dur_batch_pending();
+
+    assertf(pending == 0,
+            "with no conn deferred the batch must report nothing pending,"
+            " got %d", pending);
+}
+
+
+// net.c binds IPv6 as well as IPv4 — README lists it as supported — and
+// nothing exercised it. The v6 path differs in more than the address
+// family: it sets IPV6_V6ONLY so a v6 listener does not silently
+// swallow v4 traffic, and the verbose line brackets the address. A
+// listener that came back unusable, or that answered on v4 as well,
+// would have gone unnoticed.
+void
+cttest_make_server_socket_binds_ipv6_loopback(void)
+{
+    int fd = make_server_socket("::1", "0");
+    if (fd == -1) {
+        // No IPv6 on this machine at all: nothing to assert, and
+        // failing here would only report the environment.
+        return;
+    }
+
+    struct sockaddr_in6 sa;
+    socklen_t len = sizeof sa;
+    assertf(getsockname(fd, (struct sockaddr *)&sa, &len) == 0,
+            "the listener must be a real bound socket: %s", strerror(errno));
+    assertf(sa.sin6_family == AF_INET6,
+            "make_server_socket(\"::1\") must produce an AF_INET6 socket, "
+            "got family %d", sa.sin6_family);
+    assertf(ntohs(sa.sin6_port) != 0,
+            "the kernel must have assigned a port");
+
+    // V6ONLY: a v6 listener must not also accept v4-mapped traffic, or
+    // "bind ::1" quietly becomes "bind everything". Note this assertion
+    // does not distinguish our setsockopt from the kernel default —
+    // most systems already ship net.ipv6.bindv6only=1 — so it catches
+    // the regression only where the default is 0. It is still the
+    // property worth stating.
+    int v6only = -1;
+    socklen_t olen = sizeof v6only;
+    assertf(getsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, &olen) == 0,
+            "IPV6_V6ONLY must be readable: %s", strerror(errno));
+    assertf(v6only == 1,
+            "a v6 listener must be v6-only, got %d", v6only);
+
+    // And it really is listening: a connect must be accepted by the
+    // kernel's backlog.
+    int c = socket(AF_INET6, SOCK_STREAM, 0);
+    assertf(c >= 0, "setup: client socket");
+    assertf(connect(c, (struct sockaddr *)&sa, sizeof sa) == 0,
+            "the listener must accept connections: %s", strerror(errno));
+    close(c);
+    close(fd);
 }

@@ -1,6 +1,10 @@
 char *ctdir(void);
 void  ctfail(void);
-void  ctfailnow(void);
+// abort()s: telling the compiler so lets every assert() below act as
+// a real narrowing guard. Without it a pointer checked by assert is
+// still "possibly NULL" afterwards, and -Warray-bounds /
+// -Wstringop-overflow read that as a zero-sized destination.
+void  ctfailnow(void) __attribute__((noreturn));
 void  ctresettimer(void);
 void  ctstarttimer(void);
 void  ctstoptimer(void);

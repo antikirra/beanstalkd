@@ -2,7 +2,14 @@ PREFIX?=/usr/local
 BINDIR=$(DESTDIR)$(PREFIX)/bin
 
 CFLAGS ?= -O2 -flto=auto
-override CFLAGS+=-Wall -Wextra -Werror -Wformat=2 -g
+# -Wshadow through -Wdouble-promotion cost nothing on this tree (they
+# were all clean when added) and each closes a real class of mistake:
+# a local hiding another, a definition with no prototype to check it
+# against, a duplicate declaration drifting from its twin, a typo'd
+# #ifdef silently taking the false branch.
+override CFLAGS+=-Wall -Wextra -Werror -Wformat=2 -g \
+                 -Wshadow -Wstrict-prototypes -Wmissing-prototypes \
+                 -Wredundant-decls -Wundef -Wdouble-promotion
 override LDFLAGS?=
 override LDFLAGS+=-flto=auto
 
@@ -51,6 +58,22 @@ TOFILES=\
 	testwal2.o\
 	testinject.o\
 	testinject2.o\
+
+# Angry tests for file.c: one dedicated test file per unit.
+# Registered by wildcard so adding testfile_<unit>.c needs no edit here.
+TOFILES+=$(patsubst %.c,%.o,$(wildcard testfile_*.c))
+
+# Angry tests for walg.c: one dedicated test file per unit.
+# Registered by wildcard so adding testwal_<unit>.c needs no edit here.
+TOFILES+=$(patsubst %.c,%.o,$(wildcard testwal_*.c))
+
+# Angry tests for conn.c: one dedicated test file per unit.
+# Registered by wildcard so adding testconn_<unit>.c needs no edit here.
+TOFILES+=$(patsubst %.c,%.o,$(wildcard testconn_*.c))
+
+# Angry tests for util.c: one dedicated test file per unit.
+# Registered by wildcard so adding testutil_<unit>.c needs no edit here.
+TOFILES+=$(patsubst %.c,%.o,$(wildcard testutil_*.c))
 
 HFILES=\
 	dat.h\
@@ -103,7 +126,12 @@ endif
 # Test objects must stay inspectable by nm for ct/gen: slim-LTO
 # bytecode objects export no symbols, which would silently generate
 # an empty test list and a falsely green `make check`.
-$(TOFILES): override CFLAGS += -fno-lto
+# Also drop the two prototype warnings for test objects: ct/gen scans
+# for the historic `cttest_foo()` spelling and emits the declarations
+# itself, so these definitions legitimately have no prototype of their
+# own and must keep the empty parameter list.
+$(TOFILES): override CFLAGS += -fno-lto \
+                               -Wno-missing-prototypes -Wno-strict-prototypes
 
 CLEANFILES+=$(wildcard *.o)
 
@@ -132,6 +160,8 @@ WRAP_FLAGS=\
 	-Wl,--wrap,fdatasync\
 	-Wl,--wrap,stat\
 	-Wl,--wrap,pthread_create\
+	-Wl,--wrap,fallocate\
+	-Wl,--wrap,setsockopt\
 	-Wl,--wrap,epoll_pwait
 
 ct/_ctcheck: ct/_ctcheck.o ct/ct.o $(OFILES) $(TOFILES)
@@ -144,6 +174,11 @@ ct/_ctcheck.c: $(TOFILES) ct/gen
 	mv $@.part $@
 
 ct/ct.o ct/_ctcheck.o: ct/ct.h ct/internal.h
+
+# ct/ is a vendored harness in its own style, and ct/_ctcheck.c is
+# generated: neither is ours to re-spell for the prototype warnings.
+ct/ct.o ct/_ctcheck.o: override CFLAGS += \
+    -Wno-missing-prototypes -Wno-strict-prototypes
 
 $(TOFILES): $(HFILES) ct/ct.h
 testinject.o testinject2.o: testinject.h

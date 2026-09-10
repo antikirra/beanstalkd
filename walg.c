@@ -14,6 +14,7 @@
 #include <pthread.h>
 
 static int reserve(Wal *w, int n);
+static void resvreturn(Wal *w, int n);
 
 // fdatasync() skips metadata (atime/mtime) flush — faster than fsync()
 // for WAL writes where only data integrity matters.
@@ -80,7 +81,23 @@ walsyncstart(Wal *w)
     w->sync_fd = -1;
     w->sync_stop = 0;
     w->sync_err = 0;
-    if (pthread_create(&w->sync_thread, NULL, sync_thread_fn, w) != 0) {
+
+    // Keep every signal off this thread. The kernel is free to deliver a
+    // process-directed SIGTERM/SIGUSR1 to whichever thread has it
+    // unblocked; handling it here would run the shutdown/drain handler
+    // on a thread whose job is one fdatasync at a time, and the main
+    // loop is the only place equipped to act on either. The mask is
+    // inherited by the new thread and restored right after.
+    sigset_t all, saved;
+    sigfillset(&all);
+    int masked = pthread_sigmask(SIG_SETMASK, &all, &saved) == 0;
+
+    int cr = pthread_create(&w->sync_thread, NULL, sync_thread_fn, w);
+
+    if (masked)
+        pthread_sigmask(SIG_SETMASK, &saved, NULL);
+
+    if (cr != 0) {
         // Graceful fallback: no thread, sync_on stays 0, walsync() / dirsync()
         // fall through to the inline durable_fsync branch. Destroy the pair
         // we just initialised so a retry (or a second walsyncstart on the
@@ -132,6 +149,11 @@ walscandir(Wal *w)
     while ((e = readdir(d))) {
         if (strncmp(e->d_name, base, len) == 0) {
             char *start = e->d_name+len;
+            // strtol skips leading whitespace and accepts a leading
+            // '+'; this writer produces neither, so "binlog.+7" or
+            // "binlog. 7" dropped into the directory must not steer
+            // w->next past the files that actually exist.
+            if (*start < '0' || *start > '9') continue;
             errno = 0;
             n = strtol(start, &p, 10);
             // Require a non-empty numeric suffix ("binlog." alone has
@@ -201,13 +223,22 @@ walgc(Wal *w)
     // side effect the failed binlog stays on disk for recovery.
     while (w->head && !w->head->refs && w->head != w->cur) {
         f = w->head;
+
+        // Drop the bookkeeping only once the file has actually left the
+        // directory. A failed unlink leaves it on disk for the next
+        // start to find, so nfile has to keep counting it — otherwise
+        // the wal believes in fewer binlogs than walscandir will meet.
+        if (unlink(f->path) != 0) {
+            twarn("unlink %s", f->path);
+            break;
+        }
+
         w->head = f->next;
         if (w->tail == f) {
             w->tail = f->next; // also, f->next == NULL
         }
 
         w->nfile--;
-        unlink(f->path);
         free(f->path);
         free(f);
         did_unlink = 1;
@@ -303,7 +334,8 @@ moveone(Wal *w)
         return 1; // nothing to move
     }
 
-    if (!walresvmigrate(w, j)) {
+    int resv = walresvmigrate(w, j);
+    if (!resv) {
         return 1; // it will not fit, try again later
     }
 
@@ -316,6 +348,14 @@ moveone(Wal *w)
     filermjob(w->head, j);
     w->nmig++;
     int r = walwrite(w, j);
+    if (!r) {
+        // The write failed and the wal is disabled: this binlog now
+        // holds the only copy of the job, so hold on to the guard
+        // reference and leave the file on disk for the next start to
+        // replay. Its reservation is neither spent nor owed any more.
+        resvreturn(w, resv);
+        return 0;
+    }
     filedecref(w->head);
     return r;
 }
@@ -332,7 +372,10 @@ walcompact(Wal *w)
     for (; r >= 2; r--) {
         for (int batch = 0; batch < 8; batch++) {
             if (!moveone(w))
-                return batch > 0; // partial batch is not a failure
+                // A partial batch is not a failure — but a migration
+                // that disabled the wal is, however many succeeded
+                // before it.
+                return w->use && batch > 0;
         }
     }
 
@@ -345,19 +388,28 @@ walsync(Wal *w)
 {
     // Fast lock-free error check: avoid mutex on every walmaint call.
     // Only take the mutex for the rare sync handoff or error reset.
-    if (w->sync_on) {
-        if (atomic_load_explicit(&w->sync_err, memory_order_relaxed)) {
+    // Checked whether or not the thread is still running: walsyncstop
+    // joins it, but a failure recorded on its last round is still
+    // unreported, and the acks that rode on that fsync have already
+    // gone out. Only the locking differs — once the thread is joined
+    // the mutex is destroyed and nothing else can touch sync_err.
+    if (atomic_load_explicit(&w->sync_err, memory_order_relaxed)) {
+        int err;
+        if (w->sync_on) {
             pthread_mutex_lock(&w->sync_mu);
-            int err = atomic_load_explicit(&w->sync_err, memory_order_relaxed);
+            err = atomic_load_explicit(&w->sync_err, memory_order_relaxed);
             // Use atomic_store to match the fsync thread's store pattern;
             // mixing atomic and plain access on an _Atomic variable is
             // technically allowed but brittle (#709).
             atomic_store_explicit(&w->sync_err, 0, memory_order_relaxed);
             pthread_mutex_unlock(&w->sync_mu);
-            errno = err;
-            twarn("async fsync");
-            return 0;
+        } else {
+            err = atomic_load_explicit(&w->sync_err, memory_order_relaxed);
+            atomic_store_explicit(&w->sync_err, 0, memory_order_relaxed);
         }
+        errno = err;
+        twarn("async fsync");
+        return 0;
     }
 
     if (w->wantsync && now >= w->lastsync+w->syncrate) {
@@ -515,6 +567,16 @@ makenextfile(Wal *w)
 {
     File *f;
 
+    // The sequence is an int and fileinit stamps it into the file name:
+    // incrementing at INT_MAX is undefined, and the negative seq it
+    // produces in practice names a binlog.-1 that walscandir can never
+    // find again. Stop making files instead; the caller treats a failed
+    // makenextfile as "no space", which is the honest answer.
+    if (w->next >= INT_MAX) {
+        twarnx("binlog sequence exhausted at %d", w->next);
+        return 0;
+    }
+
     f = new(File);
     if (!f) {
         twarnx("OOM");
@@ -534,7 +596,7 @@ makenextfile(Wal *w)
         return 0;
     }
 
-    w->next++;
+    w->next++;   // guarded above: w->next < INT_MAX on entry
     fileadd(f, w);
     dirsync(w);
     return 1;
@@ -555,7 +617,20 @@ static int
 needfree(Wal *w, int n)
 {
     if (w->tail->free >= n) return n;
-    if (makenextfile(w)) return n;
+
+    // A record larger than a whole binlog can never be housed anywhere:
+    // making another file only drives that file's free count negative,
+    // and every later reservation reads the negative number as space it
+    // is free to spend.
+    if (n > w->filesize - (int)sizeof(int)) {
+        twarnx("record of %d bytes exceeds the %d-byte binlog size",
+               n, w->filesize);
+        return 0;
+    }
+
+    // makenextfile succeeding is not the same as the new file having
+    // room: check what it actually published.
+    if (makenextfile(w) && w->tail->free >= n) return n;
     return 0;
 }
 
@@ -581,6 +656,19 @@ balancerest(Wal *w, File *b, int n)
     rest = b->resv - n;
     r = rest % z;
     if (r == 0) return balancerest(w, b->next, 0);
+
+    // Both redistributions below shift the remainder between b and the
+    // tail. When b IS the tail each of them is a move onto itself: it
+    // changes nothing and reports success on a chain that still holds a
+    // remainder no delete record can ever use. r is less than one delete
+    // slot, so handing it back to b's own free space costs no slot and
+    // restores the invariant.
+    if (b == w->tail) {
+        b->resv -= r;
+        b->free += r;
+        w->resv -= r;
+        return balancerest(w, b->next, 0);
+    }
 
     c = z - r;
     if (w->tail->resv >= c && b->free >= c) {
@@ -706,6 +794,17 @@ void
 walresvreturn(Wal *w, int n)
 {
     if (!w->use) return;
+    resvreturn(w, n);
+}
+
+
+// The accounting half of walresvreturn, usable on the failure paths that
+// have just disabled the wal: the counters still have to add up, because
+// ratio() and the stats block keep reading them for the life of the
+// process.
+static void
+resvreturn(Wal *w, int n)
+{
     if (n <= 0) return;
 
     int from_cur = n;
@@ -744,7 +843,11 @@ waldirlock(Wal *w)
     }
     snprintf(path, path_length, "%s/lock", w->dir);
 
-    fd = open(path, O_WRONLY|O_CREAT|O_CLOEXEC, 0600);
+    // A signal delivered during startup is not another instance holding
+    // the lock: retry rather than refuse to start.
+    do {
+        fd = open(path, O_WRONLY|O_CREAT|O_CLOEXEC, 0600);
+    } while (fd == -1 && errno == EINTR);
     free(path);
     if (fd == -1) {
         twarn("open");

@@ -8,7 +8,7 @@
 #include <errno.h>
 #include <sys/eventfd.h>
 
-volatile sig_atomic_t shutdown_requested = 0;
+_Atomic sig_atomic_t shutdown_requested = 0;
 
 // Self-pipe trick (eventfd flavor): closes the check-then-block
 // shutdown race. srvserve tests shutdown_requested/drain_mode once per
@@ -35,6 +35,15 @@ srv_wake_init(void)
     return 0;
 }
 
+// The wake eventfd itself. Exposed so a test can prove a wake-up
+// actually reached it: srv_wake runs in a signal handler where the
+// only observable effect is this counter.
+int
+srv_wake_fd(void)
+{
+    return wake_fd;
+}
+
 // srv_wake is async-signal-safe (write + errno save/restore) and
 // thread-agnostic: with no signal blocking, the kernel may deliver
 // SIGTERM/SIGUSR1 to the WAL fsync thread; writing the eventfd from
@@ -48,8 +57,21 @@ srv_wake(void)
         return;
     int saved_errno = errno;
     uint64_t one = 1;
-    ssize_t r = write(wake_fd, &one, sizeof one);
-    (void)r;
+
+    // Retry on EINTR. This runs inside a signal handler, and losing the
+    // write loses the wake-up: the main loop would stay parked in
+    // epoll_pwait — up to an hour when idle — with shutdown_requested
+    // already set and nobody to notice. EAGAIN needs no retry: it means
+    // the eventfd counter is already saturated, so a wake-up is pending
+    // either way.
+    for (;;) {
+        ssize_t r = write(wake_fd, &one, sizeof one);
+        if (r == (ssize_t)sizeof one)
+            break;
+        if (r == -1 && errno == EINTR)
+            continue;
+        break;
+    }
     errno = saved_errno;
 }
 
@@ -133,7 +155,8 @@ srvserve(Server *s)
     }
 
     for (;;) {
-        if (unlikely(shutdown_requested))
+        if (unlikely(atomic_load_explicit(&shutdown_requested,
+                                         memory_order_relaxed)))
             break;
 
         int64 period = prottick(s);
@@ -142,8 +165,10 @@ srvserve(Server *s)
         // ticks (partial socket write while the conn was mid-PUT or
         // waiting). Such a conn generates no epoll event by itself, so
         // cap the park to retry the flush promptly instead of sleeping
-        // until the next natural wake-up (up to 1h when idle).
-        if (unlikely(dur_batch_pending()))
+        // until the next natural wake-up (up to 1h when idle). Same for
+        // a run queue that did not drain in one tick: its conns are
+        // waiting on nothing but us.
+        if (unlikely(dur_batch_pending() || runq_pending()))
             period = min(period, 10000000LL); // 10ms retry cadence
 
         // Drain all ready events before next prottick.
@@ -162,6 +187,11 @@ srvserve(Server *s)
             }
             sock->f(sock->x, rw);
         }
+        // Commands unblocked during this tick with no socket event of
+        // their own (a command pipelined behind a reserve that prottick
+        // or another conn's put just answered). Runs inside the
+        // deferred-free bracket: dispatching can close conns.
+        runq_run();
         conn_defer_free_end();
         // Defensive, currently unreachable: socknext exits(1) itself on
         // a non-EINTR epoll error and never returns -1. Kept as a guard

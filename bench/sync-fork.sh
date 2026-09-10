@@ -29,7 +29,6 @@ ssh -F "$SSH_CONFIG" "$SSH_HOST" 'mkdir -p ~/fork'
 echo "[sync-fork] rsync $REPO_DIR -> $SSH_HOST:~/fork"
 rsync -az --delete \
   --exclude='.git/' \
-  --exclude='.claude/' \
   --exclude='*.o' \
   --exclude='beanstalkd' \
   --exclude='ct/_ctcheck*' \

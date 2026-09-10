@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <sys/epoll.h>
 #include <pthread.h>
+#include <sys/socket.h>
 
 struct fault faults[FAULT_COUNT];
 
@@ -29,6 +30,10 @@ default_err(int which)
         return ENOENT;
     case FAULT_STAT:
         return EACCES;
+    case FAULT_FALLOCATE:
+        return EOPNOTSUPP;
+    case FAULT_SETSOCKOPT:
+        return ENOPROTOOPT;
     case FAULT_PTHREAD_CREATE:
         return EAGAIN;
     default:
@@ -41,6 +46,7 @@ fault_set(int which, int after, int err)
 {
     faults[which].countdown = after + 1;
     faults[which].err = err;
+    faults[which].shortn = 0;
     faults[which].hits = 0;
     // Intentionally DO NOT reset `calls` here: a test may want to
     // measure the number of wrapped calls before AND after arming.
@@ -48,10 +54,21 @@ fault_set(int which, int after, int err)
 }
 
 void
+fault_set_short(int which, int after, int nbytes)
+{
+    faults[which].countdown = after + 1;
+    faults[which].err = 0;
+    faults[which].shortn = nbytes;
+    faults[which].hits = 0;
+}
+
+
+void
 fault_clear(int which)
 {
     faults[which].countdown = 0;
     faults[which].err = 0;
+    faults[which].shortn = 0;
 }
 
 void
@@ -60,6 +77,7 @@ fault_clear_all(void)
     for (int i = 0; i < FAULT_COUNT; i++) {
         faults[i].countdown = 0;
         faults[i].err = 0;
+        faults[i].shortn = 0;
         faults[i].hits = 0;
         faults[i].calls = 0;
     }
@@ -82,17 +100,30 @@ static int
 fault_fire(int which)
 {
     struct fault *f = &faults[which];
-    f->calls++;
-    if (f->countdown <= 0)
-        return 0;
-    if (f->countdown > 1) {
-        f->countdown--;
-        return 0;
+    atomic_fetch_add_explicit(&f->calls, 1, memory_order_relaxed);
+
+    // Claim the firing slot atomically: two threads reaching a
+    // countdown of 1 must not both fire, and neither may miss a
+    // decrement the other made.
+    int cur = atomic_load_explicit(&f->countdown, memory_order_relaxed);
+    for (;;) {
+        if (cur <= 0)
+            return 0;
+        int next = cur > 1 ? cur - 1 : 0;
+        if (atomic_compare_exchange_weak_explicit(&f->countdown, &cur, next,
+                                                  memory_order_relaxed,
+                                                  memory_order_relaxed))
+            break;
     }
-    // countdown == 1: fire and disarm.
-    f->countdown = 0;
-    f->hits++;
-    errno = f->err ? f->err : default_err(which);
+    if (cur > 1)
+        return 0;
+
+    // cur == 1: this call is the one that fires.
+    atomic_fetch_add_explicit(&f->hits, 1, memory_order_relaxed);
+    if (atomic_load_explicit(&f->shortn, memory_order_relaxed) > 0)
+        return 2;   // short write, not an error
+    int e = atomic_load_explicit(&f->err, memory_order_relaxed);
+    errno = e ? e : default_err(which);
     return 1;
 }
 
@@ -105,6 +136,8 @@ extern void   *__real_realloc(void *, size_t);
 extern ssize_t __real_write(int, const void *, size_t);
 extern ssize_t __real_writev(int, const struct iovec *, int);
 extern ssize_t __real_read(int, void *, size_t);
+int     __real_fallocate(int fd, int mode, off_t offset, off_t len);
+int     __real_setsockopt(int fd, int level, int name, const void *val, socklen_t len);
 extern int     __real_open(const char *, int, mode_t);
 extern int     __real_ftruncate(int, off_t);
 extern int     __real_unlink(const char *);
@@ -141,17 +174,72 @@ __wrap_realloc(void *ptr, size_t size)
 ssize_t
 __wrap_write(int fd, const void *buf, size_t count)
 {
-    if (fd > 2 && fault_fire(FAULT_WRITE))
-        return -1;
+    if (fd > 2) {
+        int f = fault_fire(FAULT_WRITE);
+        if (f == 1)
+            return -1;
+        if (f == 2) {
+            size_t n = (size_t)atomic_load_explicit(&faults[FAULT_WRITE].shortn,
+                                                    memory_order_relaxed);
+            if (n > count) n = count;
+            return __real_write(fd, buf, n);
+        }
+    }
     return __real_write(fd, buf, count);
 }
 
 ssize_t
 __wrap_writev(int fd, const struct iovec *iov, int iovcnt)
 {
-    if (fd > 2 && fault_fire(FAULT_WRITEV))
-        return -1;
+    if (fd > 2) {
+        int f = fault_fire(FAULT_WRITEV);
+        if (f == 1)
+            return -1;
+        if (f == 2) {
+            // Trim the vector to the first `shortn` bytes, the way a
+            // full socket buffer would.
+            size_t want = (size_t)atomic_load_explicit(
+                &faults[FAULT_WRITEV].shortn, memory_order_relaxed);
+            struct iovec tmp[8];
+            int n = 0;
+            size_t left = want;
+            for (int i = 0; i < iovcnt && left > 0 && n < (int)(sizeof tmp / sizeof *tmp); i++) {
+                tmp[n] = iov[i];
+                if (tmp[n].iov_len > left)
+                    tmp[n].iov_len = left;
+                left -= tmp[n].iov_len;
+                n++;
+            }
+            if (n == 0)
+                return 0;
+            return __real_writev(fd, tmp, n);
+        }
+    }
     return __real_writev(fd, iov, iovcnt);
+}
+
+// setsockopt is wrapped for its COUNT, not its failure: TCP_CORK costs
+// two calls per pipelined burst and must not fire for a lone command,
+// which is only observable by counting. fault_calls(FAULT_SETSOCKOPT)
+// is the count; arming it as a fault works too.
+int
+__wrap_setsockopt(int fd, int level, int name, const void *val, socklen_t len)
+{
+    if (fault_fire(FAULT_SETSOCKOPT))
+        return -1;
+    return __real_setsockopt(fd, level, name, val, len);
+}
+
+// fallocate is the one syscall whose FAILURE is a supported path rather
+// than an error: rawfalloc falls back to a write loop on EOPNOTSUPP,
+// which is what NFS and tmpfs actually return. Nothing else could reach
+// that loop from a unit test on a filesystem that supports fallocate.
+int
+__wrap_fallocate(int fd, int mode, off_t offset, off_t len)
+{
+    if (fault_fire(FAULT_FALLOCATE))
+        return -1;
+    return __real_fallocate(fd, mode, offset, len);
 }
 
 ssize_t

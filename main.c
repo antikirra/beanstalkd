@@ -55,7 +55,7 @@ static void
 handle_sigterm(int _unused)
 {
     UNUSED_PARAMETER(_unused);
-    shutdown_requested = 1;
+    atomic_store_explicit(&shutdown_requested, 1, memory_order_relaxed);
     // Wake the epoll loop via the eventfd (self-pipe trick) so a
     // SIGTERM landing between srvserve's shutdown_requested check and
     // the epoll syscall cannot strand the flag until the next wake-up
@@ -206,6 +206,28 @@ main(int argc, char **argv)
     // set flags and write the eventfd, so installing them early is safe.
     set_sig_handlers();
 
+    // -z and -s are set independently, and a job larger than a whole
+    // binlog can never be stored: needfree refuses the reservation and
+    // the client gets OUT_OF_MEMORY. That is the right answer, but
+    // discovering it on the first large put — in production, at 3am —
+    // is not. Say so at startup instead, where the numbers came from.
+    //
+    // Largest record a put can produce: namelen + tube name + Jobrec +
+    // body + CRC trailer, against what a binlog has after its header.
+    if (srv.wal.use) {
+        int64 worst = (int64)sizeof(int) + (MAX_TUBE_NAME_LEN - 1)
+                    + (int64)sizeof(Jobrec) + (int64)job_data_size_limit + 2
+                    + (int64)sizeof(uint32);
+        int64 room = (int64)srv.wal.filesize - (int64)sizeof(int);
+        if (worst > room) {
+            warnx("-z %zu needs a binlog of at least %lld bytes, but -s is "
+                  "%d: jobs near the size limit will be refused with "
+                  "OUT_OF_MEMORY",
+                  job_data_size_limit, (long long)(worst + sizeof(int)),
+                  srv.wal.filesize);
+        }
+    }
+
     srv_acquire_wal(&srv);
 
     if (srv.wal.use && srv.wal.wantsync)
@@ -213,8 +235,29 @@ main(int argc, char **argv)
 
     srvserve(&srv);
 
-    if (srv.wal.use && srv.wal.wantsync)
+    // A clean exit should leave the WAL durable and the binlog no longer
+    // than what it holds. Without this the records written since the
+    // last periodic fsync live only in the page cache — a shutdown
+    // followed by a power loss drops jobs the client was acked for —
+    // and the file keeps its full preallocated size, so the next start
+    // reads a tail of zeroes it did not need to write.
+    //
+    // Under -D every commit already synced, and filewclose skips the
+    // second fdatasync in that case (uncommitted_bytes == 0).
+    if (srv.wal.use && srv.wal.cur)
+        filewclose(srv.wal.cur);
+
+    if (srv.wal.use && srv.wal.wantsync) {
         walsyncstop(&srv.wal);
+        // walsyncstop joins the thread; an error it recorded on its last
+        // round has still not been reported to anyone. Say so before
+        // exiting rather than exiting 0 on a wal that failed to sync.
+        if (atomic_load_explicit(&srv.wal.sync_err, memory_order_relaxed)) {
+            errno = atomic_load_explicit(&srv.wal.sync_err,
+                                         memory_order_relaxed);
+            twarn("async fsync failed before shutdown");
+        }
+    }
 
     exit(0);
 }

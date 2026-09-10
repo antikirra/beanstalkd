@@ -1,3 +1,4 @@
+#include <stdatomic.h>
 // Syscall error injection for hostile tests.
 // Uses GNU ld --wrap to intercept libc calls at link time.
 // Zero overhead in the production binary.
@@ -25,16 +26,26 @@ enum {
     FAULT_FDATASYNC,
     FAULT_STAT,
     FAULT_PTHREAD_CREATE,
+    FAULT_FALLOCATE,
+    FAULT_SETSOCKOPT,
     FAULT_COUNT
 };
 
+// The wrapped syscalls fire on whichever thread makes the call, and the
+// fsync thread is one of them, so every field here is touched from more
+// than one thread. Relaxed atomics: the counters only have to be
+// individually coherent, and the tests read them after the work is done.
 struct fault {
-    int countdown;  // 0=off, 1=fail next, N=skip N-1 then fail
-    int err;        // errno to inject (0=use sensible default)
-    int hits;       // number of times fault was injected
-    int calls;      // total invocations of the wrapped call, fault or not;
-                    // useful to prove a code path reached the syscall on
-                    // success tests where no fault fires.
+    _Atomic int countdown;  // 0=off, 1=fail next, N=skip N-1 then fail
+    _Atomic int err;        // errno to inject (0=use sensible default)
+    _Atomic int shortn;     // >0: pass only this many bytes through and
+                            // report that count, instead of failing.
+                            // Write paths only (write/writev).
+    _Atomic int hits;       // number of times fault was injected
+    _Atomic int calls;      // total invocations of the wrapped call, fault
+                            // or not; useful to prove a code path reached
+                            // the syscall on success tests where no fault
+                            // fires.
 };
 
 extern struct fault faults[];
@@ -42,6 +53,13 @@ extern struct fault faults[];
 // Arm: skip `after` successful calls, then fail.
 // after=0 means fail immediately on next call.
 void fault_set(int which, int after, int err);
+
+// Arm a SHORT write: skip `after` calls, then let only `nbytes` of the
+// next one through and report that count. A short write is not an
+// error — it is the kernel taking what fits in the socket buffer — and
+// it is the only way to reach the retry paths in reply()/h_conn from a
+// unit test. FAULT_WRITE and FAULT_WRITEV only.
+void fault_set_short(int which, int after, int nbytes);
 
 void fault_clear(int which);
 void fault_clear_all(void);
