@@ -25,3 +25,12 @@ Environment A: Docker on macOS, aarch64, Debian bookworm, gcc 12.
   created_at kept; wall-clock deadline not translated on read; wrapping
   instead of saturating add.
 - Not covered: x86-64; a real reboot of a VM (time namespaces only).
+
+## E-0002 B02 leak bench self-check — ACCEPTED (2026-11-24)
+- Hypothesis: the probe is deleted by the optimiser; a volatile store
+  makes LeakSanitizer report it, on aarch64 too.
+- Environment: A.
+- bench/leak/run.sh: SKIP (exit 2) -> PASS on the tree.
+- Mutation: malloc(77) planted in make_conn -> FAIL, 11704 bytes in 152
+  allocations.
+- In the gate since this entry (Dockerfile.build, 3.7 s).

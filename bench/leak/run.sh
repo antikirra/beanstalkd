@@ -25,15 +25,21 @@ cd "$ROOT"
 # Prove the detector works BEFORE trusting it. LeakSanitizer is not
 # available everywhere ASan is, and where it is missing it is missing
 # SILENTLY: a program that leaks 1234 bytes and returns exits 0 and says
-# nothing. The first version of this bench reported PASS on such a
-# platform, and kept reporting PASS with a deliberate leak compiled into
-# the accept path — which is how the check below came to exist. A leak
-# bench that cannot detect a leak is worse than no bench at all, so this
-# one refuses to report anything until a known leak is caught.
+# nothing. A leak bench that cannot detect a leak is worse than no bench
+# at all, so this one refuses to report anything until a known leak is
+# caught.
+#
+# The probe has to survive the optimiser, too. Its first spelling,
+# `void *p = malloc(1234); (void)p;`, is a dead allocation that gcc and
+# clang both delete at -O1 — so nothing leaked, the probe "failed", and
+# this bench answered SKIP on every platform while blaming aarch64. The
+# volatile store keeps the malloc; clearing it makes the block
+# unreachable.
 PROBE=$(mktemp -d)
 cat > "$PROBE/probe.c" <<'PROBE_EOF'
 #include <stdlib.h>
-int main(void) { void *p = malloc(1234); (void)p; return 0; }
+void *volatile sink;
+int main(void) { sink = malloc(1234); sink = 0; return 0; }
 PROBE_EOF
 ${CC:-cc} -O1 -g -fsanitize=address -o "$PROBE/probe" "$PROBE/probe.c"
 if ASAN_OPTIONS=detect_leaks=1 "$PROBE/probe" 2>&1 | grep -q "LeakSanitizer"; then
@@ -43,12 +49,11 @@ else
     echo "SKIP: LeakSanitizer does not report on this platform."
     echo "      A probe that leaks 1234 bytes exited clean, so anything"
     echo "      this bench said afterwards would be meaningless."
-    echo "      Known cases: aarch64, and x86-64 under emulation (LSan"
-    echo "      needs the real registers and stack, which qemu/Rosetta"
-    echo "      do not give it) — both were checked on the machine this"
-    echo "      was written on, and both are silent. Run it on NATIVE"
-    echo "      x86-64 Linux, or drive bench/leak/workload.py against"
-    echo "      ./beanstalkd under valgrind --leak-check=full."
+    echo "      Known case: x86-64 under emulation (LSan needs the real"
+    echo "      registers and stack, which qemu/Rosetta do not give it),"
+    echo "      and a sandbox that forbids ptrace. Run it natively, or"
+    echo "      drive bench/leak/workload.py against ./beanstalkd under"
+    echo "      valgrind --leak-check=full."
     exit 2
 fi
 

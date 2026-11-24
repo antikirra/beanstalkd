@@ -3,7 +3,7 @@ FROM debian:bookworm-slim
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc clang libc6-dev make cppcheck \
+    gcc clang libc6-dev make cppcheck python3 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
@@ -36,6 +36,13 @@ RUN make clean && ASAN_OPTIONS=allocator_may_return_null=1:detect_leaks=0 \
     CFLAGS="-O1 -g -fsanitize=address -fno-omit-frame-pointer -Wall -Wformat=2" \
     LDFLAGS="-fsanitize=address" \
     LDLIBS="-lrt -lpthread"
+
+# Leaks. The ASan pass above cannot see them (detect_leaks=0, and why),
+# so the real binary is driven through the whole protocol and asked on
+# its way out. The script proves LeakSanitizer catches a known leak
+# first and exits 2 when it does not, which fails this step: a gate
+# that cannot look must not pass.
+RUN sh bench/leak/run.sh
 
 # ThreadSanitizer is NOT run here: it needs ADDR_NO_RANDOMIZE, which a
 # build step cannot ask for, so it dies in `docker build` before running
