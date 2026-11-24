@@ -389,6 +389,11 @@ extern const char *progname;
 int64 nanoseconds(void);
 int64 walclock_offset(void);
 
+// Service-manager notification (systemd Type=notify and WatchdogSec).
+// Both are inert unless the manager put its variables in the environment.
+int   sdnotify(const char *state);
+int64 sdwatchdog_interval(void);
+
 // Cached nanoseconds() for the current tick. Main thread only.
 extern int64 now;
 

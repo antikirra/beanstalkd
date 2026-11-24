@@ -1,6 +1,9 @@
 #define _GNU_SOURCE
 #include "dat.h"
 #include <netdb.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <string.h>
@@ -284,4 +287,76 @@ make_server_socket(char *host, char *port)
     } else {
         return make_inet_socket(host, port);
     }
+}
+
+
+// sdnotify tells the service manager one thing about this process
+// ("READY=1", "WATCHDOG=1", "STOPPING=1") over the datagram socket
+// systemd names in NOTIFY_SOCKET. The protocol is one sendto, so it is
+// spoken here directly rather than through libsystemd: Type=notify must
+// not depend on how the binary was linked.
+//
+// Returns 1 if the datagram was sent, 0 otherwise — no socket named
+// (not started by a manager that wants to hear), or the send failed.
+// Never fatal: a server that cannot report must still serve.
+int
+sdnotify(const char *state)
+{
+    const char *path = getenv("NOTIFY_SOCKET");
+    if (!path || (path[0] != '/' && path[0] != '@') || !path[1])
+        return 0;
+
+    struct sockaddr_un sa;
+    size_t n = strlen(path);
+    if (n >= sizeof sa.sun_path)
+        return 0;
+    memset(&sa, 0, sizeof sa);
+    sa.sun_family = AF_UNIX;
+    memcpy(sa.sun_path, path, n);
+    if (path[0] == '@')
+        sa.sun_path[0] = 0;     // abstract namespace
+    socklen_t salen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + n);
+
+    int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd == -1)
+        return 0;
+    ssize_t len = (ssize_t)strlen(state);
+    ssize_t r;
+    do {
+        r = sendto(fd, state, (size_t)len, MSG_NOSIGNAL,
+                   (struct sockaddr *)&sa, salen);
+    } while (r == -1 && errno == EINTR);
+    close(fd);
+    return r == len;
+}
+
+// sdwatchdog_interval returns how often, in nanoseconds, the event loop
+// has to send WATCHDOG=1, or 0 when no watchdog was asked for. systemd
+// passes the timeout in WATCHDOG_USEC and, optionally, the pid it is
+// meant for in WATCHDOG_PID; the keep-alive goes out at half the
+// timeout, as sd_watchdog_enabled(3) recommends.
+int64
+sdwatchdog_interval(void)
+{
+    const char *us = getenv("WATCHDOG_USEC");
+    if (!us || !*us)
+        return 0;
+
+    const char *pid = getenv("WATCHDOG_PID");
+    if (pid && *pid) {
+        char *end;
+        errno = 0;
+        long long p = strtoll(pid, &end, 10);
+        if (errno || *end || p != (long long)getpid())
+            return 0;
+    }
+
+    char *end;
+    errno = 0;
+    long long v = strtoll(us, &end, 10);
+    // Under 2us there is no half to wait for; over ~292 years in
+    // nanoseconds the product below would overflow.
+    if (errno || *end || v < 2 || v > INT64_MAX / 1000)
+        return 0;
+    return (int64)v * 1000 / 2;
 }

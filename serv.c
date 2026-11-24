@@ -154,12 +154,31 @@ srvserve(Server *s)
         }
     }
 
+    // Replay is done and the socket is in the epoll set: this is the
+    // moment the server can answer, so this is when the service manager
+    // hears READY — not when the process started, which under a large
+    // binlog is minutes earlier.
+    sdnotify("READY=1");
+    int64 wd_interval = sdwatchdog_interval();
+    int64 wd_last = 0;
+
     for (;;) {
         if (unlikely(atomic_load_explicit(&shutdown_requested,
                                          memory_order_relaxed)))
             break;
 
         int64 period = prottick(s);
+
+        // The keep-alive is sent from the loop itself on purpose: a loop
+        // that stops turning stops sending, and that is the only thing
+        // the watchdog is there to notice. Wake at least that often.
+        if (unlikely(wd_interval)) {
+            if (now - wd_last >= wd_interval) {
+                sdnotify("WATCHDOG=1");
+                wd_last = now;
+            }
+            period = min(period, wd_interval);
+        }
 
         // A durable batch can carry an undelivered ack remainder across
         // ticks (partial socket write while the conn was mid-PUT or
@@ -209,6 +228,10 @@ srvserve(Server *s)
         int commit_ok = walcommit(&s->wal);
         dur_flush_all(commit_ok);
     }
+
+    // From here on a slow exit (final fsync, closing the binlog) is the
+    // manager's stop timeout to judge, not the watchdog's.
+    sdnotify("STOPPING=1");
 }
 
 
