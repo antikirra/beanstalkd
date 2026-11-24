@@ -176,6 +176,7 @@ allocate_job(int body_size)
             twarnx("OOM");
             return (Job *) 0;
         }
+        mem_took(j);
     }
 
     // Zero only Jobrec (80B), not entire Job (240B+).
@@ -319,6 +320,7 @@ job_free(Job *j)
         }
     }
 
+    mem_gave(j);
     free(j);
 }
 
@@ -339,6 +341,7 @@ job_pool_drain(void)
         Job *j = pool_head[cls];
         while (j) {
             Job *next = j->ht_next;
+            mem_gave(j);
             free(j);
             j = next;
         }
@@ -467,6 +470,12 @@ size_t
 get_all_jobs_used(void)
 {
     return all_jobs_used;
+}
+
+size_t
+job_pool_bytes(void)
+{
+    return pool_mem;
 }
 
 /* for unit tests: total pooled entries and bytes across all size classes */

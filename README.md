@@ -85,6 +85,7 @@ bench/syscalls/count.sh       # syscalls per command (needs --cap-add=SYS_PTRACE
 bench/shutdown/run.sh         # a clean SIGTERM leaves the binlog durable and trimmed
 bench/crash/run.sh            # SIGKILL mid-traffic: under -D every acked job comes back
 bench/binlog/run.sh           # the WAL stays bounded with jobs pinned in the oldest file
+bench/stall/run.sh            # memory upkeep must not stall the loop, and must still return memory
 bench/leak/run.sh             # every command, then a clean exit, under LeakSanitizer
                               #   (in the gate; exits 2 where LSan cannot report, e.g.
                               #    x86-64 under emulation)
@@ -158,7 +159,7 @@ TCP_FASTOPEN(1024). TCP_DEFER_ACCEPT. TCP_NOTSENT_LOWAT(16KB). TCP_USER_TIMEOUT(
 | `-z BYTES` | 65535 | Max job body size |
 | `-s BYTES` | 10MB | WAL file size |
 | `-u USER` | | Drop privileges |
-| `-m SEC` | 60 | malloc_trim interval (0 = disable) |
+| `-m SEC` | 60 | malloc_trim interval (0 = disable). A trim runs only when it has something to return: ≥ 1 MiB freed since the last one and ≥ 1/8 of the live heap, because it stops the loop for a walk of the whole heap |
 | `-t CPU` | — | Pin to CPU core |
 | `-c N` | 0 (off) | Reject new connections when count reaches N; 0 = unlimited (preserves upstream behaviour). EMFILE remains the kernel hard cap |
 | `-I SEC` | 0 (off) | Close conns idle for SEC seconds. A worker blocked on `reserve` is NOT idle (waiting clients are excluded), so it is safe to enable with worker pools |

@@ -27,6 +27,43 @@ size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
 
 int64 mem_trim_rate = 60000000000LL; /* 60 seconds in nanoseconds */
 
+size_t mem_held;
+size_t mem_released;
+
+void
+mem_took(void *p)
+{
+    mem_held += malloc_usable_size(p);
+}
+
+void
+mem_gave(void *p)
+{
+    size_t n = malloc_usable_size(p);
+    // Saturate: a block that never passed mem_took must not wrap the
+    // counter and switch the trim off for good.
+    mem_held -= n < mem_held ? n : mem_held;
+    mem_released += n;
+}
+
+// malloc_trim walks every free chunk of the heap, and a fragmented heap
+// has about as many of those as live ones: 34ms at 270MB, 83ms at
+// 660MB, with the event loop stopped for all of it and — when nothing
+// was freed since the last walk — nothing to show for it. So the walk
+// has to be paid for in advance: at least TRIM_MIN_BYTES to return, and
+// at least 1/TRIM_LIVE_SHARE of what it must step over. That makes the
+// cost of trimming proportional to the memory actually released instead
+// of to the size of the heap times the uptime.
+#define TRIM_MIN_BYTES  ((size_t)1 << 20)
+#define TRIM_LIVE_SHARE 8
+
+int
+trim_worthwhile(size_t reclaimable, size_t live)
+{
+    return reclaimable >= TRIM_MIN_BYTES
+        && reclaimable >= live / TRIM_LIVE_SHARE;
+}
+
 static void epollq_add(Conn *c, char rw);
 
 // Valid tube name characters (lookup table replaces strspn).
@@ -3828,11 +3865,17 @@ prottick(Server *s)
     if (mem_trim_rate > 0) {
         static int64 last_trim;
         if (now - last_trim >= mem_trim_rate) {
-            // Free the slab pools first: their entries are live allocations
-            // that malloc_trim cannot reclaim while they sit on a free list.
-            job_pool_drain();
-            conn_pool_drain();
-            malloc_trim(0);
+            size_t pooled = job_pool_bytes() + conn_pool_bytes();
+            size_t live = mem_held > pooled ? mem_held - pooled : 0;
+            if (trim_worthwhile(mem_released + pooled, live)) {
+                // Free the slab pools first: their entries are live
+                // allocations that malloc_trim cannot reclaim while they
+                // sit on a free list.
+                job_pool_drain();
+                conn_pool_drain();
+                malloc_trim(0);
+                mem_released = 0;
+            }
             last_trim = now;
         }
         // Feed the trim deadline into the epoll timeout. Without this an

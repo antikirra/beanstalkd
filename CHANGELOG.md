@@ -17,6 +17,36 @@ aarch64 for every push — the CI this README already claimed.
 
 ## 2026-11-25 — The tree builds on x86-64 again; the image is hardened
 
+### The -m trim no longer stops the loop for nothing
+
+Every `-m` seconds (60 by default) `prottick` drained both pools and
+called `malloc_trim(0)`, which walks every free chunk of the heap with
+the event loop stopped: 34 ms on a 267 MB heap, 83 ms at 660 MB — once
+per interval for the life of the server, whether or not anything had
+been freed, and on a fragmented heap returning nothing. Draining the
+pools on the same schedule also threw the hot path's cache away once a
+minute.
+
+The walk now has to be paid for in advance: it runs only when at least
+1 MiB has gone back to malloc since the last one (pools included) and
+that is at least an eighth of the live bytes it must step over. Jobs
+and conns are counted in and out by `malloc_usable_size`, so the
+decision is O(1). Trimming now costs in proportion to memory actually
+released, not to heap size times uptime.
+
+`bench/stall/run.sh` (600 000 × 200 B, every other job deleted, a
+command sent back to back for 6 s under `-m 1`; three runs each):
+replies slower than 5 ms 6 / 6 / 6 -> 1 / 1 / 1, and with all but 120
+scattered jobs deleted RSS still falls from 265 MB to 6.7–8.2 MB as
+before. A build that never trims stays at 264 MB there, so the bench
+fails in both directions. Instructions per command are unchanged
+(849.4 -> 849.2 pipelined, 1119.9 -> 1116.8 serial).
+
+What is left is the one walk a mass delete has paid for — still 34 ms
+on that heap. glibc offers no way to trim in slices; `-m 0` remains the
+setting for a server that must never pause and can keep its high-water
+mark.
+
 ### x86-64 had not compiled since the runtime CRC32C dispatch
 
 The first CI run on an x86-64 runner stopped at the first file:

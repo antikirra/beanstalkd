@@ -71,6 +71,9 @@ TOFILES+=$(patsubst %.c,%.o,$(wildcard testwal_*.c))
 # Registered by wildcard so adding testconn_<unit>.c needs no edit here.
 TOFILES+=$(patsubst %.c,%.o,$(wildcard testconn_*.c))
 
+# Angry tests for prot.c: one dedicated test file per unit.
+TOFILES+=$(patsubst %.c,%.o,$(wildcard testprot_*.c))
+
 # Angry tests for util.c: one dedicated test file per unit.
 # Registered by wildcard so adding testutil_<unit>.c needs no edit here.
 TOFILES+=$(patsubst %.c,%.o,$(wildcard testutil_*.c))

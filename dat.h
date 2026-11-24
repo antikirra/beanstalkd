@@ -392,6 +392,20 @@ int64 walclock_offset(void);
 // Cached nanoseconds() for the current tick. Main thread only.
 extern int64 now;
 
+// What the periodic trim decides on. mem_held is the malloc'ed bytes
+// of every Job and Conn alive or pooled; mem_released is how many such
+// bytes went back to malloc since the last trim. Both are exact
+// (malloc_usable_size), O(1) to keep, and main thread only.
+extern size_t mem_held;
+extern size_t mem_released;
+void mem_took(void *p);     // p was just malloc'ed
+void mem_gave(void *p);     // p is about to be freed
+
+// trim_worthwhile reports whether walking the heap can pay for itself:
+// reclaimable bytes (released since the last trim, plus the pools) against
+// the live bytes the walk has to step over.
+int trim_worthwhile(size_t reclaimable, size_t live);
+
 // Interval in nanoseconds between malloc_trim() calls.
 // Set via -m flag (in seconds). 0 disables trim.
 // Default: 60 seconds. Only effective on glibc.
@@ -434,6 +448,7 @@ void job_list_insert(Job *head, Job *j);
 // Called on the periodic -m trim tick before malloc_trim(0) so the trim can
 // reclaim the pool's pages.
 void job_pool_drain(void);
+size_t job_pool_bytes(void);    // malloc'ed bytes parked in the pool
 
 /* for unit tests */
 size_t get_all_jobs_used(void);
@@ -473,6 +488,7 @@ Conn *make_conn(int fd, char start_state, Tube *use, Tube *watch);
 // Called on the periodic -m trim tick (next to job_pool_drain) so
 // malloc_trim(0) can reclaim the pool's pages.
 void conn_pool_drain(void);
+size_t conn_pool_bytes(void);   // malloc'ed bytes parked in the pool
 
 /* for unit tests */
 void get_conn_pool_stats(int *count);

@@ -57,6 +57,7 @@ conn_pool_put(Conn *c)
         conn_pool = c;
         conn_pool_len++;
     } else {
+        mem_gave(c);
         free(c);
     }
 }
@@ -78,11 +79,18 @@ conn_pool_drain(void)
     Conn *c = conn_pool;
     while (c) {
         Conn *next = c->next;
+        mem_gave(c);
         free(c);
         c = next;
     }
     conn_pool = NULL;
     conn_pool_len = 0;
+}
+
+size_t
+conn_pool_bytes(void)
+{
+    return (size_t)conn_pool_len * sizeof(Conn);
 }
 
 void
@@ -216,6 +224,8 @@ make_conn(int fd, char start_state, Tube *use, Tube *watch)
         c->gen = gen;
     } else {
         c = new(Conn);
+        if (c)
+            mem_took(c);
     }
     if (!c) {
         twarn("OOM");

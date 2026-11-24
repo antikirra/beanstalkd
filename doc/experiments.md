@@ -54,3 +54,27 @@ Environment A: Docker on macOS, aarch64, Debian bookworm, gcc 12.
 - Mutation: flags removed from the Dockerfile -> its hardening check
   fails the image build.
 - Not covered: x86-64 cost of CET.
+
+## E-0004 B01 trim only when it pays — ACCEPTED, partly (2026-11-25)
+- Hypothesis: gating malloc_trim on bytes released since the last trim
+  removes the periodic stall without losing the return of memory.
+- Environment: A. bench/stall/run.sh, 600000 x 200 B, -m 1, 3 runs.
+- Replies slower than 5 ms in a 6 s window: 6 / 6 / 6 -> 1 / 1 / 1
+  (max 35.6 -> 34.6 ms: the single remaining walk).
+- RSS with 120 scattered jobs left: 6.7-8.4 MB -> 6.7-8.2 MB
+  (never-trim mutant: 264.2 MB).
+- Instructions/command (callgrind): p32 849.4 -> 849.2, serial 1119.9 ->
+  1116.8.
+- Mutations: always trim -> bench FAIL (6 stalls) and 2 unit tests red;
+  never trim -> bench FAIL (264 MB) and 2 unit tests red; counter not
+  reset, free not counted, pooled counted as released -> 1 unit test
+  red each (testprot_trim.c).
+- Not achieved: the backlog's "max pause < 1 ms". One O(heap) walk per
+  mass release remains; glibc has no incremental trim. Revisit if a
+  production pause is traced to it: options are -m 0 by default (user
+  decision) or an allocator with background purging via LD_PRELOAD.
+- Side finding: when every job is deleted glibc shrinks the heap by
+  itself (6.8 MB without any trim); the trim matters only when
+  survivors pin the top of the heap. The bench's second phase was
+  changed to that case after its first version passed a never-trim
+  build.
