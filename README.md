@@ -66,8 +66,10 @@ CLI (not wire-observable): upstream's deprecated no-op stubs `-c`/`-n` (warn-and
 
 ```sh
 make check                                # 1032 unit tests (~45s)
-docker build -f Dockerfile.build .        # the gate: gcc + clang, default
-                                          # flags + UBSan + ASan + cppcheck
+make verify                               # the gate (docker build -f Dockerfile.build .):
+                                          # gcc + clang, default flags + UBSan + ASan,
+                                          # leak bench under LeakSanitizer, cppcheck;
+                                          # CI runs the same on x86-64 and aarch64
 docker build -f Dockerfile.benchmark -t bsbench . && docker run --rm bsbench
                                           # A/B benchmark vs upstream
 docker build -f test/Dockerfile.loadtest -t loadtest . && docker run --rm loadtest
@@ -83,8 +85,8 @@ bench/shutdown/run.sh         # a clean SIGTERM leaves the binlog durable and tr
 bench/crash/run.sh            # SIGKILL mid-traffic: under -D every acked job comes back
 bench/binlog/run.sh           # the WAL stays bounded with jobs pinned in the oldest file
 bench/leak/run.sh             # every command, then a clean exit, under LeakSanitizer
-                              #   (exits 2 and says so where LSan cannot report: aarch64,
-                              #    or x86-64 under emulation — needs a native x86-64 host)
+                              #   (in the gate; exits 2 where LSan cannot report, e.g.
+                              #    x86-64 under emulation)
 python3 bench/mutate/mutate.py conn.c,job.c 12 1   # do the tests actually bite?
 ```
 

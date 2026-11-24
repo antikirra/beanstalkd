@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-11-24 — The leak bench runs, and the gate has a name
+
+`bench/leak/run.sh` had never produced a verdict. Its self-check leaked
+with `void *p = malloc(1234); (void)p;` — a dead allocation gcc 12 and
+clang 14 both delete at `-O1` — so the probe leaked nothing, the script
+concluded LeakSanitizer was absent and answered SKIP everywhere, with an
+explanation ("aarch64") that was wrong. The probe now stores through a
+volatile. On aarch64 the bench reports PASS on this tree, and FAIL
+("11704 byte(s) leaked in 152 allocation(s)") with a `malloc(77)`
+planted in `make_conn`.
+
+The bench is a step of `Dockerfile.build` now, `make verify` runs that
+file, and `.github/workflows/gate.yml` runs `make verify` on x86-64 and
+aarch64 for every push — the CI this README already claimed.
+
 ## 2026-11-24 — WAL timestamps are wall-clock again
 
 ### Delayed jobs froze after a reboot, and after an upgrade from upstream

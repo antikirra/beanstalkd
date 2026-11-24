@@ -22,7 +22,8 @@ WAL v8 (CRC32C per record), reads v7.
 ```sh
 make                                # build
 make check                          # unit tests (ct), ~45-70 s
-docker build -f Dockerfile.build .  # THE GATE: gcc, clang, UBSan, ASan, cppcheck
+make verify                         # THE GATE (docker build -f Dockerfile.build .):
+                                    # gcc, clang, UBSan, ASan, leak bench, cppcheck
 docker build -f Dockerfile.benchmark -t bsbench . && docker run --rm bsbench   # A/B vs upstream
 bench/syscalls/count.sh PORT ITERS DEPTH CONNS [wal|durable]                   # needs SYS_PTRACE
 bench/leak/run.sh                   # leak check (LSan)
