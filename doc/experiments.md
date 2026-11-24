@@ -34,3 +34,23 @@ Environment A: Docker on macOS, aarch64, Debian bookworm, gcc 12.
 - Mutation: malloc(77) planted in make_conn -> FAIL, 11704 bytes in 152
   allocations.
 - In the gate since this entry (Dockerfile.build, 3.7 s).
+
+## E-0003 B06 hardening flags in the production image — ACCEPTED (2026-11-25)
+- Hypothesis: canary, fortify, stack-clash and CET/PAC cost under 2% of
+  server CPU per command.
+- Environment: A (arm64, so PAC is measured, CET is not).
+- Method: wall-clock CPU/op was bimodal on this host (0.407 / 0.447 us
+  for the same binary, 7 runs), so user-space instructions per command
+  were counted under callgrind instead: two runs agree to 0.1.
+- Instructions/command, put -> reserve -> delete, 64-byte bodies, no WAL:
+  - depth 32: 849.4 -> 901.8 (+6.2%); canary 870.2, fortify 860.5,
+    PAC 872.6, stack-clash 844.2
+  - serial:   1119.9 -> 1207.6 (+7.8%); canary 1168.8, fortify 1131.9,
+    PAC 1155.9, stack-clash 1110.6
+- Total CPU/op for scale: 0.41 us at depth 32, ~8 us serial (kernel
+  dominated), so +53 / +88 instructions is under 2% / 0.5%.
+- With the WAL the callgrind count is not repeatable (3.7k..18k per
+  command across runs of one binary); not used.
+- Mutation: flags removed from the Dockerfile -> its hardening check
+  fails the image build.
+- Not covered: x86-64 cost of CET.

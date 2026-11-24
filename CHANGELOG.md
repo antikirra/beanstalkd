@@ -15,6 +15,37 @@ The bench is a step of `Dockerfile.build` now, `make verify` runs that
 file, and `.github/workflows/gate.yml` runs `make verify` on x86-64 and
 aarch64 for every push — the CI this README already claimed.
 
+## 2026-11-25 — The tree builds on x86-64 again; the image is hardened
+
+### x86-64 had not compiled since the runtime CRC32C dispatch
+
+The first CI run on an x86-64 runner stopped at the first file:
+`crc32c.c: 'wal_crc32c_sw' defined but not used`. The aarch64 path
+dispatches at run time and needs the table fallback; the x86 path
+targets SSE4.2 unconditionally and does not, so under `-Werror` neither
+the gate nor the production image could be built for amd64 from
+`f67606e` on. Every gate run until now had been on aarch64. The table
+and its loop are compiled only where something calls them.
+
+### Hardening flags in the production image
+
+`Dockerfile` now builds with `-fstack-protector-strong`,
+`-fstack-clash-protection`, `-D_FORTIFY_SOURCE=3`, CET on amd64
+(`-fcf-protection=full`), PAC/BTI on arm64
+(`-mbranch-protection=standard`), and `-z relro -z noexecstack` next to
+the existing `-z now`. PIE and full RELRO were already there; the
+canary and the checked libc calls were not (0 `*_chk` imports before, 8
+after). The image build asks the binary itself and fails without them —
+with LTO a flag missing at link time is dropped silently — and
+`make verify` builds the image, so CI holds the line on both arches.
+
+Cost on arm64, user-space instructions per command under callgrind
+(deterministic; wall-clock CPU could not resolve it on the test host):
+849 -> 902 pipelined (depth 32), 1120 -> 1208 serial. By flag:
+canary +2.4% / +4.4%, PAC +2.7% / +3.2%, fortify +1.3% / +1.1%,
+stack-clash 0. A command costs 0.41 µs of CPU pipelined and ~8 µs
+serial, most of it in the kernel, so this is under 2% of the total.
+
 ## 2026-11-24 — WAL timestamps are wall-clock again
 
 ### Delayed jobs froze after a reboot, and after an upgrade from upstream

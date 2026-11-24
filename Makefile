@@ -148,10 +148,12 @@ bench: ct/_ctcheck
 	ct/_ctcheck -b
 
 # The gate, the same locally and in CI: the suite under gcc, clang,
-# UBSan and ASan, the leak bench, cppcheck. Needs only docker.
+# UBSan and ASan, the leak bench, cppcheck; then the production image,
+# which checks its own hardening and ISA floor. Needs only docker.
 .PHONY: verify
 verify:
 	docker build -f Dockerfile.build .
+	docker build -f Dockerfile .
 
 WRAP_FLAGS=\
 	-Wl,--wrap,malloc\

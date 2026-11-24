@@ -69,7 +69,8 @@ make check                                # 1032 unit tests (~45s)
 make verify                               # the gate (docker build -f Dockerfile.build .):
                                           # gcc + clang, default flags + UBSan + ASan,
                                           # leak bench under LeakSanitizer, cppcheck;
-                                          # CI runs the same on x86-64 and aarch64
+                                          # then the production image, which checks its
+                                          # own hardening; CI runs it on x86-64 and aarch64
 docker build -f Dockerfile.benchmark -t bsbench . && docker run --rm bsbench
                                           # A/B benchmark vs upstream
 docker build -f test/Dockerfile.loadtest -t loadtest . && docker run --rm loadtest
