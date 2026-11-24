@@ -78,3 +78,26 @@ Environment A: Docker on macOS, aarch64, Debian bookworm, gcc 12.
   survivors pin the top of the heap. The bench's second phase was
   changed to that case after its first version passed a never-trim
   build.
+
+## E-0005 B10 batch WAL records into one write per burst — REJECTED (2026-11-25)
+- Hypothesis: staging a burst's records in a buffer and writing them
+  once cuts server CPU per command with the WAL on.
+- Environment: A. Prototype outside the tree: 64 KB buffer in
+  writev_all, flushed at walcommit and on close (no flush-before-ack
+  ordering, so this is the upper bound of the gain).
+- Server CPU per command, put -> reserve -> delete, async WAL on tmpfs,
+  5 runs each, median (min..max):
+  - depth 32: 0.678 (0.667..0.722) -> 0.544 (0.500..0.600) us, -20%
+  - depth 8:  1.583 (1.400..1.783) -> 1.450 (1.233..1.500) us, inside the spread
+  - serial:   no difference (8.5..10.7 both)
+- Decision: not built. The gain exists only for deep pipelines with the
+  WAL on; a client that sends one command and waits gets nothing, and
+  that is what producers and workers do. The price is a staging buffer,
+  its flush-before-ack rule and its failure handling in the one path
+  where a mistake loses acknowledged jobs — the reason bench/syscalls
+  gives for rejecting the same idea under -D, which this measurement
+  agrees with at depth 8 (~8%).
+- Revisit when: a production workload pipelines with -b at depth >= 16,
+  or acks are to be held to the end of the tick in the default mode too
+  (group write across connections) — that would help serial clients
+  under concurrency, and is a behaviour change to be decided first.
