@@ -20,6 +20,83 @@ static int  readfull(File*, void*, int, int*, char*);
 static void warnpos(File*, int, char*, ...)
 __attribute__((format(printf, 3, 4)));
 
+// Time in the WAL.
+//
+// In memory created_at and deadline_at are nanoseconds() readings: a
+// monotonic clock whose epoch is the last boot. In the file they are
+// wall-clock nanoseconds since the Unix epoch, which is what upstream
+// v7 writes and the only base that still means something after a
+// reboot. jobrec_to_wal and jobrec_from_wal are the two halves of that
+// translation; nothing else may copy a Jobrec to or from disk.
+
+// Builds between the switch to CLOCK_MONOTONIC and this translation
+// wrote monotonic stamps. They are told apart by magnitude: 10^18 ns is
+// 2001-09-09 as wall-clock time and 31.7 years as uptime.
+#define WAL_WALL_MIN ((int64)1000000000000000000)
+
+static inline int64
+sat_add(int64 a, int64 b)
+{
+    int64 r;
+    if (__builtin_add_overflow(a, b, &r))
+        return b > 0 ? INT64_MAX : INT64_MIN;
+    return r;
+}
+
+static inline int64
+sat_sub(int64 a, int64 b)
+{
+    int64 r;
+    if (__builtin_sub_overflow(a, b, &r))
+        return b < 0 ? INT64_MAX : INT64_MIN;
+    return r;
+}
+
+// Fills out with the on-disk form of r. memcpy rather than assignment:
+// the padding bytes are part of the record and of its checksum.
+static inline void
+jobrec_to_wal(Jobrec *out, const Jobrec *r)
+{
+    int64 off = walclock_offset();
+
+    memcpy(out, r, sizeof *out);
+    out->created_at = sat_add(r->created_at, off);
+    // deadline_at is defined in these two states only; elsewhere it is
+    // a leftover and is written through as it is.
+    if (r->state == Delayed || r->state == Reserved)
+        out->deadline_at = sat_add(r->deadline_at, off);
+}
+
+// Brings a record just read back onto the nanoseconds() clock. The file
+// is not trusted to be right about time: the wall clock may have been
+// stepped since the write, and a monotonic stamp may belong to a boot
+// that is gone. So whatever it says, a delayed job waits no longer than
+// the delay it was given, and no job was created in the future.
+static void
+jobrec_from_wal(Jobrec *jr)
+{
+    int64 mono = nanoseconds();
+    int64 off = walclock_offset();
+
+    int64 c = jr->created_at;
+    if (c >= WAL_WALL_MIN)
+        c = sat_sub(c, off);
+    if (c > mono)
+        c = mono;
+    jr->created_at = c;
+
+    if (jr->state == Delayed) {
+        int64 d = jr->deadline_at;
+        if (d >= WAL_WALL_MIN)
+            d = sat_sub(d, off);
+        int64 left = sat_sub(d, mono);
+        int64 max = jr->delay > 0 ? jr->delay : 0;
+        if (left > max)
+            left = max;
+        jr->deadline_at = sat_add(mono, left);
+    }
+}
+
 // An all-zero Jobrec (jr.id == 0) normally means we reached the
 // fallocate-zeroed tail of the binlog and replay stops cleanly. But a
 // zeroed record MID-file (torn write, partial fsync, misaligned replay)
@@ -378,6 +455,8 @@ readrec(File *f, Job *l, int *err)
     }
 
     // CRC is valid — safe to apply state changes.
+    jobrec_from_wal(&jr);
+
     j = job_find(jr.id);
     if (!(j || namelen)) {
         // Short record for a job whose full record lived in a now-deleted
@@ -593,6 +672,8 @@ readrec7(File *f, Job *l, int *err)
         *err = 1;
         return 0;
     }
+
+    jobrec_from_wal(&jr);
 
     j = job_find(jr.id);
     if (!(j || namelen)) {
@@ -1152,14 +1233,16 @@ filewrjobshort(File *f, Job *j)
 
     // CRC32C (v8 trailer) over [nl, j->r], serialized little-endian.
     uint32 crc = WAL_CRC32C_INIT;
+    Jobrec wr;
+    jobrec_to_wal(&wr, &j->r);
     crc = wal_crc32c(crc, &nl,   sizeof nl);
-    crc = wal_crc32c(crc, &j->r, sizeof j->r);
+    crc = wal_crc32c(crc, &wr,   sizeof wr);
     unsigned char crc_bytes[4];
     crc32c_trailer_le(crc, crc_bytes);
 
     struct iovec iov[3] = {
         { .iov_base = &nl,       .iov_len = sizeof nl },
-        { .iov_base = &j->r,     .iov_len = sizeof j->r },
+        { .iov_base = &wr,       .iov_len = sizeof wr },
         { .iov_base = crc_bytes, .iov_len = sizeof crc_bytes },
     };
 
@@ -1204,9 +1287,11 @@ filewrjobfull(File *f, Job *j)
 
     // CRC32C (v8 trailer) over [nl, tube name, j->r, body], serialized LE.
     uint32 crc = WAL_CRC32C_INIT;
+    Jobrec wr;
+    jobrec_to_wal(&wr, &j->r);
     crc = wal_crc32c(crc, &nl,           sizeof nl);
     crc = wal_crc32c(crc, j->tube->name, nl);
-    crc = wal_crc32c(crc, &j->r,         sizeof j->r);
+    crc = wal_crc32c(crc, &wr,           sizeof wr);
     crc = wal_crc32c(crc, j->body,       j->r.body_size);
     unsigned char crc_bytes[4];
     crc32c_trailer_le(crc, crc_bytes);
@@ -1214,7 +1299,7 @@ filewrjobfull(File *f, Job *j)
     struct iovec iov[5] = {
         { .iov_base = &nl,           .iov_len = sizeof nl },
         { .iov_base = j->tube->name, .iov_len = nl },
-        { .iov_base = &j->r,         .iov_len = sizeof j->r },
+        { .iov_base = &wr,           .iov_len = sizeof wr },
         { .iov_base = j->body,       .iov_len = j->r.body_size },
         { .iov_base = crc_bytes,     .iov_len = sizeof crc_bytes },
     };

@@ -141,3 +141,19 @@ which fails the commit and requires the burst to come back as
 INTERNAL_ERROR rather than acked. A SIGKILL bench cannot pin this:
 killing the process does not lose the page cache, so records acked a
 moment too early still come back.
+
+## #17 — Time in the WAL is wall-clock time
+
+`created_at` and `deadline_at` are `nanoseconds()` readings (monotonic,
+epoch = last boot) everywhere in memory and wall-clock nanoseconds in
+the file, as in upstream v7. `jobrec_to_wal` and `jobrec_from_wal`
+(file.c) are the only crossing points. The reader also bounds what it
+reads: a delayed job's remaining time never exceeds its `delay`, and
+`created_at` is never later than now.
+
+**When it breaks:** after a reboot, or on an upstream binlog, a delayed
+job waits for the previous uptime (or decades) instead of its delay and
+`stats-job` reports a negative `age`. A plain restart hides it
+completely, because the monotonic clock survives that.
+
+**Pinned by:** `testfile_waltime.c`.

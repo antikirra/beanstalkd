@@ -13,6 +13,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -225,9 +226,15 @@ cttest_filewrjobshort_trailer_covers_the_namelen_and_the_jobrec(void)
     assertf(r == 1, "setup: staging must succeed, got %d", r);
 
     int nl = 0;
+    // The timestamp is wall-clock time in the file (testfile_waltime.c
+    // pins its value); every other byte is the job's own.
+    Jobrec disk = j->r;
+    assertf(pread(fd, &disk.created_at, sizeof disk.created_at,
+                  ws_size(fd) - 4 - (off_t)sizeof(Jobrec) + (off_t)offsetof(Jobrec, created_at))
+            == (ssize_t)sizeof disk.created_at, "setup: pread created_at");
     uint32 c = WAL_CRC32C_INIT;
     c = wal_crc32c(c, &nl, sizeof nl);
-    c = wal_crc32c(c, &j->r, sizeof j->r);
+    c = wal_crc32c(c, &disk, sizeof disk);
     c ^= WAL_CRC32C_XOR;
     unsigned char want[4] = {
         (unsigned char)(c), (unsigned char)(c >> 8),

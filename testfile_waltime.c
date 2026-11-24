@@ -171,12 +171,6 @@ wt_job(const char *tube, uint64 id, byte state, int64 delay,
     return j;
 }
 
-#if 0 /* QUARANTINE B00: red until WAL timestamps are wall-clock again.
-       * The fork stamps Jobrec.created_at/deadline_at with
-       * CLOCK_MONOTONIC_COARSE; upstream v7 stamps wall-clock time. After
-       * a host reboot, or a replay of an upstream binlog, a delayed job
-       * waits for the previous uptime (or ~57 years) instead of its
-       * delay, and age goes negative. Lifted by the fix commit. */
 
 // The wall clock, read independently of the code under test.
 static int64
@@ -362,7 +356,6 @@ cttest_waltime_a_short_record_carries_wall_clock_time(void)
 {
     wt_writer_stamps_wall_time("wshort.binlog", 0);
 }
-#endif /* QUARANTINE B00 */
 
 
 // A plain restart on the same boot. Binlogs written by earlier builds

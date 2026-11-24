@@ -271,6 +271,10 @@ struct Jobrec {
     int64  delay;
     int64  ttr;
     int32  body_size;
+
+    // Both timestamps are on the nanoseconds() clock (monotonic) in
+    // memory and wall-clock nanoseconds in the WAL, as in upstream v7;
+    // file.c translates at the boundary (jobrec_to_wal/jobrec_from_wal).
     int64  created_at;
 
     // deadline_at is a timestamp, in nsec, that points to:
@@ -383,6 +387,7 @@ void optparse(Server*, char**);
 extern const char *progname;
 
 int64 nanoseconds(void);
+int64 walclock_offset(void);
 
 // Cached nanoseconds() for the current tick. Main thread only.
 extern int64 now;

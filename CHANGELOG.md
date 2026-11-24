@@ -1,5 +1,50 @@
 # Changelog
 
+## 2026-11-24 — WAL timestamps are wall-clock again
+
+### Delayed jobs froze after a reboot, and after an upgrade from upstream
+
+The scheduler runs on `CLOCK_MONOTONIC_COARSE`, and the WAL writer put
+those readings straight into `Jobrec.created_at` and `deadline_at`.
+Upstream v7 writes wall-clock time there, and for a reason: the
+monotonic clock starts over at every boot, so a monotonic stamp means
+nothing to the next one.
+
+- After a host reboot a delayed job waited for roughly the previous
+  uptime instead of its delay. Reproduced with time namespaces
+  (uptime 30 days, then 60 s): `put 0 30 60` came back with
+  `time-left: 2591966` and `age: -2591936`.
+- An upstream binlog replayed with `time-left: 1794738220` (56.9 years)
+  and a negative `age` on every job — the "transparent v7 replay" this
+  README promised did not hold for delayed jobs.
+- A plain restart on the same boot was correct, which is why the suite
+  never saw it.
+
+The record layout is unchanged; the two fields carry wall-clock
+nanoseconds again, translated at the file boundary
+(`jobrec_to_wal`/`jobrec_from_wal` in file.c) while everything in
+memory stays monotonic. The reader no longer trusts the file about
+time: whatever it says, a delayed job waits no longer than the delay it
+was given and no job is created in the future. That bounds the two
+cases nothing can repair — a wall clock stepped between write and
+replay, and binlogs already written by fork builds with monotonic
+stamps (recognised by magnitude, below 10^18 ns). Those keep their
+exact remaining time across a restart on the same boot; after a reboot
+a delayed job from such a file waits at most its original delay once
+more, or becomes ready at once.
+
+After the fix (same scenarios, Docker aarch64, 2026-11-24): upstream →
+fork, reboot 30 d → 60 s, reboot 60 s → 30 d and plain restart all give
+`time-left: 26`, `age: 3` three seconds after the put; a binlog from the
+previous build replayed after a reboot gives `time-left: 29`, `age: 0`.
+Server CPU per pipelined `put` with async WAL: 0.81–0.84 µs before and
+after (3 runs each, within clock-tick resolution).
+
+Pinned by `testfile_waltime.c` (invariant #17).
+
+**If you run a build older than this with `-b`:** before a planned
+reboot wait for `current-jobs-delayed: 0`, or upgrade first.
+
 ## 2026-09-10 — Pipeline reply coalescing; a command behind a blocking reserve is answered
 
 ### The command the server ate and never answered (upstream #647)

@@ -14,6 +14,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -140,11 +141,17 @@ cttest_crc32c_trailer_le_matches_an_independent_checksum_of_the_record(void)
     assertf(filewrjobfull(&f, j) == 1, "setup: staging must succeed");
 
     int nl = (int)t->name_len;
+    // The timestamp is wall-clock time in the file (testfile_waltime.c
+    // pins its value); every other byte is the job's own.
+    Jobrec disk = j->r;
+    assertf(pread(fd, &disk.created_at, sizeof disk.created_at,
+                  4 + 4 + nl + (off_t)offsetof(Jobrec, created_at))
+            == (ssize_t)sizeof disk.created_at, "setup: pread created_at");
     unsigned char covered[4 + 32 + sizeof(Jobrec) + 6];
     int p = 0;
     memcpy(covered + p, &nl, sizeof nl);        p += (int)sizeof nl;
     memcpy(covered + p, t->name, (size_t)nl);   p += nl;
-    memcpy(covered + p, &j->r, sizeof j->r);    p += (int)sizeof j->r;
+    memcpy(covered + p, &disk, sizeof disk);    p += (int)sizeof disk;
     memcpy(covered + p, j->body, 6);            p += 6;
 
     uint32 c = tl_crc32c(covered, (size_t)p);
