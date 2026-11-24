@@ -17,6 +17,25 @@ aarch64 for every push — the CI this README already claimed.
 
 ## 2026-11-25 — The tree builds on x86-64 again; the image is hardened
 
+### systemd: readiness, watchdog, sandbox
+
+The server now speaks the notify protocol itself (one datagram to
+`NOTIFY_SOCKET`, no libsystemd needed): `READY=1` after the binlog is
+replayed and the loop is about to serve, `WATCHDOG=1` from the loop at
+half of `WatchdogSec`, `STOPPING=1` on the way out. Without those
+environment variables nothing is sent and nothing changes.
+
+`adm/systemd/beanstalkd.service` uses it — `Type=notify`,
+`WatchdogSec=30s` — and is sandboxed: no capabilities, no new
+privileges, read-only filesystem except `StateDirectory`, private
+`/tmp` and devices, `@system-service` syscalls only. Checked under
+systemd 252 in a container: `systemd-analyze security` 9.5 UNSAFE ->
+1.7 OK; start, `-b` in the state directory, `-t 0` and the 25 s drain
+stop all work inside the sandbox; a server frozen with SIGSTOP is
+killed by the watchdog after the timeout and restarted with its jobs;
+a binary that never says READY fails to start under the same unit.
+`Type=simple` used to report "started" before the replay had begun.
+
 ### The -m trim no longer stops the loop for nothing
 
 Every `-m` seconds (60 by default) `prottick` drained both pools and

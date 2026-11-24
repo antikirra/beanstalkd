@@ -101,3 +101,18 @@ Environment A: Docker on macOS, aarch64, Debian bookworm, gcc 12.
   or acks are to be held to the end of the tick in the default mode too
   (group write across connections) — that would help serial clients
   under concurrency, and is a behaviour change to be decided first.
+
+## E-0006 B31 systemd notify, watchdog, sandbox — ACCEPTED (2026-11-25)
+- Environment: debian:bookworm container running systemd 252 as PID 1
+  (privileged), aarch64.
+- systemd-analyze security: 9.5 UNSAFE -> 1.7 OK.
+- Under the new unit: start returns after READY=1; put with -b writes
+  to /var/lib/beanstalkd (0700, owned by User=); -t 0 pins (Cpus_allowed
+  0); CapEff 0, NoNewPrivs 1, seccomp filter on; stop drains and exits
+  in 25 s with Result=success.
+- Watchdog (WatchdogSec=5s for the test): 12 s alive with NRestarts=0;
+  kill -STOP -> "Killing process with signal SIGABRT", Result=watchdog,
+  NRestarts=1, both jobs present after the restart.
+- Control: the previous binary under the same unit ->
+  "failed because a timeout was exceeded" (it never sends READY).
+- Not covered: x86-64; a binlog large enough to make replay slow.
