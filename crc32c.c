@@ -26,6 +26,10 @@
 // CRC32C("123456789") == 0xE3069283 (the CRC-32/ISCSI check value)
 // is enforced by cttest_crc32c_known_vector in testcore.c.
 
+// The x86 path has no fallback (SSE4.2 is the project floor), so there
+// the table and its loop would be dead code — and -Werror says so.
+#if !defined(__SSE4_2__)
+
 // Table-driven software fallback. The table maps byte b to the
 // CRC32C of that byte: t = b; for 8 bits: t = (t>>1) ^ (0x82F63B78
 // if t&1). Written out as a constant so the CRC works identically
@@ -107,6 +111,8 @@ wal_crc32c_sw(uint32 crc, const void *buf, size_t n)
     }
     return crc;
 }
+
+#endif /* !__SSE4_2__ */
 
 #if defined(__SSE4_2__)
 
